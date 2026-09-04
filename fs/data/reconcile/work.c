@@ -1229,7 +1229,8 @@ static int do_reconcile_scan_bps(struct moving_context *ctxt,
 		ctxt->stats->pos = BBPOS(BTREE_ID_backpointers, iter.pos);
 
 		CLASS(disk_reservation, res)(c);
-		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
+		(kthread_should_stop() || !bch2_reconcile_enabled(c))
+		? bch_err_throw(c, reconcile_scan_stop) :
 		do_reconcile_scan_bp(trans, s, bp, last_flushed) ?:
 		bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc);
 	}));
@@ -1298,7 +1299,8 @@ static int do_reconcile_scan_btree(struct moving_context *ctxt,
 		bch2_disk_reservation_put(c, &res.r);
 
 		struct bch_inode_opts opts;
-		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
+		(kthread_should_stop() || !bch2_reconcile_enabled(c))
+		? bch_err_throw(c, reconcile_scan_stop) :
 		bch2_bkey_get_io_opts(trans, snapshot_io_opts, k, &opts) ?:
 		update_reconcile_opts_scan(trans, snapshot_io_opts, &opts, &iter, level, k, s) ?:
 		(start.inode &&
@@ -1391,7 +1393,8 @@ static int do_reconcile_scan_stripes(struct moving_context *ctxt)
 		atomic64_add(c->opts.btree_node_size >> 9,
 			     &r->scan_stats.sectors_seen);
 
-		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
+		(kthread_should_stop() || !bch2_reconcile_enabled(c))
+		? bch_err_throw(c, reconcile_scan_stop) :
 		reconcile_scan_stripe_can_widen_one(trans, &iter, k, &cache);
 	}));
 }
@@ -1850,6 +1853,11 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
 			continue;
+		} else if (bch2_err_matches(ret, BCH_ERR_reconcile_scan_stop) ||
+			   WARN_ON_ONCE(ret > 0)) {
+			/* End this phase so the outer loop can park or stop. */
+			ret = 0;
+			break;
 		} else if (ret) {
 			break;
 		} else {
@@ -1992,6 +2000,7 @@ static int do_reconcile(struct moving_context *ctxt)
 
 			if (kick != r->kick ||
 			    test_bit(BCH_FS_going_ro, &c->flags) ||
+			    !bch2_reconcile_enabled(c) ||
 			    bch2_move_ratelimit(ctxt))
 				break;
 
