@@ -1692,7 +1692,14 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		ret = handler(p, k);
 
 		if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc)) {
-			bch2_trans_unlock_long(trans);
+			/*
+			 * Flush our in-flight moves before sleeping: their
+			 * writes are only ever issued from this thread, and
+			 * each holds nocow locks until it completes. Copygc
+			 * needs those locks to evacuate the buckets, so parking
+			 * them here while waiting for copygc deadlocks.
+			 */
+			bch2_moving_ctxt_flush_all(ctxt);
 			bch2_copygc_wakeup(c);
 			wait_event(c->copygc.running_wq,
 				   c->copygc.run_count != *p->copygc_run_count ||
