@@ -1825,15 +1825,20 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase,
 }
 
 /*
- * The long keyed phases resume where they were interrupted; the scan, btree
- * and pending phases are short, and restart from the beginning:
+ * The keyed phases resume where they were interrupted. The btree phases are
+ * usually short, but restarting them would re-hit entries deferred on
+ * need_copygc every pass, each costing a copygc wait. The scan phase must see
+ * new cookies from the start, and the pending phases only run when a pending
+ * cookie is set, so those restart from the beginning.
  */
 static bool reconcile_phase_resumable(unsigned i)
 {
 	struct reconcile_phase p = reconcile_phases[i];
 
 	return p.type == RECONCILE_PHASE_destage ||
-		(p.type == RECONCILE_PHASE_normal && p.priority != RECONCILE_WORK_pending);
+		((p.type == RECONCILE_PHASE_normal ||
+		  p.type == RECONCILE_PHASE_btree) &&
+		 p.priority != RECONCILE_WORK_pending);
 }
 
 static void reconcile_phase_start(struct bch_fs *c)
@@ -2033,9 +2038,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			 */
 			bch2_moving_ctxt_flush_all(ctxt);
 			bch2_copygc_wakeup(c);
-			wait_event(c->copygc.running_wq,
+			/*
+			 * Bounded: a copygc run can take hours on a fragmented
+			 * pool, and the entry is deferred either way.
+			 */
+			wait_event_timeout(c->copygc.running_wq,
 				   c->copygc.run_count != *p->copygc_run_count ||
-				   kthread_should_stop());
+				   kthread_should_stop() ||
+				   test_bit(BCH_FS_going_ro, &c->flags),
+				   10 * HZ);
 			*p->copygc_run_count = c->copygc.run_count;
 			ret = 0;
 
