@@ -66,10 +66,34 @@ static void data_update_free_rcu(struct rcu_head *rcu)
 	kfree(u);
 }
 
+/*
+ * Split a move's lifetime into the steps it can be blocked in; a step whose
+ * start or end wasn't reached (read error, nothing to write) isn't recorded:
+ */
+static void move_update_time_stats(struct bch_fs *c, struct data_update *u)
+{
+	u64 now = local_clock();
+
+	if (u->time_read_done)
+		__bch2_time_stats_update(&c->times[BCH_TIME_move_read],
+					 u->time_read_submit, u->time_read_done);
+	if (u->time_read_done && u->time_write_issue)
+		__bch2_time_stats_update(&c->times[BCH_TIME_move_write_wait],
+					 u->time_read_done, u->time_write_issue);
+	if (u->time_write_issue && u->time_index_update) {
+		__bch2_time_stats_update(&c->times[BCH_TIME_move_write_io],
+					 u->time_write_issue, u->time_index_update);
+		__bch2_time_stats_update(&c->times[BCH_TIME_move_index_update],
+					 u->time_index_update, now);
+	}
+}
+
 static void move_write_done(struct bch_write_op *op)
 {
 	struct data_update *u = container_of(op, struct data_update, op);
 	struct moving_context *ctxt = u->ctxt;
+
+	move_update_time_stats(op->c, u);
 
 	atomic_sub(u->k.k->k.size, &ctxt->write_sectors);
 	atomic_dec(&ctxt->write_ios);
@@ -107,6 +131,7 @@ static void move_write(struct data_update *u)
 	atomic_add(u->k.k->k.size, &ctxt->write_sectors);
 	atomic_inc(&ctxt->write_ios);
 
+	u->time_write_issue = local_clock();
 	bch2_data_update_read_done(u);
 }
 
@@ -125,6 +150,7 @@ static void move_read_endio(struct bio *bio)
 
 	atomic_sub(u->k.k->k.size, &ctxt->read_sectors);
 	atomic_dec(&ctxt->read_ios);
+	u->time_read_done = local_clock();
 	u->read_done = true;
 
 	wake_up(&ctxt->wait);
@@ -277,6 +303,7 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	 * ctxt when doing wakeup
 	 */
 	closure_get(&ctxt->cl);
+	u->time_read_submit = local_clock();
 	ret = __bch2_read_extent(trans, &u->rbio,
 				 u->rbio.bio.bi_iter,
 				 bkey_start_pos(k.k),
@@ -497,12 +524,27 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 	 * XXX: these limits really ought to be per device, SSDs and hard drives
 	 * will want different limits
 	 */
-	move_ctxt_wait_event(ctxt,
-		atomic_read(&ctxt->write_sectors) < c->opts.move_bytes_in_flight >> 9 &&
-		atomic_read(&ctxt->read_sectors) < c->opts.move_bytes_in_flight >> 9 &&
-		atomic_read(&ctxt->write_ios) < c->opts.move_ios_in_flight &&
-		atomic_read(&ctxt->read_ios) < c->opts.move_ios_in_flight);
+	unsigned max_sectors	= c->opts.move_bytes_in_flight >> 9;
+	unsigned max_ios	= c->opts.move_ios_in_flight;
+	bool write_bound	= atomic_read(&ctxt->write_sectors) >= max_sectors ||
+				  atomic_read(&ctxt->write_ios) >= max_ios;
+	bool read_bound		= atomic_read(&ctxt->read_sectors) >= max_sectors ||
+				  atomic_read(&ctxt->read_ios) >= max_ios;
 
+	u64 start = local_clock();
+
+	/* Also issues pending writes, so it runs even when nothing is bound: */
+	move_ctxt_wait_event(ctxt,
+		atomic_read(&ctxt->write_sectors) < max_sectors &&
+		atomic_read(&ctxt->read_sectors) < max_sectors &&
+		atomic_read(&ctxt->write_ios) < max_ios &&
+		atomic_read(&ctxt->read_ios) < max_ios);
+
+	/* attributed to the limit that was binding when the wait began */
+	if (write_bound || read_bound)
+		bch2_time_stats_update(&c->times[write_bound
+						 ? BCH_TIME_move_ratelimit_write
+						 : BCH_TIME_move_ratelimit_read], start);
 	return 0;
 }
 

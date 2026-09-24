@@ -559,6 +559,8 @@ static int __bch2_data_update_index_update(struct btree_trans *trans,
 
 int bch2_data_update_index_update(struct bch_write_op *op)
 {
+	container_of(op, struct data_update, op)->time_index_update = local_clock();
+
 	CLASS(btree_trans, trans)(op->c);
 	return __bch2_data_update_index_update(trans, op);
 }

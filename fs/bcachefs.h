@@ -360,6 +360,20 @@ BCH_DEBUG_PARAMS_ALL()
 	x(data_promote,							\
 	  "Promote: write a cached copy of an extent "			\
 	  "to promote_target on read")					\
+	x(move_read,							\
+	  "Data move: read submitted to read completed")		\
+	x(move_write_wait,						\
+	  "Data move: read completed to write issued; writes "		\
+	  "are issued in read submission order")			\
+	x(move_write_io,						\
+	  "Data move: write issued to btree index update "		\
+	  "started (allocation, write IO, index update queue)")		\
+	x(move_index_update,						\
+	  "Data move: btree index update")				\
+	x(move_ratelimit_read,						\
+	  "Mover waiting for its in-flight read limit")			\
+	x(move_ratelimit_write,						\
+	  "Mover waiting for its in-flight write limit")		\
 	x(journal_flush_write,						\
 	  "Flush journal writes: cache flush to devices "		\
 	  "then FUA journal writes")					\

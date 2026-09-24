@@ -71,6 +71,12 @@ struct data_update {
 	struct moving_context	*ctxt;
 	struct bch_move_stats	*stats;
 
+	/* local_clock() at each move step, for the move_* time stats: */
+	u64			time_read_submit;
+	u64			time_read_done;
+	u64			time_write_issue;
+	u64			time_index_update;
+
 	struct bch_read_bio	rbio;
 	struct bch_write_op	op;
 	struct bio_vec		*bvecs;
