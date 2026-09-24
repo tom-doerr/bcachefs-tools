@@ -349,6 +349,7 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	u->op.end_io		= move_write_done;
 	u->rbio.bio.bi_end_io	= move_read_endio;
 	u->rbio.bio.bi_ioprio	= bch2_move_ioprio(c);
+	u->op.wbio.bio.bi_ioprio = bch2_move_ioprio(c);
 
 	u32 size = k.k->size;
 
@@ -367,12 +368,13 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	}
 
 	/*
-	 * Charge the read to the source device the caller asked for; the
-	 * data update holds refs on every device the extent points to, which
-	 * outlive the read:
+	 * Charge reconcile reads to the source device the caller asked for,
+	 * for bch2_move_wait_dev_reads(); the data update holds refs on every
+	 * device the extent points to, which outlive the read:
 	 */
-	if (data_opts->read_flags & (BCH_READ_soft_require_read_device|
-				     BCH_READ_hard_require_read_device))
+	if (data_opts->type == BCH_DATA_UPDATE_reconcile &&
+	    (data_opts->read_flags & (BCH_READ_soft_require_read_device|
+				      BCH_READ_hard_require_read_device)))
 		for (unsigned i = 0; i < ARRAY_SIZE(u->cas); i++)
 			if (u->cas[i] && u->cas[i]->dev_idx == data_opts->read_dev) {
 				u->read_ca_counted = u->cas[i];

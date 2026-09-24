@@ -34,10 +34,13 @@ extern const char * const bch2_move_ioprio_opts[];
 
 /*
  * IO priority of data move reads and writes (reconcile, copygc, other data
- * jobs): idle is the stock setting, but mq-deadline dispatches idle requests
- * only when nothing else is queued or after prio_aging_expire, which on a
- * busy device makes move reads wait seconds. best_effort is the lowest best
- * effort level; per-device move admission bounds its load.
+ * jobs; not promotes): idle is the stock setting, but mq-deadline dispatches
+ * idle requests only when nothing else is queued or after prio_aging_expire,
+ * which on a busy device makes move reads wait seconds. best_effort is the
+ * lowest best effort level - mq-deadline doesn't order levels within a class,
+ * so moves then compete evenly with other best effort IO. What bounds their
+ * load is the mover's in-flight limits (move_ios_in_flight, the reconcile
+ * budget) and, for destage reads, move_ios_in_flight_per_dev.
  */
 #define BCH_MOVE_IOPRIO_OPTS()		\
 	x(idle,		0)		\
@@ -582,14 +585,15 @@ enum fsck_err_opts {
 	  OPT_STR(bch2_move_ioprio_opts),				\
 	  BCH2_NO_SB_OPT,		BCH_MOVE_IOPRIO_idle,		\
 	  NULL,		"IO priority of data move reads and writes:\n"	\
-			"idle, or best_effort (lowest level)\n")		\
+			"idle, or best_effort (lowest level; not ordered\n"	\
+			"against other best effort IO by mq-deadline)\n")	\
 	x(move_ios_in_flight_per_dev,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, 1024),						\
 	  BCH2_NO_SB_OPT,		0,				\
-	  NULL,		"Maximum move reads in flight from one device,\n"	\
-			"for moves that choose their source (destage);\n"	\
-			"0: no limit\n")					\
+	  NULL,		"Maximum reconcile move reads in flight from one\n"	\
+			"device, for moves that choose their source\n"	\
+			"(destage); 0: no limit\n")				\
 	x(reconcile_move_ios_in_flight,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, 4096),						\
