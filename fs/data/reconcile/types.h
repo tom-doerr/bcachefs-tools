@@ -115,6 +115,9 @@ struct bch_fs_reconcile {
 	u64				destage_deferred;
 	u64				deferred;
 
+	/* In-flight IO across the reconcile thread and its phys workers */
+	struct move_budget		move_budget;
+
 	/*
 	 * Per-device laps of the phys phases, [0] hipri, [1] normal, indexed
 	 * by dev * 2 + priority; each written only by that device's worker:

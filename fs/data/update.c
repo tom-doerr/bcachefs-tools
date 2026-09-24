@@ -872,7 +872,7 @@ void bch2_data_update_exit(struct data_update *update, int ret)
 	if (update->ctxt) {
 		scoped_guard(mutex, &update->ctxt->lock)
 			list_del(&update->io_list);
-		wake_up(&update->ctxt->wait);
+		wake_up(update->ctxt->waitq);
 	}
 
 	bch2_bio_free_pages_pool(c, &update->op.wbio.bio);

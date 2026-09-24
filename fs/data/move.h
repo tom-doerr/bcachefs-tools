@@ -52,7 +52,12 @@ struct moving_context {
 	atomic_t		read_ios;
 	atomic_t		write_ios;
 
+	/* optional: also counted against, and limited by, a shared budget */
+	struct move_budget	*budget;
+
 	wait_queue_head_t	wait;
+	/* &wait, or the shared budget's waitqueue */
+	wait_queue_head_t	*waitq;
 };
 
 #define move_ctxt_wait_event_timeout(_ctxt, _cond, _timeout)			\
@@ -65,7 +70,7 @@ struct moving_context {
 		if (_cond)							\
 			break;							\
 		bch2_trans_unlock_long((_ctxt)->trans);				\
-		_ret = __wait_event_timeout((_ctxt)->wait,			\
+		_ret = __wait_event_timeout(*(_ctxt)->waitq,			\
 			     bch2_moving_ctxt_next_pending_write(_ctxt) ||	\
 			     (cond_finished = (_cond)), _timeout);		\
 		if (_ret || ( cond_finished))					\
@@ -82,7 +87,7 @@ do {									\
 	if (_cond)							\
 		break;							\
 	bch2_trans_unlock_long((_ctxt)->trans);				\
-	__wait_event((_ctxt)->wait,					\
+	__wait_event(*(_ctxt)->waitq,					\
 		     bch2_moving_ctxt_next_pending_write(_ctxt) ||	\
 		     (cond_finished = (_cond)));			\
 	if (cond_finished)						\
@@ -98,6 +103,7 @@ void bch2_moving_ctxt_exit(struct moving_context *);
 void bch2_moving_ctxt_init(struct moving_context *, struct bch_fs *,
 			   struct bch_ratelimit *, struct bch_move_stats *,
 			   struct write_point_specifier, bool);
+void bch2_moving_ctxt_set_budget(struct moving_context *, struct move_budget *);
 struct data_update *bch2_moving_ctxt_next_pending_write(struct moving_context *);
 void bch2_moving_ctxt_do_pending_writes(struct moving_context *);
 void bch2_moving_ctxt_flush_all(struct moving_context *);

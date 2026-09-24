@@ -754,7 +754,7 @@ static void ec_stripe_create(struct ec_stripe_new *s)
 		unsigned stripe_sectors = le16_to_cpu(v->sectors) * v->nr_blocks;
 		atomic_sub(stripe_sectors, &s->ctxt->write_sectors);
 		atomic_dec(&s->ctxt->write_ios);
-		wake_up(&s->ctxt->wait);
+		wake_up(s->ctxt->waitq);
 		closure_put(&s->ctxt->cl);
 	}
 

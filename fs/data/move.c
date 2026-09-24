@@ -88,6 +88,26 @@ static void move_update_time_stats(struct bch_fs *c, struct data_update *u)
 	}
 }
 
+static void move_ctxt_account_reads(struct moving_context *ctxt, int sectors, int ios)
+{
+	atomic_add(sectors, &ctxt->read_sectors);
+	atomic_add(ios, &ctxt->read_ios);
+	if (ctxt->budget) {
+		atomic_add(sectors, &ctxt->budget->read_sectors);
+		atomic_add(ios, &ctxt->budget->read_ios);
+	}
+}
+
+static void move_ctxt_account_writes(struct moving_context *ctxt, int sectors, int ios)
+{
+	atomic_add(sectors, &ctxt->write_sectors);
+	atomic_add(ios, &ctxt->write_ios);
+	if (ctxt->budget) {
+		atomic_add(sectors, &ctxt->budget->write_sectors);
+		atomic_add(ios, &ctxt->budget->write_ios);
+	}
+}
+
 static void move_write_done(struct bch_write_op *op)
 {
 	struct data_update *u = container_of(op, struct data_update, op);
@@ -95,8 +115,7 @@ static void move_write_done(struct bch_write_op *op)
 
 	move_update_time_stats(op->c, u);
 
-	atomic_sub(u->k.k->k.size, &ctxt->write_sectors);
-	atomic_dec(&ctxt->write_ios);
+	move_ctxt_account_writes(ctxt, -(int) u->k.k->k.size, -1);
 
 	/*
 	 * EC allocation failed — the write never happened but the extent
@@ -128,8 +147,7 @@ static void move_write(struct data_update *u)
 	}
 
 	closure_get(&ctxt->cl);
-	atomic_add(u->k.k->k.size, &ctxt->write_sectors);
-	atomic_inc(&ctxt->write_ios);
+	move_ctxt_account_writes(ctxt, u->k.k->k.size, 1);
 
 	u->time_write_issue = local_clock();
 	bch2_data_update_read_done(u);
@@ -148,12 +166,11 @@ static void move_read_endio(struct bio *bio)
 	struct data_update *u = container_of(bio, struct data_update, rbio.bio);
 	struct moving_context *ctxt = u->ctxt;
 
-	atomic_sub(u->k.k->k.size, &ctxt->read_sectors);
-	atomic_dec(&ctxt->read_ios);
+	move_ctxt_account_reads(ctxt, -(int) u->k.k->k.size, -1);
 	u->time_read_done = local_clock();
 	u->read_done = true;
 
-	wake_up(&ctxt->wait);
+	wake_up(ctxt->waitq);
 	closure_put(&ctxt->cl);
 }
 
@@ -231,9 +248,17 @@ void bch2_moving_ctxt_init(struct moving_context *ctxt,
 	INIT_LIST_HEAD(&ctxt->reads);
 	INIT_LIST_HEAD(&ctxt->ios);
 	init_waitqueue_head(&ctxt->wait);
+	ctxt->waitq = &ctxt->wait;
 
 	scoped_guard(mutex, &c->moving_context_lock)
 		list_add(&ctxt->list, &c->moving_context_list);
+}
+
+/* Before the context starts any IO */
+void bch2_moving_ctxt_set_budget(struct moving_context *ctxt, struct move_budget *budget)
+{
+	ctxt->budget	= budget;
+	ctxt->waitq	= &budget->wait;
 }
 
 void bch2_move_stats_exit(struct bch_move_stats *stats, struct bch_fs *c)
@@ -289,8 +314,7 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	}
 
 	scoped_guard(mutex, &ctxt->lock) {
-		atomic_add(u->k.k->k.size, &ctxt->read_sectors);
-		atomic_inc(&ctxt->read_ios);
+		move_ctxt_account_reads(ctxt, u->k.k->k.size, 1);
 
 		list_add_tail(&u->read_list, &ctxt->reads);
 		list_add_tail(&u->io_list, &ctxt->ios);
@@ -327,8 +351,7 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 		closure_put(&ctxt->cl);
 
 		scoped_guard(mutex, &ctxt->lock) {
-			atomic_sub(u->k.k->k.size, &ctxt->read_sectors);
-			atomic_dec(&ctxt->read_ios);
+			move_ctxt_account_reads(ctxt, -(int) u->k.k->k.size, -1);
 			list_del(&u->read_list);
 		}
 
@@ -536,19 +559,28 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 	 */
 	unsigned max_sectors	= c->opts.move_bytes_in_flight >> 9;
 	unsigned max_ios	= c->opts.move_ios_in_flight;
-	bool write_bound	= atomic_read(&ctxt->write_sectors) >= max_sectors ||
-				  atomic_read(&ctxt->write_ios) >= max_ios;
-	bool read_bound		= atomic_read(&ctxt->read_sectors) >= max_sectors ||
-				  atomic_read(&ctxt->read_ios) >= max_ios;
+	struct move_budget *b	= ctxt->budget;
+
+#define move_writes_bound()							\
+	(atomic_read(&ctxt->write_sectors) >= max_sectors ||			\
+	 atomic_read(&ctxt->write_ios) >= max_ios ||				\
+	 (b && (atomic_read(&b->write_sectors) >= b->max_sectors ||		\
+		atomic_read(&b->write_ios) >= b->max_ios)))
+#define move_reads_bound()							\
+	(atomic_read(&ctxt->read_sectors) >= max_sectors ||			\
+	 atomic_read(&ctxt->read_ios) >= max_ios ||				\
+	 (b && (atomic_read(&b->read_sectors) >= b->max_sectors ||		\
+		atomic_read(&b->read_ios) >= b->max_ios)))
+
+	bool write_bound	= move_writes_bound();
+	bool read_bound		= move_reads_bound();
 
 	u64 start = local_clock();
 
 	/* Also issues pending writes, so it runs even when nothing is bound: */
-	move_ctxt_wait_event(ctxt,
-		atomic_read(&ctxt->write_sectors) < max_sectors &&
-		atomic_read(&ctxt->read_sectors) < max_sectors &&
-		atomic_read(&ctxt->write_ios) < max_ios &&
-		atomic_read(&ctxt->read_ios) < max_ios);
+	move_ctxt_wait_event(ctxt, !move_writes_bound() && !move_reads_bound());
+#undef move_reads_bound
+#undef move_writes_bound
 
 	/* attributed to the limit that was binding when the wait began */
 	if (write_bound || read_bound)

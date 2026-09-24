@@ -1645,6 +1645,7 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	bch2_moving_ctxt_init(&ctxt, c, NULL, &thr->stats,
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
+	bch2_moving_ctxt_set_budget(&ctxt, &c->reconcile.move_budget);
 
 	struct btree_trans *trans = ctxt.trans;
 
@@ -2279,6 +2280,10 @@ static int do_reconcile(struct moving_context *ctxt)
 
 		pass.phys_yielded = false;
 
+		/* runtime options: picked up by every context at the next wait */
+		r->move_budget.max_ios		= c->opts.reconcile_move_ios_in_flight;
+		r->move_budget.max_sectors	= c->opts.reconcile_move_bytes_in_flight >> 9;
+
 		for (r->phase = 0; r->phase < ARRAY_SIZE(reconcile_phases); r->phase++) {
 			reconcile_phase_start(c);
 
@@ -2363,6 +2368,7 @@ static int bch2_reconcile_thread(void *arg)
 	bch2_moving_ctxt_init(&ctxt, c, NULL, &r->work_stats,
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
+	bch2_moving_ctxt_set_budget(&ctxt, &r->move_budget);
 
 	while (!kthread_should_stop() && !do_reconcile(&ctxt))
 		;
@@ -2505,6 +2511,12 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 	printbuf_tabstop_push(out, 24);
 	for (unsigned i = 0; i < RECONCILE_PHASE_EXIT_NR; i++)
 		printbuf_tabstop_push(out, 16);
+
+	struct move_budget *b = &r->move_budget;
+	prt_printf(out, "in flight, all contexts:\tios\tsectors\n");
+	prt_printf(out, "reads\t%u\t%u\n", atomic_read(&b->read_ios), atomic_read(&b->read_sectors));
+	prt_printf(out, "writes\t%u\t%u\n", atomic_read(&b->write_ios), atomic_read(&b->write_sectors));
+	prt_printf(out, "limit\t%u\t%u\n\n", b->max_ios, b->max_sectors);
 
 	prt_printf(out, "kicks since mount:\n");
 	scoped_guard(printbuf_indent, out)
@@ -2689,6 +2701,10 @@ int bch2_fs_reconcile_init(struct bch_fs *c)
 	r->phys_laps = kvcalloc(BCH_SB_MEMBERS_MAX * 2, sizeof(*r->phys_laps), GFP_KERNEL);
 	if (!r->phys_laps)
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
+
+	init_waitqueue_head(&r->move_budget.wait);
+	r->move_budget.max_ios		= c->opts.reconcile_move_ios_in_flight;
+	r->move_budget.max_sectors	= c->opts.reconcile_move_bytes_in_flight >> 9;
 
 	mutex_init(&r->scans_in_flight_lock);
 	try(rhashtable_init(&r->scans_in_flight, &reconcile_scan_in_flight_params));

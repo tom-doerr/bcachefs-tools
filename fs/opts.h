@@ -559,6 +559,18 @@ enum fsck_err_opts {
 	  BCH2_NO_SB_OPT,			true,			\
 	  NULL,		"Enable copygc: disable for debugging, or to\n"\
 			"quiet the system when doing performance testing\n")\
+	x(reconcile_move_ios_in_flight,	u32,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_UINT(1, 4096),						\
+	  BCH2_NO_SB_OPT,		256,				\
+	  NULL,		"Maximum IOs in flight across all reconcile\n"	\
+			"move contexts (each also has move_ios_in_flight)\n")\
+	x(reconcile_move_bytes_in_flight, u32,				\
+	  OPT_HUMAN_READABLE|OPT_FS|OPT_MOUNT|OPT_RUNTIME,		\
+	  OPT_UINT(1024, U32_MAX),					\
+	  BCH2_NO_SB_OPT,		256U << 20,			\
+	  NULL,		"Maximum amount of IO in flight across all\n"	\
+			"reconcile move contexts\n")				\
 	x(reconcile_destage_slice_ms,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, U32_MAX),						\

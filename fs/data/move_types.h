@@ -33,6 +33,22 @@ struct bch_move_stats {
 	struct bch_devs_mask	devs_error_uncorrected;
 };
 
+/*
+ * In-flight move IO shared by several moving contexts - reconcile's thread
+ * and its per-device phys workers - bounded in bch2_move_ratelimit() on top
+ * of each context's own limits. Every context using it sleeps on @wait, so
+ * any context's completion wakes waiters in all of them.
+ */
+struct move_budget {
+	atomic_t		read_sectors;
+	atomic_t		write_sectors;
+	atomic_t		read_ios;
+	atomic_t		write_ios;
+	u32			max_sectors;
+	u32			max_ios;
+	wait_queue_head_t	wait;
+};
+
 struct move_bucket_key {
 	struct bpos		bucket;
 	unsigned		generation;
