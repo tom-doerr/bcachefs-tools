@@ -806,6 +806,10 @@ enum move_outcome bch2_move_outcome(int ret)
 		return MOVE_OUTCOME_no_io;
 	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_in_flight))
 		return MOVE_OUTCOME_in_flight;
+	/* the extent changed while its move read was in flight */
+	if (bch2_err_matches(ret, BCH_ERR_data_read_ptr_stale_race) ||
+	    bch2_err_matches(ret, BCH_ERR_data_read_key_overwritten))
+		return MOVE_OUTCOME_raced;
 	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc))
 		return MOVE_OUTCOME_need_copygc;
 	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_would_block))

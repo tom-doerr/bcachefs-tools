@@ -54,6 +54,7 @@ enum reconcile_phase_exit {
 	x(ok)				\
 	x(no_io)			\
 	x(in_flight)			\
+	x(raced)			\
 	x(need_copygc)			\
 	x(would_block)			\
 	x(blocked)			\
