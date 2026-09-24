@@ -74,6 +74,9 @@ struct data_update {
 	struct moving_context	*ctxt;
 	struct bch_move_stats	*stats;
 
+	/* read_dev's device, counted in its move_reads_in_flight until endio */
+	struct bch_dev		*read_ca_counted;
+
 	/* local_clock() at each move step, for the move_* time stats: */
 	u64			time_read_submit;
 	u64			time_read_done;

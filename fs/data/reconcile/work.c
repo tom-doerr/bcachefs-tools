@@ -1000,8 +1000,12 @@ static int do_reconcile_extent(struct moving_context *ctxt,
 
 /*
  * Destage prepass filter: the extent needs background_target work and one of
- * the pointers that has to move is on a non-rotational device - return that
- * device, to read from; -1 means not destage work.
+ * the pointers that has to move is on a non-rotational device - return the
+ * device to read from; -1 means not destage work.
+ *
+ * With copies on several SSDs, read from the one with the fewest move reads
+ * in flight, then the lowest read latency: always taking the first pointer
+ * piled destage reads onto one device while the other idled.
  *
  * Reads the reconcile entry stored in the extent, which may predate an option
  * change: a key misjudged here is still handled by the normal logical phase.
@@ -1016,17 +1020,30 @@ static int reconcile_destage_read_dev(struct bch_fs *c, struct bkey_s_c k)
 	const union bch_extent_entry *entry;
 	struct extent_ptr_decoded p;
 	unsigned ptr_bit = 1;
+	int best = -1;
+	unsigned best_reads = 0;
+	u64 best_latency = 0;
 
 	guard(rcu)();
 	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
 		if (r->ptrs_moving & ptr_bit) {
 			struct bch_dev *ca = bch2_dev_rcu_noerror(c, p.ptr.dev);
-			if (ca && !ca->mi.rotational)
-				return p.ptr.dev;
+			if (ca && !ca->mi.rotational) {
+				unsigned reads	= atomic_read(&ca->move_reads_in_flight);
+				u64 latency	= atomic64_read(&ca->cur_latency[READ]);
+
+				if (best < 0 ||
+				    reads < best_reads ||
+				    (reads == best_reads && latency < best_latency)) {
+					best		= p.ptr.dev;
+					best_reads	= reads;
+					best_latency	= latency;
+				}
+			}
 		}
 		ptr_bit <<= 1;
 	}
-	return -1;
+	return best;
 }
 
 /*
@@ -1054,6 +1071,13 @@ static int do_reconcile_extent_destage(struct moving_context *ctxt,
 	int read_dev = reconcile_destage_read_dev(c, k);
 	if (read_dev < 0)
 		return 1;
+
+	/*
+	 * Admission control on the source device, before the data update
+	 * takes any locks; drops the btree locks and returns a restart if
+	 * relocking fails, retrying from the lookup above:
+	 */
+	try(bch2_move_wait_dev_reads(ctxt, read_dev));
 
 	struct bkey_buf stack_k __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&stack_k);
@@ -2584,12 +2608,12 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		prt_newline(out);
 	}
 
-	prt_printf(out, "\nbuckets emptied since mount:\n");
-	prt_printf(out, "device\tdata moved/deleted\tcache evicted\n");
+	prt_printf(out, "\nper device:\tbuckets emptied\tcache evicted\tmove reads now\n");
 	for_each_member_device(c, ca)
-		prt_printf(out, "%u %s\t%llu\t%llu\n", ca->dev_idx, ca->name,
+		prt_printf(out, "%u %s\t%llu\t%llu\t%u\n", ca->dev_idx, ca->name,
 			   (u64) atomic64_read(&ca->buckets_emptied),
-			   (u64) atomic64_read(&ca->buckets_evicted));
+			   (u64) atomic64_read(&ca->buckets_evicted),
+			   atomic_read(&ca->move_reads_in_flight));
 
 	prt_printf(out, "\nmove outcomes since mount:\n");
 	prt_printf(out, "outcome\treconcile\tcopygc\tparked pending\n");

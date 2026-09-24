@@ -374,6 +374,9 @@ BCH_DEBUG_PARAMS_ALL()
 	  "Mover waiting for its in-flight read limit")			\
 	x(move_ratelimit_write,						\
 	  "Mover waiting for its in-flight write limit")		\
+	x(move_blocked_dev_reads,					\
+	  "Mover admission waiting for its source device's "		\
+	  "move_ios_in_flight_per_dev")					\
 	x(journal_flush_write,						\
 	  "Flush journal writes: cache flush to devices "		\
 	  "then FUA journal writes")					\
@@ -642,6 +645,9 @@ struct bch_dev {
 	/* Buckets that became empty (-> need_discard) since mount: */
 	atomic64_t		buckets_emptied;	/* last dirty data moved or deleted */
 	atomic64_t		buckets_evicted;	/* cached copies invalidated */
+
+	/* Move reads in flight that named this device as their source */
+	atomic_t		move_reads_in_flight;
 };
 
 /*

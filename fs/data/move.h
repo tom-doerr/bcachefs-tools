@@ -109,6 +109,7 @@ void bch2_moving_ctxt_do_pending_writes(struct moving_context *);
 void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
 int bch2_move_ratelimit(struct moving_context *);
+int bch2_move_wait_dev_reads(struct moving_context *, unsigned);
 
 int bch2_move_extent(struct moving_context *,
 		     struct move_bucket *,
