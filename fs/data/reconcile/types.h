@@ -69,6 +69,19 @@ enum move_outcome {
 	MOVE_OUTCOME_NR,
 };
 
+/*
+ * A lap is one full pass over a long phase's keyspace, taken cyclically from
+ * wherever the phase was last interrupted: [start, end of range], then
+ * wrapped to [range start, start). Interruptions (kicks, deferral limits)
+ * save the cursor instead of throwing the lap away.
+ */
+struct reconcile_lap {
+	struct bpos			cursor;
+	struct bpos			start;
+	bool				active;
+	bool				wrapped;
+};
+
 struct bch_fs_reconcile {
 	struct task_struct __rcu	*thread;
 	u32				kick;
@@ -100,7 +113,9 @@ struct bch_fs_reconcile {
 	u64				destage_deferred;
 	u64				deferred;
 
-	/* Since mount, written only by the reconcile thread: */
+	/* Written only by the reconcile thread: */
+	struct reconcile_lap		laps[RECONCILE_NR_PHASES];
+	u64				laps_completed[RECONCILE_NR_PHASES];
 	u64				phase_exits[RECONCILE_NR_PHASES][RECONCILE_PHASE_EXIT_NR];
 
 	/*

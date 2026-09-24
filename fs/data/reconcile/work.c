@@ -1682,11 +1682,80 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
 	return 0;
 }
 
+/*
+ * The long keyed phases resume where they were interrupted; the scan, btree
+ * and pending phases are short, and restart from the beginning:
+ */
+static bool reconcile_phase_resumable(unsigned i)
+{
+	struct reconcile_phase p = reconcile_phases[i];
+
+	return p.type == RECONCILE_PHASE_destage ||
+		(p.type == RECONCILE_PHASE_normal && p.priority != RECONCILE_WORK_pending);
+}
+
+static struct bpos reconcile_work_pos_successor(struct bbpos pos)
+{
+	return btree_type_has_snapshot_field(pos.btree)
+		? bpos_successor(pos.pos)
+		: bpos_nosnap_successor(pos.pos);
+}
+
+/* Inclusive end of the range the current lap still has to cover */
+static struct bpos reconcile_phase_end(struct bch_fs_reconcile *r)
+{
+	struct reconcile_phase p = reconcile_phases[r->phase];
+	struct reconcile_lap *lap = &r->laps[r->phase];
+
+	if (!reconcile_phase_resumable(r->phase) || !lap->wrapped)
+		return p.end;
+
+	return btree_type_has_snapshot_field(p.btree)
+		? bpos_predecessor(lap->start)
+		: bpos_nosnap_predecessor(lap->start);
+}
+
+/*
+ * The range to the end is done: if the lap began partway in, go back to the
+ * range start for the part before it. Returns false when the lap is complete.
+ */
+static bool reconcile_lap_wrap(struct bch_fs_reconcile *r)
+{
+	struct reconcile_phase p = reconcile_phases[r->phase];
+	struct reconcile_lap *lap = &r->laps[r->phase];
+
+	if (!reconcile_phase_resumable(r->phase))
+		return false;
+
+	if (!lap->wrapped && bpos_gt(lap->start, p.start)) {
+		lap->wrapped = true;
+		r->work_pos.pos = p.start;
+		return true;
+	}
+
+	lap->active = false;
+	r->laps_completed[r->phase]++;
+	return false;
+}
+
 static void reconcile_phase_start(struct bch_fs *c)
 {
 	struct bch_fs_reconcile *r = &c->reconcile;
 	struct reconcile_phase p = reconcile_phases[r->phase];
-	r->work_pos = BBPOS(p.btree, p.start);
+	struct reconcile_lap *lap = &r->laps[r->phase];
+
+	if (reconcile_phase_resumable(r->phase)) {
+		if (!lap->active)
+			*lap = (struct reconcile_lap) {
+				.cursor		= p.start,
+				.start		= p.start,
+				.active		= true,
+			};
+
+		r->work_pos = BBPOS(p.btree, lap->cursor);
+	} else {
+		r->work_pos = BBPOS(p.btree, p.start);
+	}
 
 	switch (p.type) {
 	case RECONCILE_PHASE_normal:
@@ -1831,7 +1900,7 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		bch2_trans_begin(trans);
 
 		struct bkey_s_c k = next_reconcile_entry(trans, p->work, &r->work_pos,
-							 reconcile_phases[r->phase].end);
+							 reconcile_phase_end(r));
 		ret = bkey_err(k);
 		if (ret) {
 			p->exit = RECONCILE_PHASE_EXIT_error;
@@ -1839,6 +1908,9 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		}
 
 		if (!k.k) {
+			if (reconcile_lap_wrap(r))
+				continue;
+
 			p->exit = RECONCILE_PHASE_EXIT_exhausted;
 			return 0;
 		}
@@ -1879,8 +1951,9 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 				r->destage_deferred++;
 
 			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED) {
+				r->work_pos.pos = reconcile_work_pos_successor(r->work_pos);
 				p->exit = RECONCILE_PHASE_EXIT_deferred_limit;
-				return 0;
+				break;
 			}
 		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
@@ -1893,13 +1966,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			do_retry_stripes(ctxt, p->stripe_retry);
 		}
 
-		r->work_pos.pos = btree_type_has_snapshot_field(r->work_pos.btree)
-			? bpos_successor(r->work_pos.pos)
-			: bpos_nosnap_successor(r->work_pos.pos);
+		r->work_pos.pos = reconcile_work_pos_successor(r->work_pos);
 	}
 
 	if (p->exit == RECONCILE_PHASE_EXIT_stopped && kick != r->kick)
 		p->exit = RECONCILE_PHASE_EXIT_kick;
+
+	/* work_pos is past the last entry handled: resume there */
+	if (reconcile_phase_resumable(r->phase))
+		r->laps[r->phase].cursor = r->work_pos.pos;
 	return ret;
 }
 
@@ -2251,6 +2326,22 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		prt_tab(out);
 		for (unsigned j = 0; j < RECONCILE_PHASE_EXIT_NR; j++)
 			prt_printf(out, "%llu\t", r->phase_exits[i][j]);
+		prt_newline(out);
+	}
+
+	prt_printf(out, "\nlaps of resumable phases:\n");
+	prt_printf(out, "phase\tcompleted\tin progress\tcursor\n");
+	for (unsigned i = 0; i < ARRAY_SIZE(reconcile_phases); i++) {
+		if (!reconcile_phase_resumable(i))
+			continue;
+
+		struct reconcile_lap lap = r->laps[i];
+
+		reconcile_phase_name_to_text(out, i);
+		prt_printf(out, "\t%llu\t%s\t", r->laps_completed[i],
+			   !lap.active ? "no" : lap.wrapped ? "wrapped" : "yes");
+		if (lap.active)
+			bch2_bpos_to_text(out, lap.cursor);
 		prt_newline(out);
 	}
 
