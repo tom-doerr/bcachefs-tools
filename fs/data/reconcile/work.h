@@ -85,6 +85,7 @@ int bch2_extent_reconcile_pending_mod(struct btree_trans *, struct btree_iter *,
 
 void bch2_reconcile_status_to_text(struct printbuf *, struct bch_fs *);
 void bch2_reconcile_stats_to_text(struct printbuf *, struct bch_fs *);
+void bch2_reconcile_moves_to_text(struct printbuf *, struct bch_fs *);
 void bch2_reconcile_scan_pending_to_text(struct printbuf *, struct bch_fs *);
 
 void bch2_reconcile_stop(struct bch_fs *);

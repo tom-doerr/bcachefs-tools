@@ -227,6 +227,7 @@ read_attribute(copy_gc_wait);
 
 read_attribute(reconcile_status);
 read_attribute(reconcile_stats);
+read_attribute(reconcile_moves);
 read_attribute(reconcile_scan_pending);
 read_attribute(snapshot_delete_status);
 read_attribute(recovery_status);
@@ -342,6 +343,9 @@ SHOW(bch2_fs)
 
 	if (attr == &sysfs_reconcile_stats)
 		bch2_reconcile_stats_to_text(out, c);
+
+	if (attr == &sysfs_reconcile_moves)
+		bch2_reconcile_moves_to_text(out, c);
 
 	if (attr == &sysfs_reconcile_scan_pending)
 		bch2_reconcile_scan_pending_to_text(out, c);
@@ -660,6 +664,7 @@ struct attribute *bch2_fs_internal_files[] = {
 
 	&sysfs_copy_gc_wait,
 	&sysfs_reconcile_stats,
+	&sysfs_reconcile_moves,
 
 	&sysfs_moving_ctxts,
 	&sysfs_recent_counters,

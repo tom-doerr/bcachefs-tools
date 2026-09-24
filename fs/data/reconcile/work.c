@@ -2507,47 +2507,43 @@ static __cold void reconcile_phase_name_to_text(struct printbuf *out, unsigned i
 }
 
 /*
- * Counters for tuning and diagnosing the reconcile scheduler; kept out of
- * reconcile_status, which sysfs truncates at a page and whose tail is the
- * thread backtrace.
+ * Counters for tuning and diagnosing reconcile, kept out of reconcile_status
+ * (whose tail is the thread backtrace) and split in two - sysfs truncates at
+ * a page: the scheduler here, the work done in bch2_reconcile_moves_to_text().
+ * Zero counts are left out. Racy reads of counters the reconcile thread and
+ * phys workers update; fine for monitoring.
  */
 __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct bch_fs_reconcile *r = &c->reconcile;
-
-	printbuf_tabstop_push(out, 24);
-	for (unsigned i = 0; i < RECONCILE_PHASE_EXIT_NR; i++)
-		printbuf_tabstop_push(out, 16);
-
 	struct move_budget *b = &r->move_budget;
-	prt_printf(out, "in flight, all contexts:\tios\tsectors\n");
-	prt_printf(out, "reads\t%u\t%u\n", atomic_read(&b->read_ios), atomic_read(&b->read_sectors));
-	prt_printf(out, "writes\t%u\t%u\n", atomic_read(&b->write_ios), atomic_read(&b->write_sectors));
-	prt_printf(out, "limit\t%u\t%u\n\n", b->max_ios, b->max_sectors);
 
-	prt_printf(out, "kicks since mount:\n");
-	scoped_guard(printbuf_indent, out)
-		for (unsigned i = 0; i < RECONCILE_KICK_NR; i++)
-			prt_printf(out, "%s\t%llu\n",
-				   bch2_reconcile_kick_reasons[i],
-				   (u64) atomic64_read(&r->kicks[i]));
+	prt_printf(out, "in flight, all contexts: reads %u ios %u sectors, writes %u ios %u sectors, limit %u ios %u sectors\n",
+		   atomic_read(&b->read_ios), atomic_read(&b->read_sectors),
+		   atomic_read(&b->write_ios), atomic_read(&b->write_sectors),
+		   READ_ONCE(b->max_ios), READ_ONCE(b->max_sectors));
 
-	prt_printf(out, "\nphase exits since mount:\n");
-	prt_printf(out, "phase\t");
-	for (unsigned i = 0; i < RECONCILE_PHASE_EXIT_NR; i++)
-		prt_printf(out, "%s\t", bch2_reconcile_phase_exits[i]);
+	prt_str(out, "kicks:");
+	for (unsigned i = 0; i < RECONCILE_KICK_NR; i++) {
+		u64 v = atomic64_read(&r->kicks[i]);
+		if (v)
+			prt_printf(out, " %s=%llu", bch2_reconcile_kick_reasons[i], v);
+	}
 	prt_newline(out);
 
+	prt_str(out, "\nphase exits:\n");
 	for (unsigned i = 0; i < ARRAY_SIZE(reconcile_phases); i++) {
 		reconcile_phase_name_to_text(out, i);
-		prt_tab(out);
-		for (unsigned j = 0; j < RECONCILE_PHASE_EXIT_NR; j++)
-			prt_printf(out, "%llu\t", r->phase_exits[i][j]);
+		prt_char(out, ':');
+		for (unsigned j = 0; j < RECONCILE_PHASE_EXIT_NR; j++) {
+			u64 v = data_race(r->phase_exits[i][j]);
+			if (v)
+				prt_printf(out, " %s=%llu", bch2_reconcile_phase_exits[j], v);
+		}
 		prt_newline(out);
 	}
 
-	prt_printf(out, "\nlaps of resumable phases:\n");
-	prt_printf(out, "phase\tcompleted\tin progress\tcursor\n");
+	prt_str(out, "\nlaps (completed, cursor if in progress):\n");
 	for (unsigned i = 0; i < ARRAY_SIZE(reconcile_phases); i++) {
 		if (!reconcile_phase_resumable(i))
 			continue;
@@ -2555,56 +2551,64 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		struct reconcile_lap lap = data_race(r->laps[i]);
 
 		reconcile_phase_name_to_text(out, i);
-		prt_printf(out, "\t%llu\t%s\t", data_race(r->laps_completed[i]),
-			   lap.active ? "yes" : "no");
-		if (lap.active)
+		prt_printf(out, ": %llu", data_race(r->laps_completed[i]));
+		if (lap.active) {
+			prt_str(out, ", at ");
 			bch2_bpos_to_text(out, lap.cursor);
-		prt_newline(out);
-	}
-
-	prt_printf(out, "\nphys laps (rotational devices):\n");
-	prt_printf(out, "device\thipri\tnormal\n");
-	for_each_member_device(c, ca) {
-		if (!ca->mi.rotational)
-			continue;
-
-		prt_printf(out, "%u %s", ca->dev_idx, ca->name);
-		for (unsigned prio = 0; prio < 2; prio++) {
-			struct reconcile_lap lap = data_race(r->phys_laps[ca->dev_idx * 2 + prio]);
-
-			prt_tab(out);
-			if (!lap.active)
-				prt_str(out, "idle");
-			else
-				prt_printf(out, "at %llu", lap.cursor.offset);
 		}
 		prt_newline(out);
 	}
 
-	prt_printf(out, "\ncommitted since mount (moves completed and indexed):\n");
-	prt_printf(out, "phase\tkeys\tdata\n");
+	for_each_member_device(c, ca) {
+		if (!ca->mi.rotational)
+			continue;
+
+		prt_printf(out, "phys %u %s:", ca->dev_idx, ca->name);
+		for (unsigned prio = 0; prio < 2; prio++) {
+			struct reconcile_lap lap = data_race(r->phys_laps[ca->dev_idx * 2 + prio]);
+
+			prt_printf(out, " %s ", prio ? "normal" : "hipri");
+			if (lap.active)
+				prt_printf(out, "at %llu", lap.cursor.offset);
+			else
+				prt_str(out, "idle");
+		}
+		prt_newline(out);
+	}
+}
+
+__cold void bch2_reconcile_moves_to_text(struct printbuf *out, struct bch_fs *c)
+{
+	struct bch_fs_reconcile *r = &c->reconcile;
+
+	prt_str(out, "committed (moves completed and indexed):\n");
 	for (unsigned i = 0; i < ARRAY_SIZE(reconcile_phases); i++) {
+		u64 keys = atomic64_read(&r->phase_committed_keys[i]);
+		if (!keys)
+			continue;
+
 		reconcile_phase_name_to_text(out, i);
-		prt_printf(out, "\t%llu\t", (u64) atomic64_read(&r->phase_committed_keys[i]));
+		prt_printf(out, ": %llu keys, ", keys);
 		prt_human_readable_u64(out, atomic64_read(&r->phase_committed_sectors[i]) << 9);
 		prt_newline(out);
 	}
 
-	prt_printf(out, "\nper device:\tbuckets emptied\tcache evicted\tmove reads now\n");
+	prt_str(out, "\nmove outcomes (reconcile, copygc, parked pending):\n");
+	for (unsigned i = 0; i < MOVE_OUTCOME_NR; i++) {
+		u64 rc = atomic64_read(&r->move_outcomes[0][i]);
+		u64 gc = atomic64_read(&r->move_outcomes[1][i]);
+		u64 pending = atomic64_read(&r->pending_reasons[i]);
+
+		if (rc || gc || pending)
+			prt_printf(out, "%s: %llu %llu %llu\n", bch2_move_outcomes[i], rc, gc, pending);
+	}
+
+	prt_str(out, "\nper device (buckets emptied, cache evicted, move reads in flight):\n");
 	for_each_member_device(c, ca)
-		prt_printf(out, "%u %s\t%llu\t%llu\t%u\n", ca->dev_idx, ca->name,
+		prt_printf(out, "%u %s: %llu %llu %u\n", ca->dev_idx, ca->name,
 			   (u64) atomic64_read(&ca->buckets_emptied),
 			   (u64) atomic64_read(&ca->buckets_evicted),
 			   atomic_read(&ca->move_reads_in_flight));
-
-	prt_printf(out, "\nmove outcomes since mount:\n");
-	prt_printf(out, "outcome\treconcile\tcopygc\tparked pending\n");
-	for (unsigned i = 0; i < MOVE_OUTCOME_NR; i++)
-		prt_printf(out, "%s\t%llu\t%llu\t%llu\n",
-			   bch2_move_outcomes[i],
-			   (u64) atomic64_read(&r->move_outcomes[0][i]),
-			   (u64) atomic64_read(&r->move_outcomes[1][i]),
-			   (u64) atomic64_read(&r->pending_reasons[i]));
 }
 
 __cold void bch2_reconcile_scan_pending_to_text(struct printbuf *out, struct bch_fs *c)
