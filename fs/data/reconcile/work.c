@@ -1855,7 +1855,7 @@ static void reconcile_phase_start(struct bch_fs *c)
 			};
 
 			if (p.type == RECONCILE_PHASE_destage)
-				r->destage_lap_attempted = 0;
+				r->destage_lap_moved = 0;
 		}
 
 		r->work_pos = BBPOS(p.btree, lap->cursor);
@@ -1964,6 +1964,7 @@ static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
 {
 	struct btree_trans *trans = p->ctxt->trans;
 	struct bch_fs_reconcile *r = &trans->c->reconcile;
+	u64 moved = atomic64_read(&r->work_stats.keys_moved);
 
 	int ret = lockrestart_do(trans,
 		do_reconcile_extent_destage(p->ctxt, p->snapshot_io_opts, r->work_pos,
@@ -1973,8 +1974,11 @@ static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
 		return 0;
 	}
 
+	/* not attempts: an entry skipped further in doesn't start a move */
+	if (atomic64_read(&r->work_stats.keys_moved) != moved)
+		r->destage_lap_moved++;
+
 	r->destage_attempted++;
-	r->destage_lap_attempted++;
 	if (!ret)
 		r->destage_completed++;
 	return ret;
@@ -2160,12 +2164,14 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 
 	/*
 	 * Nothing for the filtered destage walk to find - or its last lap
-	 * found nothing: target work it can't do (stuck entries, work on
-	 * rotational devices) mustn't make it walk the work btree every pass.
+	 * moved nothing and nothing has kicked reconcile since: target work
+	 * it can't do (stuck entries, work on rotational devices) mustn't make
+	 * it walk the work btree every pass.
 	 */
 	if (phase.type == RECONCILE_PHASE_destage &&
 	    (!reconcile_target_work_pending(c) ||
-	     ktime_get_ns() < r->destage_idle_until)) {
+	     (ktime_get_ns() < r->destage_idle_until &&
+	      r->destage_idle_kick == kick))) {
 		p->exit = RECONCILE_PHASE_EXIT_skipped;
 		return 0;
 	}
@@ -2206,8 +2212,10 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 
 		if (!ret &&
 		    p->exit == RECONCILE_PHASE_EXIT_exhausted &&
-		    !r->destage_lap_attempted)
-			r->destage_idle_until = ktime_get_ns() + 10ULL * 60 * NSEC_PER_SEC;
+		    !r->destage_lap_moved) {
+			r->destage_idle_until	= ktime_get_ns() + 10ULL * 60 * NSEC_PER_SEC;
+			r->destage_idle_kick	= kick;
+		}
 		return ret;
 	}
 	default:
