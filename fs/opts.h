@@ -559,6 +559,19 @@ enum fsck_err_opts {
 	  BCH2_NO_SB_OPT,			true,			\
 	  NULL,		"Enable copygc: disable for debugging, or to\n"\
 			"quiet the system when doing performance testing\n")\
+	x(reconcile_destage_slice_ms,	u32,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_UINT(0, U32_MAX),						\
+	  BCH2_NO_SB_OPT,		60000,				\
+	  NULL,		"Longest the destage phase runs before the\n"	\
+			"next reconcile phase gets a turn; 0: no limit\n")	\
+	x(reconcile_phase_slice_ms,	u32,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_UINT(0, U32_MAX),						\
+	  BCH2_NO_SB_OPT,		60000,				\
+	  NULL,		"Longest the normal priority phys and logical\n"	\
+			"reconcile phases run before destage gets a\n"	\
+			"turn again; 0: no limit\n")				\
 	x(reconcile_wait_on_copygc,	u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_BOOL(),							\

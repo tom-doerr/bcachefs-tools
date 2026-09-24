@@ -1606,6 +1606,7 @@ typedef struct {
 	unsigned		dev;
 	unsigned		reconcile_phase;
 	u32			kick;
+	u64			deadline;
 	struct closure		cl;
 
 	struct bch_move_stats	stats;
@@ -1695,6 +1696,11 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 			break;
 		}
 
+		if (thr->deadline && ktime_get_ns() > thr->deadline) {
+			thr->exit = RECONCILE_PHASE_EXIT_yield;
+			break;
+		}
+
 		bch2_trans_begin(trans);
 
 		struct bpos end = lap->wrapped
@@ -1780,6 +1786,7 @@ static enum reconcile_phase_exit reconcile_phys_exit(darray_reconcile_phys_thr *
 		RECONCILE_PHASE_EXIT_error,
 		RECONCILE_PHASE_EXIT_stopped,
 		RECONCILE_PHASE_EXIT_kick,
+		RECONCILE_PHASE_EXIT_yield,
 		RECONCILE_PHASE_EXIT_deferred_limit,
 	};
 
@@ -1791,7 +1798,7 @@ static enum reconcile_phase_exit reconcile_phys_exit(darray_reconcile_phys_thr *
 }
 
 static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase, u32 kick,
-			     enum reconcile_phase_exit *exit)
+			     u64 deadline, enum reconcile_phase_exit *exit)
 {
 	CLASS(darray_reconcile_phys_thr, thrs)();
 	CLASS(closure_stack, cl)();
@@ -1804,6 +1811,7 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase, u32 kic
 						.dev			= ca->dev_idx,
 						.reconcile_phase	= reconcile_phase,
 						.kick			= kick,
+						.deadline		= deadline,
 						})));
 
 	darray_for_each(thrs, i)
@@ -1922,6 +1930,13 @@ struct reconcile_pass {
 
 	/* Set by the phase functions: why the last phase returned */
 	enum reconcile_phase_exit	exit;
+
+	/* ktime_get_ns() at which the current phase yields; 0: no limit */
+	u64				deadline;
+	/* A phase yielded with work left: don't wait at the end of the pass */
+	bool				yielded;
+	/* This pass's normal phys phase yielded; see do_reconcile_phase() */
+	bool				phys_yielded;
 };
 
 /* Per-key handler: returns the result of processing one key in a keyed phase. */
@@ -2016,6 +2031,11 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 	       !test_bit(BCH_FS_going_ro, &c->flags) &&
 	       bch2_reconcile_enabled(c) &&
 	       kick == r->kick) {
+		if (p->deadline && ktime_get_ns() > p->deadline) {
+			p->exit = RECONCILE_PHASE_EXIT_yield;
+			break;
+		}
+
 		bch2_trans_begin(trans);
 
 		struct bkey_s_c k = next_reconcile_entry(trans, p->work, &r->work_pos,
@@ -2109,19 +2129,73 @@ static int do_reconcile_phase_phys(struct reconcile_pass *p, u32 kick)
 	struct bch_fs_reconcile *r = &c->reconcile;
 
 	bch2_trans_unlock_long(trans);
-	int ret = do_reconcile_phys(c, r->phase, kick, &p->exit);
+	int ret = do_reconcile_phys(c, r->phase, kick, p->deadline, &p->exit);
 	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart));
 	return ret;
+}
+
+static bool reconcile_target_work_pending(struct bch_fs *c)
+{
+	struct disk_accounting_pos pos;
+	disk_accounting_key_init(pos, reconcile_work,
+				 BCH_RECONCILE_ACCOUNTING_target);
+
+	u64 v[2];
+	bch2_accounting_mem_read(c, disk_accounting_pos_to_bpos(&pos), v, ARRAY_SIZE(v));
+	return v[0] || v[1];
+}
+
+/*
+ * The normal priority destage, phys and logical phases take turns instead of
+ * each running until empty, so destage recurs while a long phys backlog (EC
+ * of rotational data) drains; hipri phases still run until empty.
+ */
+static u64 reconcile_phase_slice_ms(struct bch_fs *c, unsigned i)
+{
+	struct reconcile_phase p = reconcile_phases[i];
+
+	if (p.priority != RECONCILE_WORK_normal)
+		return 0;
+	if (p.type == RECONCILE_PHASE_destage)
+		return c->opts.reconcile_destage_slice_ms;
+	if (p.type == RECONCILE_PHASE_phys ||
+	    p.type == RECONCILE_PHASE_normal)
+		return c->opts.reconcile_phase_slice_ms;
+	return 0;
 }
 
 static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 {
 	struct btree_trans *trans = p->ctxt->trans;
-	struct bch_fs_reconcile *r = &trans->c->reconcile;
+	struct bch_fs *c = trans->c;
+	struct bch_fs_reconcile *r = &c->reconcile;
+	struct reconcile_phase phase = reconcile_phases[r->phase];
+
+	u64 slice_ms = reconcile_phase_slice_ms(c, r->phase);
+	p->deadline = slice_ms ? ktime_get_ns() + slice_ms * NSEC_PER_MSEC : 0;
+
+	/* Nothing for the filtered destage walk to find: */
+	if (phase.type == RECONCILE_PHASE_destage &&
+	    !reconcile_target_work_pending(c)) {
+		p->exit = RECONCILE_PHASE_EXIT_skipped;
+		return 0;
+	}
+
+	/*
+	 * Rotational work is also indexed in the logical btree, but must be
+	 * done in LBA order by the phys phase: while that has a lap in
+	 * progress the logical phase would do it in inode:offset order.
+	 */
+	if (phase.type == RECONCILE_PHASE_normal &&
+	    phase.priority == RECONCILE_WORK_normal &&
+	    p->phys_yielded) {
+		p->exit = RECONCILE_PHASE_EXIT_skipped;
+		return 0;
+	}
 
 	bch2_btree_write_buffer_flush_sync(trans);
 
-	switch (reconcile_phases[r->phase].type) {
+	switch (phase.type) {
 	case RECONCILE_PHASE_scan:
 		return do_reconcile_phase_iter(p, kick, do_reconcile_scan_key);
 	case RECONCILE_PHASE_btree:
@@ -2203,6 +2277,8 @@ static int do_reconcile(struct moving_context *ctxt)
 		 */
 		kick = r->kick;
 
+		pass.phys_yielded = false;
+
 		for (r->phase = 0; r->phase < ARRAY_SIZE(reconcile_phases); r->phase++) {
 			reconcile_phase_start(c);
 
@@ -2222,6 +2298,12 @@ static int do_reconcile(struct moving_context *ctxt)
 				: pass.exit]++;
 			if (ret)
 				goto out;
+
+			if (pass.exit == RECONCILE_PHASE_EXIT_yield) {
+				pass.yielded = true;
+				if (reconcile_phases[r->phase].type == RECONCILE_PHASE_phys)
+					pass.phys_yielded = true;
+			}
 
 			work.nr = 0;
 
@@ -2249,6 +2331,7 @@ out:
 	    !kthread_should_stop() &&
 	    !atomic64_read(&r->work_stats.sectors_seen) &&
 	    !sectors_scanned &&
+	    !pass.yielded &&
 	    kick == r->kick) {
 		bch2_moving_ctxt_flush_all(ctxt);
 		bch2_trans_unlock_long(trans);

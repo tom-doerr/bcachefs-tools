@@ -33,7 +33,9 @@ enum reconcile_kick_reason {
 #define RECONCILE_PHASE_EXITS()		\
 	x(exhausted)			\
 	x(kick)				\
+	x(yield)			\
 	x(deferred_limit)		\
+	x(skipped)			\
 	x(stopped)			\
 	x(error)
 
