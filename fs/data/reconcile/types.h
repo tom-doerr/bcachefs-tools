@@ -72,16 +72,13 @@ enum move_outcome {
 };
 
 /*
- * A lap is one full pass over a long phase's keyspace, taken cyclically from
- * wherever the phase was last interrupted: [start, end of range], then
- * wrapped to [range start, start). Interruptions (kicks, deferral limits)
- * save the cursor instead of throwing the lap away.
+ * A lap is one pass over a long phase's keyspace, from its start to its end;
+ * interruptions (kicks, time slices, deferral limits) save the cursor, and
+ * the phase resumes there instead of starting over.
  */
 struct reconcile_lap {
 	struct bpos			cursor;
-	struct bpos			start;
 	bool				active;
-	bool				wrapped;
 };
 
 struct bch_fs_reconcile {

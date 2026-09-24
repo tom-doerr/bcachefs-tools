@@ -1618,12 +1618,6 @@ static struct bpos reconcile_work_pos_successor(struct bbpos pos)
 		: bpos_nosnap_successor(pos.pos);
 }
 
-static struct bpos reconcile_work_pos_predecessor(struct bbpos pos)
-{
-	return btree_type_has_snapshot_field(pos.btree)
-		? bpos_predecessor(pos.pos)
-		: bpos_nosnap_predecessor(pos.pos);
-}
 
 typedef struct {
 	struct bch_fs		*c;
@@ -1678,6 +1672,7 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	darray_make_room(&work, RECONCILE_WORK_BUF_NR);
 	if (!work.size) {
 		bch_err(c, "%s: unable to allocate memory", __func__);
+		thr->exit = RECONCILE_PHASE_EXIT_error;
 		bch2_moving_ctxt_exit(&ctxt);
 		closure_return(cl);
 		return;
@@ -1690,18 +1685,13 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	struct wb_maybe_flush last_flushed __cleanup(wb_maybe_flush_exit);
 	wb_maybe_flush_init(&last_flushed);
 
-	/*
-	 * This device's lap: LBA order from wherever the last one stopped,
-	 * wrapping to the start of the device for the part before it.
-	 */
+	/* This device's lap, in LBA order from wherever it was interrupted: */
 	enum btree_id btree = reconcile_phases[thr->reconcile_phase].btree;
-	struct bpos range_start = POS(thr->dev, 0);
 	struct reconcile_lap *lap = reconcile_phys_lap(c, thr->dev, thr->reconcile_phase);
 
 	if (!lap->active)
 		*lap = (struct reconcile_lap) {
-			.cursor	= range_start,
-			.start	= range_start,
+			.cursor	= POS(thr->dev, 0),
 			.active	= true,
 		};
 
@@ -1722,30 +1712,16 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 			break;
 		}
 
-		if (thr->deadline && ktime_get_ns() > thr->deadline) {
-			thr->exit = RECONCILE_PHASE_EXIT_yield;
-			break;
-		}
-
 		bch2_trans_begin(trans);
 
-		struct bpos end = lap->wrapped
-			? reconcile_work_pos_predecessor(BBPOS(btree, lap->start))
-			: POS(thr->dev, U64_MAX);
-		struct bkey_s_c k = next_reconcile_entry(trans, &work, &work_pos, end);
+		struct bkey_s_c k = next_reconcile_entry(trans, &work, &work_pos,
+							 POS(thr->dev, U64_MAX));
 		if (bkey_err(k)) {
 			thr->exit = RECONCILE_PHASE_EXIT_error;
 			break;
 		}
 
 		if (!k.k || k.k->p.inode != thr->dev) {
-			if (!lap->wrapped && bpos_gt(lap->start, range_start)) {
-				lap->wrapped	= true;
-				work_pos.pos	= range_start;
-				resume		= range_start;
-				continue;
-			}
-
 			lap->active = false;
 			thr->exit = RECONCILE_PHASE_EXIT_exhausted;
 			break;
@@ -1777,22 +1753,26 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 			copygc_run_count = c->copygc.run_count;
 			thr->deferred++;
 
-			resume = reconcile_work_pos_successor(BBPOS(btree, pos));
 			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED) {
+				resume = reconcile_work_pos_successor(BBPOS(btree, pos));
 				thr->exit = RECONCILE_PHASE_EXIT_deferred_limit;
 				break;
 			}
-			continue;
-		}
-
-		if (ret) {
+		} else if (ret) {
 			resume = pos;
 			thr->exit = RECONCILE_PHASE_EXIT_error;
 			break;
+		} else {
+			consecutive_deferred = 0;
 		}
 
-		consecutive_deferred = 0;
 		resume = reconcile_work_pos_successor(BBPOS(btree, pos));
+
+		/* Checked after a key, so every slice makes progress: */
+		if (thr->deadline && ktime_get_ns() > thr->deadline) {
+			thr->exit = RECONCILE_PHASE_EXIT_yield;
+			break;
+		}
 	}
 
 	if (lap->active)
@@ -1863,41 +1843,6 @@ static bool reconcile_phase_resumable(unsigned i)
 		(p.type == RECONCILE_PHASE_normal && p.priority != RECONCILE_WORK_pending);
 }
 
-/* Inclusive end of the range the current lap still has to cover */
-static struct bpos reconcile_phase_end(struct bch_fs_reconcile *r)
-{
-	struct reconcile_phase p = reconcile_phases[r->phase];
-	struct reconcile_lap *lap = &r->laps[r->phase];
-
-	if (!reconcile_phase_resumable(r->phase) || !lap->wrapped)
-		return p.end;
-
-	return reconcile_work_pos_predecessor(BBPOS(p.btree, lap->start));
-}
-
-/*
- * The range to the end is done: if the lap began partway in, go back to the
- * range start for the part before it. Returns false when the lap is complete.
- */
-static bool reconcile_lap_wrap(struct bch_fs_reconcile *r)
-{
-	struct reconcile_phase p = reconcile_phases[r->phase];
-	struct reconcile_lap *lap = &r->laps[r->phase];
-
-	if (!reconcile_phase_resumable(r->phase))
-		return false;
-
-	if (!lap->wrapped && bpos_gt(lap->start, p.start)) {
-		lap->wrapped = true;
-		r->work_pos.pos = p.start;
-		return true;
-	}
-
-	lap->active = false;
-	r->laps_completed[r->phase]++;
-	return false;
-}
-
 static void reconcile_phase_start(struct bch_fs *c)
 {
 	struct bch_fs_reconcile *r = &c->reconcile;
@@ -1908,7 +1853,6 @@ static void reconcile_phase_start(struct bch_fs *c)
 		if (!lap->active) {
 			*lap = (struct reconcile_lap) {
 				.cursor		= p.start,
-				.start		= p.start,
 				.active		= true,
 			};
 
@@ -2062,15 +2006,10 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 	       !test_bit(BCH_FS_going_ro, &c->flags) &&
 	       bch2_reconcile_enabled(c) &&
 	       kick == r->kick) {
-		if (p->deadline && ktime_get_ns() > p->deadline) {
-			p->exit = RECONCILE_PHASE_EXIT_yield;
-			break;
-		}
-
 		bch2_trans_begin(trans);
 
 		struct bkey_s_c k = next_reconcile_entry(trans, p->work, &r->work_pos,
-							 reconcile_phase_end(r));
+							 reconcile_phases[r->phase].end);
 		ret = bkey_err(k);
 		if (ret) {
 			p->exit = RECONCILE_PHASE_EXIT_error;
@@ -2078,8 +2017,10 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		}
 
 		if (!k.k) {
-			if (reconcile_lap_wrap(r))
-				continue;
+			if (reconcile_phase_resumable(r->phase)) {
+				r->laps[r->phase].active = false;
+				r->laps_completed[r->phase]++;
+			}
 
 			p->exit = RECONCILE_PHASE_EXIT_exhausted;
 			return 0;
@@ -2137,6 +2078,12 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		}
 
 		r->work_pos.pos = reconcile_work_pos_successor(r->work_pos);
+
+		/* Checked after a key, so every slice makes progress: */
+		if (p->deadline && ktime_get_ns() > p->deadline) {
+			p->exit = RECONCILE_PHASE_EXIT_yield;
+			break;
+		}
 	}
 
 	if (p->exit == RECONCILE_PHASE_EXIT_stopped && kick != r->kick)
@@ -2202,9 +2149,6 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 	struct bch_fs_reconcile *r = &c->reconcile;
 	struct reconcile_phase phase = reconcile_phases[r->phase];
 
-	u64 slice_ms = reconcile_phase_slice_ms(c, r->phase);
-	p->deadline = slice_ms ? ktime_get_ns() + slice_ms * NSEC_PER_MSEC : 0;
-
 	/*
 	 * Nothing for the filtered destage walk to find - or its last lap
 	 * found nothing: target work it can't do (stuck entries, work on
@@ -2230,6 +2174,10 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 	}
 
 	bch2_btree_write_buffer_flush_sync(trans);
+
+	/* the slice starts after the flush, which can take a while */
+	u64 slice_ms = reconcile_phase_slice_ms(c, r->phase);
+	p->deadline = slice_ms ? ktime_get_ns() + slice_ms * NSEC_PER_MSEC : 0;
 
 	switch (phase.type) {
 	case RECONCILE_PHASE_scan:
@@ -2318,6 +2266,7 @@ static int do_reconcile(struct moving_context *ctxt)
 		 */
 		kick = r->kick;
 
+		pass.yielded = false;
 		pass.phys_yielded = false;
 
 		/* runtime options: picked up by every context at the next wait */
@@ -2586,11 +2535,11 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		if (!reconcile_phase_resumable(i))
 			continue;
 
-		struct reconcile_lap lap = r->laps[i];
+		struct reconcile_lap lap = data_race(r->laps[i]);
 
 		reconcile_phase_name_to_text(out, i);
-		prt_printf(out, "\t%llu\t%s\t", r->laps_completed[i],
-			   !lap.active ? "no" : lap.wrapped ? "wrapped" : "yes");
+		prt_printf(out, "\t%llu\t%s\t", data_race(r->laps_completed[i]),
+			   lap.active ? "yes" : "no");
 		if (lap.active)
 			bch2_bpos_to_text(out, lap.cursor);
 		prt_newline(out);
@@ -2604,14 +2553,13 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 
 		prt_printf(out, "%u %s", ca->dev_idx, ca->name);
 		for (unsigned prio = 0; prio < 2; prio++) {
-			struct reconcile_lap lap = r->phys_laps[ca->dev_idx * 2 + prio];
+			struct reconcile_lap lap = data_race(r->phys_laps[ca->dev_idx * 2 + prio]);
 
 			prt_tab(out);
 			if (!lap.active)
 				prt_str(out, "idle");
 			else
-				prt_printf(out, "%s %llu", lap.wrapped ? "wrapped" : "at",
-					   lap.cursor.offset);
+				prt_printf(out, "at %llu", lap.cursor.offset);
 		}
 		prt_newline(out);
 	}
