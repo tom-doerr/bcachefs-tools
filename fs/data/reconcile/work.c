@@ -2510,8 +2510,9 @@ static __cold void reconcile_phase_name_to_text(struct printbuf *out, unsigned i
  * Counters for tuning and diagnosing reconcile, kept out of reconcile_status
  * (whose tail is the thread backtrace) and split in two - sysfs truncates at
  * a page: the scheduler here, the work done in bch2_reconcile_moves_to_text().
- * Zero counts are left out. Racy reads of counters the reconcile thread and
- * phys workers update; fine for monitoring.
+ * Zero counts are left out. Plain racy reads of what the reconcile thread and
+ * phys workers write (a lap may show a cursor and flag from different
+ * moments); fine for monitoring.
  */
 __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 {
@@ -2536,7 +2537,7 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		reconcile_phase_name_to_text(out, i);
 		prt_char(out, ':');
 		for (unsigned j = 0; j < RECONCILE_PHASE_EXIT_NR; j++) {
-			u64 v = data_race(r->phase_exits[i][j]);
+			u64 v = r->phase_exits[i][j];
 			if (v)
 				prt_printf(out, " %s=%llu", bch2_reconcile_phase_exits[j], v);
 		}
@@ -2548,10 +2549,10 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		if (!reconcile_phase_resumable(i))
 			continue;
 
-		struct reconcile_lap lap = data_race(r->laps[i]);
+		struct reconcile_lap lap = r->laps[i];
 
 		reconcile_phase_name_to_text(out, i);
-		prt_printf(out, ": %llu", data_race(r->laps_completed[i]));
+		prt_printf(out, ": %llu", r->laps_completed[i]);
 		if (lap.active) {
 			prt_str(out, ", at ");
 			bch2_bpos_to_text(out, lap.cursor);
@@ -2565,7 +2566,7 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 
 		prt_printf(out, "phys %u %s:", ca->dev_idx, ca->name);
 		for (unsigned prio = 0; prio < 2; prio++) {
-			struct reconcile_lap lap = data_race(r->phys_laps[ca->dev_idx * 2 + prio]);
+			struct reconcile_lap lap = r->phys_laps[ca->dev_idx * 2 + prio];
 
 			prt_printf(out, " %s ", prio ? "normal" : "hipri");
 			if (lap.active)
