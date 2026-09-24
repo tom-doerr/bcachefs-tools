@@ -1905,12 +1905,16 @@ static void reconcile_phase_start(struct bch_fs *c)
 	struct reconcile_lap *lap = &r->laps[r->phase];
 
 	if (reconcile_phase_resumable(r->phase)) {
-		if (!lap->active)
+		if (!lap->active) {
 			*lap = (struct reconcile_lap) {
 				.cursor		= p.start,
 				.start		= p.start,
 				.active		= true,
 			};
+
+			if (p.type == RECONCILE_PHASE_destage)
+				r->destage_lap_attempted = 0;
+		}
 
 		r->work_pos = BBPOS(p.btree, lap->cursor);
 	} else {
@@ -2028,6 +2032,7 @@ static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
 	}
 
 	r->destage_attempted++;
+	r->destage_lap_attempted++;
 	if (!ret)
 		r->destage_completed++;
 	return ret;
@@ -2200,9 +2205,14 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 	u64 slice_ms = reconcile_phase_slice_ms(c, r->phase);
 	p->deadline = slice_ms ? ktime_get_ns() + slice_ms * NSEC_PER_MSEC : 0;
 
-	/* Nothing for the filtered destage walk to find: */
+	/*
+	 * Nothing for the filtered destage walk to find - or its last lap
+	 * found nothing: target work it can't do (stuck entries, work on
+	 * rotational devices) mustn't make it walk the work btree every pass.
+	 */
 	if (phase.type == RECONCILE_PHASE_destage &&
-	    !reconcile_target_work_pending(c)) {
+	    (!reconcile_target_work_pending(c) ||
+	     ktime_get_ns() < r->destage_idle_until)) {
 		p->exit = RECONCILE_PHASE_EXIT_skipped;
 		return 0;
 	}
@@ -2236,6 +2246,11 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 
 		r->destage_ns += ktime_get_ns() - start;
 		r->destage_sweeps++;
+
+		if (!ret &&
+		    p->exit == RECONCILE_PHASE_EXIT_exhausted &&
+		    !r->destage_lap_attempted)
+			r->destage_idle_until = ktime_get_ns() + 10ULL * 60 * NSEC_PER_SEC;
 		return ret;
 	}
 	default:

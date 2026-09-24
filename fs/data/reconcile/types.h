@@ -115,6 +115,11 @@ struct bch_fs_reconcile {
 	u64				destage_deferred;
 	u64				deferred;
 
+	/* Destage keys attempted in the current destage lap */
+	u64				destage_lap_attempted;
+	/* After a lap that found nothing: skip destage until (ktime ns) */
+	u64				destage_idle_until;
+
 	/* In-flight IO across the reconcile thread and its phys workers */
 	struct move_budget		move_budget;
 
