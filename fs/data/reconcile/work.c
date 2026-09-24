@@ -1623,7 +1623,6 @@ typedef struct {
 	struct bch_fs		*c;
 	unsigned		dev;
 	unsigned		reconcile_phase;
-	u32			kick;
 	u64			deadline;
 	struct closure		cl;
 
@@ -1706,11 +1705,6 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 		if (!bch2_reconcile_enabled(c) ||
 		    test_bit(BCH_FS_going_ro, &c->flags))
 			break;
-
-		if (thr->kick != READ_ONCE(c->reconcile.kick)) {
-			thr->exit = RECONCILE_PHASE_EXIT_kick;
-			break;
-		}
 
 		bch2_trans_begin(trans);
 
@@ -1803,7 +1797,7 @@ static enum reconcile_phase_exit reconcile_phys_exit(darray_reconcile_phys_thr *
 	return RECONCILE_PHASE_EXIT_exhausted;
 }
 
-static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase, u32 kick,
+static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase,
 			     u64 deadline, enum reconcile_phase_exit *exit)
 {
 	CLASS(darray_reconcile_phys_thr, thrs)();
@@ -1816,7 +1810,6 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase, u32 kic
 						.c			= c,
 						.dev			= ca->dev_idx,
 						.reconcile_phase	= reconcile_phase,
-						.kick			= kick,
 						.deadline		= deadline,
 						})));
 
@@ -2100,14 +2093,19 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
  * threads which together consume the whole reconcile_*_phys btree, then we
  * return to advance to the next phase.
  */
-static int do_reconcile_phase_phys(struct reconcile_pass *p, u32 kick)
+/*
+ * Workers don't watch for kicks: the phase runs until every device's lap is
+ * done or the slice ends, as it did before laps (a kick per stamped file
+ * during a replica campaign would otherwise cut it short over and over).
+ */
+static int do_reconcile_phase_phys(struct reconcile_pass *p)
 {
 	struct btree_trans *trans = p->ctxt->trans;
 	struct bch_fs *c = trans->c;
 	struct bch_fs_reconcile *r = &c->reconcile;
 
 	bch2_trans_unlock_long(trans);
-	int ret = do_reconcile_phys(c, r->phase, kick, p->deadline, &p->exit);
+	int ret = do_reconcile_phys(c, r->phase, p->deadline, &p->exit);
 	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart));
 	return ret;
 }
@@ -2185,7 +2183,7 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 	case RECONCILE_PHASE_btree:
 		return do_reconcile_phase_iter(p, kick, do_reconcile_btree_key);
 	case RECONCILE_PHASE_phys:
-		return do_reconcile_phase_phys(p, kick);
+		return do_reconcile_phase_phys(p);
 	case RECONCILE_PHASE_normal:
 		return do_reconcile_phase_iter(p, kick, do_reconcile_extent_key);
 	case RECONCILE_PHASE_destage: {

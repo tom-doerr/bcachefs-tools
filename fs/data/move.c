@@ -663,7 +663,7 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 	 * same condition a throttled commit waits out; journal reclaim is what
 	 * writes dirty nodes back, so poke it while waiting:
 	 */
-	if (ctxt->metadata_throttle && bch2_btree_cache_should_throttle(c)) {
+	if (bch2_move_metadata_admission(c, ctxt) && bch2_btree_cache_should_throttle(c)) {
 		u64 metadata_start = local_clock();
 
 		while (bch2_btree_write_ratelimited(c)) {

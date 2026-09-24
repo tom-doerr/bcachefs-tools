@@ -58,9 +58,10 @@ struct moving_context {
 	struct move_budget	*budget;
 
 	/*
-	 * Throttle on dirty btree nodes when starting moves, and let their
-	 * index updates commit without the btree write ratelimit: a completion
-	 * never waits on metadata writeback while holding in-flight budget.
+	 * With reconcile_metadata_admission: throttle on dirty btree nodes when
+	 * starting moves, and let their index updates commit without the btree
+	 * write ratelimit, so a completion never waits on metadata writeback
+	 * while holding in-flight budget. See bch2_move_metadata_admission().
 	 */
 	bool			metadata_throttle;
 
@@ -135,6 +136,11 @@ void bch2_moving_ctxt_do_pending_writes(struct moving_context *);
 void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
 int bch2_move_ratelimit(struct moving_context *);
+
+static inline bool bch2_move_metadata_admission(struct bch_fs *c, struct moving_context *ctxt)
+{
+	return ctxt && ctxt->metadata_throttle && c->opts.reconcile_metadata_admission;
+}
 
 static inline u16 bch2_move_ioprio(struct bch_fs *c)
 {

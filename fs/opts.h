@@ -586,32 +586,39 @@ enum fsck_err_opts {
 	x(move_ios_in_flight_per_dev,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, 1024),						\
-	  BCH2_NO_SB_OPT,		32,				\
+	  BCH2_NO_SB_OPT,		0,				\
 	  NULL,		"Maximum move reads in flight from one device,\n"	\
 			"for moves that choose their source (destage);\n"	\
 			"0: no limit\n")					\
 	x(reconcile_move_ios_in_flight,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
-	  OPT_UINT(1, 4096),						\
-	  BCH2_NO_SB_OPT,		256,				\
+	  OPT_UINT(0, 4096),						\
+	  BCH2_NO_SB_OPT,		0,				\
 	  NULL,		"Maximum IOs in flight across all reconcile\n"	\
-			"move contexts (each also has move_ios_in_flight)\n")\
+			"move contexts (each also has move_ios_in_flight);\n"	\
+			"0: no limit\n")					\
 	x(reconcile_move_bytes_in_flight, u32,				\
 	  OPT_HUMAN_READABLE|OPT_FS|OPT_MOUNT|OPT_RUNTIME,		\
-	  OPT_UINT(1024, U32_MAX),					\
-	  BCH2_NO_SB_OPT,		256U << 20,			\
+	  OPT_UINT(0, U32_MAX),						\
+	  BCH2_NO_SB_OPT,		0,				\
 	  NULL,		"Maximum amount of IO in flight across all\n"	\
-			"reconcile move contexts\n")				\
+			"reconcile move contexts; 0: no limit\n")		\
+	x(reconcile_metadata_admission,	u8,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		"Throttle reconcile on dirty btree nodes when\n"	\
+			"starting moves, instead of when committing them\n")\
 	x(reconcile_destage_slice_ms,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, U32_MAX),						\
-	  BCH2_NO_SB_OPT,		60000,				\
+	  BCH2_NO_SB_OPT,		0,				\
 	  NULL,		"Longest the destage phase runs before the\n"	\
 			"next reconcile phase gets a turn; 0: no limit\n")	\
 	x(reconcile_phase_slice_ms,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, U32_MAX),						\
-	  BCH2_NO_SB_OPT,		60000,				\
+	  BCH2_NO_SB_OPT,		0,				\
 	  NULL,		"Longest the normal priority phys and logical\n"	\
 			"reconcile phases run before destage gets a\n"	\
 			"turn again; 0: no limit\n")				\

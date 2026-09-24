@@ -513,7 +513,7 @@ static int data_update_index_update_key(struct btree_trans *trans,
 	try(bch2_trans_commit(trans, &u->op.res, NULL,
 			      BCH_TRANS_COMMIT_no_check_rw|
 			      BCH_TRANS_COMMIT_no_enospc|
-			      (u->ctxt && u->ctxt->metadata_throttle
+			      (bch2_move_metadata_admission(c, u->ctxt)
 			       ? BCH_TRANS_COMMIT_no_write_ratelimit : 0)|
 			      u->opts.commit_flags));
 
