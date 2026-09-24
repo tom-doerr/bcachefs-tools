@@ -64,8 +64,9 @@ int bch2_set_fs_needs_reconcile(struct bch_fs *);
 
 int bch2_reconcile_scan_cookie_is_set(struct btree_trans *, u64);
 
-static inline void bch2_reconcile_wakeup(struct bch_fs *c)
+static inline void bch2_reconcile_wakeup(struct bch_fs *c, enum reconcile_kick_reason reason)
 {
+	atomic64_inc(&c->reconcile.kicks[reason]);
 	c->reconcile.kick++;
 	guard(rcu)();
 	struct task_struct *p = rcu_dereference(c->reconcile.thread);
@@ -83,6 +84,7 @@ int bch2_extent_reconcile_pending_mod(struct btree_trans *, struct btree_iter *,
 				      unsigned, struct bkey_s_c, bool);
 
 void bch2_reconcile_status_to_text(struct printbuf *, struct bch_fs *);
+void bch2_reconcile_stats_to_text(struct printbuf *, struct bch_fs *);
 void bch2_reconcile_scan_pending_to_text(struct printbuf *, struct bch_fs *);
 
 void bch2_reconcile_stop(struct bch_fs *);

@@ -733,7 +733,7 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 
 	switch (id) {
 	case Opt_reconcile_enabled:
-		bch2_reconcile_wakeup(c);
+		bch2_reconcile_wakeup(c, RECONCILE_KICK_opt_change);
 		break;
 	case Opt_copygc_enabled:
 		bch2_copygc_wakeup(c);
@@ -770,7 +770,7 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 			bch2_sb_upgrade_incompat(c);
 		break;
 	case Opt_read_only:
-		bch2_reconcile_wakeup(c);
+		bch2_reconcile_wakeup(c, RECONCILE_KICK_read_only);
 		break;
 	case Opt_btree_cache_shrinker_seeks: {
 		struct bch_fs_btree_cache *bc = &c->btree.cache;

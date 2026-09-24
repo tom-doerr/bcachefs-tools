@@ -186,7 +186,7 @@ int __must_check bch2_write_inode(struct bch_fs *c,
 							       fields, &reconcile_changed));
 
 	if (!ret && reconcile_changed)
-		bch2_reconcile_wakeup(c);
+		bch2_reconcile_wakeup(c, RECONCILE_KICK_inode_opts);
 
 	bch2_fs_fatal_err_on(bch2_err_matches(ret, ENOENT), c,
 			     "%s: inode %llu:%llu not found when updating",
@@ -3218,7 +3218,7 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 
 	opt_set(opts->opts, read_only, (fc->sb_flags & SB_RDONLY) != 0);
 
-	bch2_reconcile_wakeup(c);
+	bch2_reconcile_wakeup(c, RECONCILE_KICK_remount);
 
 	/*
 	 * If we went read-only without being asked to, we hit an error and went

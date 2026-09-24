@@ -69,6 +69,16 @@ static const char * const bch2_reconcile_phase_types[] = {
 	RECONCILE_PHASE_TYPES()
 };
 
+static const char * const bch2_reconcile_kick_reasons[] = {
+	RECONCILE_KICK_REASONS()
+	NULL
+};
+
+static const char * const bch2_reconcile_phase_exits[] = {
+	RECONCILE_PHASE_EXITS()
+	NULL
+};
+
 #undef x
 
 static u64 reconcile_scan_encode(struct reconcile_scan s)
@@ -157,7 +167,7 @@ int bch2_set_reconcile_needs_scan(struct bch_fs *c, struct reconcile_scan s, boo
 	try(commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
 		      bch2_set_reconcile_needs_scan_trans(trans, s)));
 	if (wakeup)
-		bch2_reconcile_wakeup(c);
+		bch2_reconcile_wakeup(c, RECONCILE_KICK_scan_cookie);
 	return 0;
 }
 
@@ -289,7 +299,7 @@ int bch2_set_reconcile_needs_scan_post(struct bch_fs *c, struct reconcile_scan s
 	int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
 			    bch2_set_reconcile_needs_scan_trans(trans, s));
 
-	bch2_reconcile_wakeup(c);
+	bch2_reconcile_wakeup(c, RECONCILE_KICK_opt_change_settled);
 	return ret;
 }
 
@@ -1699,6 +1709,9 @@ struct reconcile_pass {
 	struct bkey_i_cookie		*pending_cookie;
 	u64				*sectors_scanned;
 	u32				*copygc_run_count;
+
+	/* Set by the phase functions: why the last phase returned */
+	enum reconcile_phase_exit	exit;
 };
 
 /* Per-key handler: returns the result of processing one key in a keyed phase. */
@@ -1794,6 +1807,8 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 	unsigned consecutive_deferred = 0;
 	int ret = 0;
 
+	p->exit = RECONCILE_PHASE_EXIT_stopped;
+
 	while (!bch2_move_ratelimit(ctxt) &&
 	       !test_bit(BCH_FS_going_ro, &c->flags) &&
 	       bch2_reconcile_enabled(c) &&
@@ -1803,11 +1818,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		struct bkey_s_c k = next_reconcile_entry(trans, p->work, &r->work_pos,
 							 reconcile_phases[r->phase].end);
 		ret = bkey_err(k);
-		if (ret)
+		if (ret) {
+			p->exit = RECONCILE_PHASE_EXIT_error;
 			break;
+		}
 
-		if (!k.k)
-			return 0;	/* phase exhausted */
+		if (!k.k) {
+			p->exit = RECONCILE_PHASE_EXIT_exhausted;
+			return 0;
+		}
 
 		r->work_pos.pos = k.k->p;
 
@@ -1844,12 +1863,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			if (reconcile_phases[r->phase].type == RECONCILE_PHASE_destage)
 				r->destage_deferred++;
 
-			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED)
+			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED) {
+				p->exit = RECONCILE_PHASE_EXIT_deferred_limit;
 				return 0;
+			}
 		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
 			continue;
 		} else if (ret) {
+			p->exit = RECONCILE_PHASE_EXIT_error;
 			break;
 		} else {
 			consecutive_deferred = 0;
@@ -1861,6 +1883,8 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			: bpos_nosnap_successor(r->work_pos.pos);
 	}
 
+	if (p->exit == RECONCILE_PHASE_EXIT_stopped && kick != r->kick)
+		p->exit = RECONCILE_PHASE_EXIT_kick;
 	return ret;
 }
 
@@ -1878,6 +1902,10 @@ static int do_reconcile_phase_phys(struct reconcile_pass *p)
 	bch2_trans_unlock_long(trans);
 	int ret = do_reconcile_phys(c, r->phase);
 	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart));
+
+	p->exit = test_bit(BCH_FS_going_ro, &c->flags) || !bch2_reconcile_enabled(c)
+		? RECONCILE_PHASE_EXIT_stopped
+		: RECONCILE_PHASE_EXIT_exhausted;
 	return ret;
 }
 
@@ -1984,6 +2012,9 @@ static int do_reconcile(struct moving_context *ctxt)
 				goto out;
 
 			ret = do_reconcile_phase(&pass, kick);
+			r->phase_exits[r->phase][ret
+				? RECONCILE_PHASE_EXIT_error
+				: pass.exit]++;
 			if (ret)
 				goto out;
 
@@ -2165,6 +2196,50 @@ __cold void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c
 	}
 }
 
+static __cold void reconcile_phase_name_to_text(struct printbuf *out, unsigned i)
+{
+	struct reconcile_phase p = reconcile_phases[i];
+
+	prt_printf(out, "%s %s",
+		   bch2_reconcile_work_ids[p.priority],
+		   bch2_reconcile_phase_types[p.type]);
+}
+
+/*
+ * Counters for tuning and diagnosing the reconcile scheduler; kept out of
+ * reconcile_status, which sysfs truncates at a page and whose tail is the
+ * thread backtrace.
+ */
+__cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
+{
+	struct bch_fs_reconcile *r = &c->reconcile;
+
+	printbuf_tabstop_push(out, 24);
+	for (unsigned i = 0; i < RECONCILE_PHASE_EXIT_NR; i++)
+		printbuf_tabstop_push(out, 16);
+
+	prt_printf(out, "kicks since mount:\n");
+	scoped_guard(printbuf_indent, out)
+		for (unsigned i = 0; i < RECONCILE_KICK_NR; i++)
+			prt_printf(out, "%s\t%llu\n",
+				   bch2_reconcile_kick_reasons[i],
+				   (u64) atomic64_read(&r->kicks[i]));
+
+	prt_printf(out, "\nphase exits since mount:\n");
+	prt_printf(out, "phase\t");
+	for (unsigned i = 0; i < RECONCILE_PHASE_EXIT_NR; i++)
+		prt_printf(out, "%s\t", bch2_reconcile_phase_exits[i]);
+	prt_newline(out);
+
+	for (unsigned i = 0; i < ARRAY_SIZE(reconcile_phases); i++) {
+		reconcile_phase_name_to_text(out, i);
+		prt_tab(out);
+		for (unsigned j = 0; j < RECONCILE_PHASE_EXIT_NR; j++)
+			prt_printf(out, "%llu\t", r->phase_exits[i][j]);
+		prt_newline(out);
+	}
+}
+
 __cold void bch2_reconcile_scan_pending_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	/*
@@ -2229,7 +2304,7 @@ static int bch2_reconcile_power_notifier(struct notifier_block *nb,
 	struct bch_fs *c = container_of(nb, struct bch_fs, reconcile.power_notifier);
 
 	c->reconcile.on_battery = !power_supply_is_system_supplied();
-	bch2_reconcile_wakeup(c);
+	bch2_reconcile_wakeup(c, RECONCILE_KICK_power);
 	return NOTIFY_OK;
 }
 #endif
@@ -2255,6 +2330,8 @@ void bch2_fs_reconcile_exit(struct bch_fs *c)
 
 int bch2_fs_reconcile_init(struct bch_fs *c)
 {
+	BUILD_BUG_ON(ARRAY_SIZE(reconcile_phases) != RECONCILE_NR_PHASES);
+
 	struct bch_fs_reconcile *r = &c->reconcile;
 
 	mutex_init(&r->scans_in_flight_lock);

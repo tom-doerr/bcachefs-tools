@@ -832,7 +832,7 @@ int bch2_dev_attach_bdev(struct bch_fs *c, struct bch_sb_handle *sb, struct prin
 
 	bch2_dev_sysfs_online(c, ca);
 
-	bch2_reconcile_wakeup(c);
+	bch2_reconcile_wakeup(c, RECONCILE_KICK_device_online);
 	return 0;
 }
 

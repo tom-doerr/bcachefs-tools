@@ -739,7 +739,7 @@ int bch2_run_recovery_passes(struct bch_fs *c, u64 orig_passes_to_run, bool fail
 		if (prev <= BCH_RECOVERY_PASS_check_snapshots &&
 		    pass > BCH_RECOVERY_PASS_check_snapshots) {
 			bch2_copygc_wakeup(c);
-			bch2_reconcile_wakeup(c);
+			bch2_reconcile_wakeup(c, RECONCILE_KICK_recovery);
 		}
 
 		prev = pass;

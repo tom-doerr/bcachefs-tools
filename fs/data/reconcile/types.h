@@ -9,9 +9,48 @@
 #include <linux/mutex.h>
 #include <linux/rhashtable-types.h>
 
+/* Who woke the reconcile thread: a kick restarts the pass from phase 0 */
+#define RECONCILE_KICK_REASONS()	\
+	x(sysfs)			\
+	x(inode_opts)			\
+	x(remount)			\
+	x(device_online)		\
+	x(recovery)			\
+	x(opt_change)			\
+	x(read_only)			\
+	x(scan_cookie)			\
+	x(opt_change_settled)		\
+	x(power)
+
+enum reconcile_kick_reason {
+#define x(n)	RECONCILE_KICK_##n,
+	RECONCILE_KICK_REASONS()
+#undef x
+	RECONCILE_KICK_NR,
+};
+
+/* Why a phase returned to do_reconcile() */
+#define RECONCILE_PHASE_EXITS()		\
+	x(exhausted)			\
+	x(kick)				\
+	x(deferred_limit)		\
+	x(stopped)			\
+	x(error)
+
+enum reconcile_phase_exit {
+#define x(n)	RECONCILE_PHASE_EXIT_##n,
+	RECONCILE_PHASE_EXITS()
+#undef x
+	RECONCILE_PHASE_EXIT_NR,
+};
+
+/* ARRAY_SIZE(reconcile_phases), checked in work.c */
+#define RECONCILE_NR_PHASES		10
+
 struct bch_fs_reconcile {
 	struct task_struct __rcu	*thread;
 	u32				kick;
+	atomic64_t			kicks[RECONCILE_KICK_NR];
 
 	bool				running;
 	u64				wait_iotime_start;
@@ -38,6 +77,9 @@ struct bch_fs_reconcile {
 	u64				destage_completed;
 	u64				destage_deferred;
 	u64				deferred;
+
+	/* Since mount, written only by the reconcile thread: */
+	u64				phase_exits[RECONCILE_NR_PHASES][RECONCILE_PHASE_EXIT_NR];
 
 	/* In-flight opt changes - see bch2_set_reconcile_needs_scan_pre/post() */
 	struct rhashtable		scans_in_flight;
