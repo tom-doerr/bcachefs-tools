@@ -1762,9 +1762,16 @@ static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
 }
 
 /*
- * Iterate one keyed phase (scan / btree / normal) to exhaustion or interrupt.
- * The phys phase doesn't go through here — it's a one-shot, dispatched
- * separately from the outer loop.
+ * A run of this many need_copygc deferrals ends a keyed phase for this pass:
+ * each one waited for a copygc run already, and a phase where nothing can be
+ * placed shouldn't hold up the phases after it.
+ */
+#define RECONCILE_MAX_CONSECUTIVE_DEFERRED	16
+
+/*
+ * Iterate one keyed phase (scan / btree / normal / destage) to exhaustion or
+ * interrupt. The phys phase doesn't go through here — it's a one-shot,
+ * dispatched separately from the outer loop.
  *
  * Returns 0 on phase done or interrupt, error on real failure. Caller
  * re-checks loop conditions to decide whether to advance or bail.
@@ -1776,6 +1783,7 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 	struct btree_trans *trans = ctxt->trans;
 	struct bch_fs *c = trans->c;
 	struct bch_fs_reconcile *r = &c->reconcile;
+	unsigned consecutive_deferred = 0;
 	int ret = 0;
 
 	while (!bch2_move_ratelimit(ctxt) &&
@@ -1812,18 +1820,29 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 				   kthread_should_stop());
 			*p->copygc_run_count = c->copygc.run_count;
 			ret = 0;
-			continue;
-		}
 
-		if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
+			/*
+			 * Scan cookies are retried in place. Keyed work is
+			 * deferred: step past the entry and leave its work
+			 * entry for the next pass. Retrying in place let one
+			 * entry that couldn't be placed stall every later
+			 * phase - the btree phase re-reads from work_pos, so it
+			 * got the same key back after every copygc run.
+			 */
+			if (reconcile_phases[r->phase].type == RECONCILE_PHASE_scan)
+				continue;
+
+			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED)
+				return 0;
+		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
 			continue;
-		}
-
-		if (ret)
+		} else if (ret) {
 			break;
-
-		do_retry_stripes(ctxt, p->stripe_retry);
+		} else {
+			consecutive_deferred = 0;
+			do_retry_stripes(ctxt, p->stripe_retry);
+		}
 
 		r->work_pos.pos = btree_type_has_snapshot_field(r->work_pos.btree)
 			? bpos_successor(r->work_pos.pos)
