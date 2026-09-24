@@ -30,6 +30,24 @@ extern const char * const bch2_member_states[];
 extern const char * const __bch2_reconcile_accounting_types[];
 extern const char * const bch2_d_types[];
 extern const char * const bch2_scrub_journal_opts[];
+extern const char * const bch2_move_ioprio_opts[];
+
+/*
+ * IO priority of data move reads and writes (reconcile, copygc, other data
+ * jobs): idle is the stock setting, but mq-deadline dispatches idle requests
+ * only when nothing else is queued or after prio_aging_expire, which on a
+ * busy device makes move reads wait seconds. best_effort is the lowest best
+ * effort level; per-device move admission bounds its load.
+ */
+#define BCH_MOVE_IOPRIO_OPTS()		\
+	x(idle,		0)		\
+	x(best_effort,	1)
+
+enum bch_move_ioprio_opts {
+#define x(t, n) BCH_MOVE_IOPRIO_##t = n,
+	BCH_MOVE_IOPRIO_OPTS()
+#undef x
+};
 
 void bch2_prt_jset_entry_type(struct printbuf *,	enum bch_jset_entry_type);
 void bch2_prt_fs_usage_type(struct printbuf *,		enum bch_fs_usage_type);
@@ -559,6 +577,12 @@ enum fsck_err_opts {
 	  BCH2_NO_SB_OPT,			true,			\
 	  NULL,		"Enable copygc: disable for debugging, or to\n"\
 			"quiet the system when doing performance testing\n")\
+	x(move_ioprio,			u8,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_STR(bch2_move_ioprio_opts),				\
+	  BCH2_NO_SB_OPT,		BCH_MOVE_IOPRIO_idle,		\
+	  NULL,		"IO priority of data move reads and writes:\n"	\
+			"idle, or best_effort (lowest level)\n")		\
 	x(move_ios_in_flight_per_dev,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, 1024),						\

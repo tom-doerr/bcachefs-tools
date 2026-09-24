@@ -7,6 +7,8 @@
 #include "btree/bbpos.h"
 #include "btree/iter.h"
 #include "data/update.h"
+
+#include <linux/ioprio.h>
 #include "move_types.h"
 
 struct bch_read_bio;
@@ -116,6 +118,13 @@ void bch2_moving_ctxt_do_pending_writes(struct moving_context *);
 void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
 int bch2_move_ratelimit(struct moving_context *);
+
+static inline u16 bch2_move_ioprio(struct bch_fs *c)
+{
+	return c->opts.move_ioprio == BCH_MOVE_IOPRIO_best_effort
+		? IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_BE_NR - 1)
+		: IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+}
 int bch2_move_wait_dev_reads(struct moving_context *, unsigned);
 
 int bch2_move_extent(struct moving_context *,

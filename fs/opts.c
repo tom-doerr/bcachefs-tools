@@ -139,6 +139,11 @@ const char * const bch2_scrub_journal_opts[] = {
 	NULL
 };
 
+const char * const bch2_move_ioprio_opts[] = {
+	BCH_MOVE_IOPRIO_OPTS()
+	NULL
+};
+
 #undef x
 
 static void prt_str_opt_boundscheck(struct printbuf *out, const char * const opts[],
