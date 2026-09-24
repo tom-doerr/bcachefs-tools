@@ -186,6 +186,16 @@ static inline bool bch2_btree_cache_should_throttle(struct bch_fs *c)
 	return READ_ONCE(c->btree.cache.should_throttle);
 }
 
+/*
+ * True until bch2_trans_commit_btree_write_ratelimit() would let a commit
+ * through: for callers that throttle before starting work instead.
+ */
+static inline bool bch2_btree_write_ratelimited(struct bch_fs *c)
+{
+	return atomic_long_read(&c->btree.cache.nr_in_flight_inner) >= BTREE_WRITE_IO_LIMIT(c) * 3 / 4 ||
+		bch2_btree_cache_should_throttle(c);
+}
+
 static inline void bch2_btree_cache_update_throttle(struct bch_fs *c)
 {
 	struct bch_fs_btree_cache *bc = &c->btree.cache;

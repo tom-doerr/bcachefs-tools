@@ -278,12 +278,21 @@ int bch2_move_wait_dev_reads(struct moving_context *ctxt, unsigned dev)
 
 	u64 start = local_clock();
 	int ret = drop_locks_do(trans, ({
-		while (atomic_read(&ca->move_reads_in_flight) >= max &&
-		       !test_bit(BCH_FS_going_ro, &c->flags))
-			move_ctxt_wait_event_timeout(ctxt,
-				atomic_read(&ca->move_reads_in_flight) < max,
-				HZ / 10);
-		0;
+		int wait_ret = 0;
+
+		while (atomic_read(&ca->move_reads_in_flight) >= max) {
+			wait_ret = bch2_kthread_cancelled(c);
+			if (wait_ret)
+				break;
+			if (unlikely(test_bit(BCH_FS_going_ro, &c->flags))) {
+				wait_ret = bch_err_throw(c, erofs_no_writes);
+				break;
+			}
+
+			move_ctxt_wait_event_once(ctxt,
+				atomic_read(&ca->move_reads_in_flight) < max, HZ / 10);
+		}
+		wait_ret;
 	}));
 	bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_dev_reads], start);
 	return ret;
@@ -569,6 +578,37 @@ static int bch2_move_extent_pred(struct moving_context *ctxt,
 	return bch2_move_extent(ctxt, bucket_in_flight, &opts, &data_opts, iter, level, k);
 }
 
+/*
+ * In-flight limits: the context's own (move_ios_in_flight, move_bytes_in_flight
+ * - XXX: these ought to be per device, SSDs and hard drives want different
+ * limits), and its shared budget's, where 0 means no limit:
+ */
+static bool move_budget_bound(atomic_t *sectors, atomic_t *ios, u32 max_sectors, u32 max_ios)
+{
+	return (max_sectors && atomic_read(sectors) >= max_sectors) ||
+		(max_ios && atomic_read(ios) >= max_ios);
+}
+
+static bool move_ctxt_writes_bound(struct bch_fs *c, struct moving_context *ctxt)
+{
+	struct move_budget *b = ctxt->budget;
+
+	return move_budget_bound(&ctxt->write_sectors, &ctxt->write_ios,
+				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight) ||
+		(b && move_budget_bound(&b->write_sectors, &b->write_ios,
+					READ_ONCE(b->max_sectors), READ_ONCE(b->max_ios)));
+}
+
+static bool move_ctxt_reads_bound(struct bch_fs *c, struct moving_context *ctxt)
+{
+	struct move_budget *b = ctxt->budget;
+
+	return move_budget_bound(&ctxt->read_sectors, &ctxt->read_ios,
+				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight) ||
+		(b && move_budget_bound(&b->read_sectors, &b->read_ios,
+					READ_ONCE(b->max_sectors), READ_ONCE(b->max_ios)));
+}
+
 int bch2_move_ratelimit(struct moving_context *ctxt)
 {
 	struct bch_fs *c = ctxt->trans->c;
@@ -604,61 +644,49 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 		}
 	} while (delay);
 
-	/*
-	 * XXX: these limits really ought to be per device, SSDs and hard drives
-	 * will want different limits
-	 */
-	unsigned max_sectors	= c->opts.move_bytes_in_flight >> 9;
-	unsigned max_ios	= c->opts.move_ios_in_flight;
-	struct move_budget *b	= ctxt->budget;
-
-#define move_writes_bound()							\
-	(atomic_read(&ctxt->write_sectors) >= max_sectors ||			\
-	 atomic_read(&ctxt->write_ios) >= max_ios ||				\
-	 (b && (atomic_read(&b->write_sectors) >= b->max_sectors ||		\
-		atomic_read(&b->write_ios) >= b->max_ios)))
-#define move_reads_bound()							\
-	(atomic_read(&ctxt->read_sectors) >= max_sectors ||			\
-	 atomic_read(&ctxt->read_ios) >= max_ios ||				\
-	 (b && (atomic_read(&b->read_sectors) >= b->max_sectors ||		\
-		atomic_read(&b->read_ios) >= b->max_ios)))
-
-	bool write_bound	= move_writes_bound();
-	bool read_bound		= move_reads_bound();
-
 	u64 start = local_clock();
+	bool write_bound	= move_ctxt_writes_bound(c, ctxt);
+	bool read_bound		= move_ctxt_reads_bound(c, ctxt);
 
 	/* Also issues pending writes, so it runs even when nothing is bound: */
-	move_ctxt_wait_event(ctxt, !move_writes_bound() && !move_reads_bound());
-#undef move_reads_bound
-#undef move_writes_bound
-
-	/*
-	 * Metadata backpressure at admission rather than completion: journal
-	 * reclaim is what writes dirty nodes back, so poke it while waiting.
-	 */
-	if (ctxt->metadata_throttle && bch2_btree_cache_should_throttle(c)) {
-		u64 metadata_start = local_clock();
-
-		while (bch2_btree_cache_should_throttle(c)) {
-			try(bch2_kthread_cancelled(c));
-			if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)))
-				return bch_err_throw(c, erofs_no_writes);
-
-			journal_reclaim_kick(&c->journal);
-			move_ctxt_wait_event_timeout(ctxt,
-				!bch2_btree_cache_should_throttle(c), HZ / 10);
-		}
-
-		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_metadata],
-				       metadata_start);
-	}
+	move_ctxt_wait_event(ctxt,
+		!move_ctxt_writes_bound(c, ctxt) && !move_ctxt_reads_bound(c, ctxt));
 
 	/* attributed to the limit that was binding when the wait began */
 	if (write_bound || read_bound)
 		bch2_time_stats_update(&c->times[write_bound
 						 ? BCH_TIME_move_ratelimit_write
 						 : BCH_TIME_move_ratelimit_read], start);
+
+	/*
+	 * Metadata backpressure at admission rather than completion, with the
+	 * same condition a throttled commit waits out; journal reclaim is what
+	 * writes dirty nodes back, so poke it while waiting:
+	 */
+	if (ctxt->metadata_throttle && bch2_btree_cache_should_throttle(c)) {
+		u64 metadata_start = local_clock();
+
+		while (bch2_btree_write_ratelimited(c)) {
+			try(bch2_kthread_cancelled(c));
+			if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)))
+				return bch_err_throw(c, erofs_no_writes);
+			if (unlikely(freezing(current))) {
+				bch2_moving_ctxt_flush_all(ctxt);
+				try_to_freeze();
+			}
+
+			journal_reclaim_kick(&c->journal);
+			move_ctxt_wait_event_once(ctxt, !bch2_btree_write_ratelimited(c), HZ / 10);
+		}
+
+		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_metadata],
+				       metadata_start);
+
+		/* writes issued while we waited count against the limits again: */
+		move_ctxt_wait_event(ctxt,
+			!move_ctxt_writes_bound(c, ctxt) && !move_ctxt_reads_bound(c, ctxt));
+	}
+
 	return 0;
 }
 

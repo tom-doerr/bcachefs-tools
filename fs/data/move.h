@@ -88,6 +88,23 @@ struct moving_context {
 	_ret;									\
 })
 
+/*
+ * One bounded wait: issue this context's pending writes, then sleep until
+ * @_cond, a pending write, or @_timeout. Unlike move_ctxt_wait_event_timeout(),
+ * which keeps waiting after a timeout, this returns - so a caller looping on
+ * it can check its own exit conditions.
+ */
+#define move_ctxt_wait_event_once(_ctxt, _cond, _timeout)			\
+do {										\
+	bch2_moving_ctxt_do_pending_writes(_ctxt);				\
+	if (!(_cond)) {								\
+		bch2_trans_unlock_long((_ctxt)->trans);				\
+		wait_event_timeout(*(_ctxt)->waitq,				\
+			bch2_moving_ctxt_next_pending_write(_ctxt) || (_cond),	\
+			_timeout);						\
+	}									\
+} while (0)
+
 #define move_ctxt_wait_event(_ctxt, _cond)				\
 do {									\
 	bool cond_finished = false;					\
