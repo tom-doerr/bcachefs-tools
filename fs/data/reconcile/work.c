@@ -41,6 +41,7 @@
 	x(btree)			\
 	x(phys)				\
 	x(normal)			\
+	x(destage)			\
 
 enum reconcile_phase_type {
 #define x(n)	RECONCILE_PHASE_##n,
@@ -978,6 +979,85 @@ static int do_reconcile_extent(struct moving_context *ctxt,
 	return 0;
 }
 
+/*
+ * Destage prepass filter: the extent needs background_target work and one of
+ * the pointers that has to move is on a non-rotational device - return that
+ * device, to read from; -1 means not destage work.
+ *
+ * Reads the reconcile entry stored in the extent, which may predate an option
+ * change: a key misjudged here is still handled by the normal logical phase.
+ */
+static int reconcile_destage_read_dev(struct bch_fs *c, struct bkey_s_c k)
+{
+	const struct bch_extent_reconcile *r = bch2_bkey_reconcile_opts(c, k);
+	if (!r || !(r->need_rb & BIT(BCH_RECONCILE_background_target)))
+		return -1;
+
+	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
+	const union bch_extent_entry *entry;
+	struct extent_ptr_decoded p;
+	unsigned ptr_bit = 1;
+
+	guard(rcu)();
+	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+		if (r->ptrs_moving & ptr_bit) {
+			struct bch_dev *ca = bch2_dev_rcu_noerror(c, p.ptr.dev);
+			if (ca && !ca->mi.rotational)
+				return p.ptr.dev;
+		}
+		ptr_bit <<= 1;
+	}
+	return -1;
+}
+
+/*
+ * Returns 1 if the entry isn't destage work: it is skipped without touching
+ * the extent or its work entry. Checked before __do_reconcile_extent(), which
+ * commits updated reconcile opts.
+ */
+static int do_reconcile_extent_destage(struct moving_context *ctxt,
+				       struct per_snapshot_io_opts *snapshot_io_opts,
+				       struct bbpos work,
+				       darray_stripe_retry *stripe_retry)
+{
+	struct btree_trans *trans = ctxt->trans;
+	struct bch_fs *c = trans->c;
+	struct bbpos data_pos = rb_work_to_data_pos(work.pos);
+
+	if (data_pos.btree == BTREE_ID_stripes)
+		return 1;
+
+	CLASS(btree_iter, iter)(trans, data_pos.btree, data_pos.pos, BTREE_ITER_all_snapshots);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
+	if (!k.k)
+		return 1;
+
+	int read_dev = reconcile_destage_read_dev(c, k);
+	if (read_dev < 0)
+		return 1;
+
+	struct bkey_buf stack_k __cleanup(bch2_bkey_buf_exit);
+	bch2_bkey_buf_init(&stack_k);
+	bch2_bkey_buf_reassemble(&stack_k, k);
+
+	struct bch_inode_opts opts;
+	struct data_update_opts data_opts = {
+		.read_dev	= read_dev,
+		.read_flags	= BCH_READ_soft_require_read_device,
+	};
+	try(__do_reconcile_extent(ctxt, snapshot_io_opts, &opts, &data_opts,
+				  work, &iter, 0,
+				  bkey_i_to_s_c(stack_k.k), stripe_retry));
+
+	event_add_trace(c, reconcile_data, stack_k.k->k.size, buf, ({
+		prt_newline(&buf);
+		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(stack_k.k));
+		prt_newline(&buf);
+		bch2_data_update_opts_to_text(&buf, c, &opts, &data_opts);
+	}));
+	return 0;
+}
+
 static int do_reconcile_extent_phys(struct moving_context *ctxt,
 				    struct per_snapshot_io_opts *snapshot_io_opts,
 				    struct bbpos work,
@@ -1446,6 +1526,20 @@ static const struct reconcile_phase reconcile_phases[] = {
 	/* Normal priority work: */
 	{ RECONCILE_PHASE_btree,	RECONCILE_WORK_normal,
 		BTREE_ID_reconcile_scan, POS(RECONCILE_WORK_normal, 0), POS(RECONCILE_WORK_normal, U64_MAX) },
+
+	/*
+	 * Destage prepass: background_target moves of data sitting on
+	 * non-rotational devices. Otherwise these only happen in the normal
+	 * logical phase, after the phys phase - which runs to exhaustion and can
+	 * take days on a large rotational backlog while the SSDs fill.
+	 *
+	 * Filtered sweep of the logical work btree: entries that don't match are
+	 * stepped over and left untouched for the phases below. The phys phase
+	 * can't do this work, rotational-device pointers are all it indexes.
+	 */
+	{ RECONCILE_PHASE_destage,	RECONCILE_WORK_normal,
+		BTREE_ID_reconcile_work,		POS_MIN, SPOS_MAX },
+
 	{ RECONCILE_PHASE_phys,		RECONCILE_WORK_normal,
 		BTREE_ID_reconcile_work_phys,		POS_MIN, SPOS_MAX },
 	{ RECONCILE_PHASE_normal,	RECONCILE_WORK_normal,
@@ -1571,6 +1665,7 @@ static void reconcile_phase_start(struct bch_fs *c)
 
 	switch (p.type) {
 	case RECONCILE_PHASE_normal:
+	case RECONCILE_PHASE_destage:
 		bch2_progress_init(&r->progress, NULL, c,
 				   BIT_ULL(reconcile_work_btree[p.priority]), 0);
 		break;
@@ -1653,6 +1748,17 @@ static int do_reconcile_extent_key(struct reconcile_pass *p, struct bkey_s_c k)
 	return lockrestart_do(trans,
 		do_reconcile_extent(p->ctxt, p->snapshot_io_opts, r->work_pos,
 				    p->stripe_retry));
+}
+
+static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
+{
+	struct btree_trans *trans = p->ctxt->trans;
+	struct bch_fs_reconcile *r = &trans->c->reconcile;
+
+	int ret = lockrestart_do(trans,
+		do_reconcile_extent_destage(p->ctxt, p->snapshot_io_opts, r->work_pos,
+					    p->stripe_retry));
+	return ret > 0 ? 0 : ret;
 }
 
 /*
@@ -1760,6 +1866,8 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 		return do_reconcile_phase_phys(p);
 	case RECONCILE_PHASE_normal:
 		return do_reconcile_phase_iter(p, kick, do_reconcile_extent_key);
+	case RECONCILE_PHASE_destage:
+		return do_reconcile_phase_iter(p, kick, do_reconcile_destage_key);
 	default:
 		BUG();
 	}
@@ -1961,7 +2069,8 @@ __cold void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c
 					   bch2_reconcile_work_ids[phase.priority],
 					   bch2_reconcile_phase_types[phase.type]);
 
-				if (phase.type == RECONCILE_PHASE_normal) {
+				if (phase.type == RECONCILE_PHASE_normal ||
+				    phase.type == RECONCILE_PHASE_destage) {
 					bch2_progress_to_text(out, &r->progress);
 				} else {
 					bch2_bpos_to_text(out, work_pos);
