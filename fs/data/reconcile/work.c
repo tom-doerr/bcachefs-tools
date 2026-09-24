@@ -1134,6 +1134,9 @@ static int do_reconcile_extent_phys(struct moving_context *ctxt,
 	if (!k.k)
 		return 0;
 
+	/* As for destage; phys reads from the device whose lap this is: */
+	try(bch2_move_wait_dev_reads(ctxt, work.pos.inode));
+
 	struct bkey_buf stack_bp __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&stack_bp);
 	bch2_bkey_buf_reassemble(&stack_bp, bp_k);
@@ -1220,7 +1223,7 @@ static int update_reconcile_opts_scan(struct btree_trans *trans,
 					  SET_NEEDS_RECONCILE_opt_change);
 }
 
-static bool bch2_reconcile_enabled(struct bch_fs *c)
+bool bch2_reconcile_enabled(struct bch_fs *c)
 {
 	return !c->opts.read_only &&
 		c->opts.reconcile_enabled &&
@@ -1619,11 +1622,50 @@ static struct bpos reconcile_work_pos_successor(struct bbpos pos)
 }
 
 
+/*
+ * The normal priority destage, phys and logical phases take turns instead of
+ * each running until empty, so destage recurs while a long phys backlog (EC
+ * of rotational data) drains; hipri phases still run until empty.
+ */
+static u64 reconcile_phase_slice_ms(struct bch_fs *c, unsigned i)
+{
+	struct reconcile_phase p = reconcile_phases[i];
+
+	if (p.priority != RECONCILE_WORK_normal)
+		return 0;
+	if (p.type == RECONCILE_PHASE_destage)
+		return c->opts.reconcile_destage_slice_ms;
+	if (p.type == RECONCILE_PHASE_phys ||
+	    p.type == RECONCILE_PHASE_normal)
+		return c->opts.reconcile_phase_slice_ms;
+	return 0;
+}
+
+/*
+ * Slices are read live, so a changed option applies to a phase that is
+ * already running - which for phys may otherwise be days.
+ */
+static bool reconcile_slice_expired(struct bch_fs *c, unsigned phase, u64 phase_start)
+{
+	u64 slice_ms = reconcile_phase_slice_ms(c, phase);
+
+	return slice_ms && phase_start &&
+		ktime_get_ns() > phase_start + slice_ms * NSEC_PER_MSEC;
+}
+
+/* The running phase's slice, for waits inside the move path; false between phases */
+bool bch2_reconcile_slice_expired(struct bch_fs *c)
+{
+	struct bch_fs_reconcile *r = &c->reconcile;
+
+	return reconcile_slice_expired(c, READ_ONCE(r->phase), READ_ONCE(r->phase_start));
+}
+
 typedef struct {
 	struct bch_fs		*c;
 	unsigned		dev;
 	unsigned		reconcile_phase;
-	u64			deadline;
+	u64			phase_start;
 	struct closure		cl;
 
 	struct bch_move_stats	stats;
@@ -1701,7 +1743,8 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 
 	thr->exit = RECONCILE_PHASE_EXIT_stopped;
 
-	while (!bch2_move_ratelimit(&ctxt)) {
+	int rl;
+	while (!(rl = bch2_move_ratelimit(&ctxt))) {
 		if (!bch2_reconcile_enabled(c) ||
 		    test_bit(BCH_FS_going_ro, &c->flags))
 			break;
@@ -1763,11 +1806,15 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 		resume = reconcile_work_pos_successor(BBPOS(btree, pos));
 
 		/* Checked after a key, so every slice makes progress: */
-		if (thr->deadline && ktime_get_ns() > thr->deadline) {
+		if (reconcile_slice_expired(c, thr->reconcile_phase, thr->phase_start)) {
 			thr->exit = RECONCILE_PHASE_EXIT_yield;
 			break;
 		}
 	}
+
+	/* the metadata wait ran into the end of the slice: */
+	if (rl > 0)
+		thr->exit = RECONCILE_PHASE_EXIT_yield;
 
 	if (lap->active)
 		lap->cursor = resume;
@@ -1798,7 +1845,7 @@ static enum reconcile_phase_exit reconcile_phys_exit(darray_reconcile_phys_thr *
 }
 
 static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase,
-			     u64 deadline, enum reconcile_phase_exit *exit)
+			     u64 phase_start, enum reconcile_phase_exit *exit)
 {
 	CLASS(darray_reconcile_phys_thr, thrs)();
 	CLASS(closure_stack, cl)();
@@ -1810,7 +1857,7 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase,
 						.c			= c,
 						.dev			= ca->dev_idx,
 						.reconcile_phase	= reconcile_phase,
-						.deadline		= deadline,
+						.phase_start		= phase_start,
 						})));
 
 	darray_for_each(thrs, i)
@@ -1903,8 +1950,6 @@ struct reconcile_pass {
 	/* Set by the phase functions: why the last phase returned */
 	enum reconcile_phase_exit	exit;
 
-	/* ktime_get_ns() at which the current phase yields; 0: no limit */
-	u64				deadline;
 	/* A phase yielded with work left: don't wait at the end of the pass */
 	bool				yielded;
 	/* This pass's normal phys phase yielded; see do_reconcile_phase() */
@@ -2004,7 +2049,8 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 
 	p->exit = RECONCILE_PHASE_EXIT_stopped;
 
-	while (!bch2_move_ratelimit(ctxt) &&
+	int rl;
+	while (!(rl = bch2_move_ratelimit(ctxt)) &&
 	       !test_bit(BCH_FS_going_ro, &c->flags) &&
 	       bch2_reconcile_enabled(c) &&
 	       kick == r->kick) {
@@ -2088,13 +2134,16 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		r->work_pos.pos = reconcile_work_pos_successor(r->work_pos);
 
 		/* Checked after a key, so every slice makes progress: */
-		if (p->deadline && ktime_get_ns() > p->deadline) {
+		if (reconcile_slice_expired(c, r->phase, r->phase_start)) {
 			p->exit = RECONCILE_PHASE_EXIT_yield;
 			break;
 		}
 	}
 
-	if (p->exit == RECONCILE_PHASE_EXIT_stopped && kick != r->kick)
+	/* the metadata wait ran into the end of the slice: */
+	if (rl > 0)
+		p->exit = RECONCILE_PHASE_EXIT_yield;
+	else if (p->exit == RECONCILE_PHASE_EXIT_stopped && kick != r->kick)
 		p->exit = RECONCILE_PHASE_EXIT_kick;
 
 	/* work_pos is past the last entry handled: resume there */
@@ -2120,7 +2169,7 @@ static int do_reconcile_phase_phys(struct reconcile_pass *p)
 	struct bch_fs_reconcile *r = &c->reconcile;
 
 	bch2_trans_unlock_long(trans);
-	int ret = do_reconcile_phys(c, r->phase, p->deadline, &p->exit);
+	int ret = do_reconcile_phys(c, r->phase, r->phase_start, &p->exit);
 	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart));
 	return ret;
 }
@@ -2134,25 +2183,6 @@ static bool reconcile_target_work_pending(struct bch_fs *c)
 	u64 v[2];
 	bch2_accounting_mem_read(c, disk_accounting_pos_to_bpos(&pos), v, ARRAY_SIZE(v));
 	return v[0] || v[1];
-}
-
-/*
- * The normal priority destage, phys and logical phases take turns instead of
- * each running until empty, so destage recurs while a long phys backlog (EC
- * of rotational data) drains; hipri phases still run until empty.
- */
-static u64 reconcile_phase_slice_ms(struct bch_fs *c, unsigned i)
-{
-	struct reconcile_phase p = reconcile_phases[i];
-
-	if (p.priority != RECONCILE_WORK_normal)
-		return 0;
-	if (p.type == RECONCILE_PHASE_destage)
-		return c->opts.reconcile_destage_slice_ms;
-	if (p.type == RECONCILE_PHASE_phys ||
-	    p.type == RECONCILE_PHASE_normal)
-		return c->opts.reconcile_phase_slice_ms;
-	return 0;
 }
 
 static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
@@ -2191,8 +2221,7 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 	bch2_btree_write_buffer_flush_sync(trans);
 
 	/* the slice starts after the flush, which can take a while */
-	u64 slice_ms = reconcile_phase_slice_ms(c, r->phase);
-	p->deadline = slice_ms ? ktime_get_ns() + slice_ms * NSEC_PER_MSEC : 0;
+	r->phase_start = ktime_get_ns();
 
 	switch (phase.type) {
 	case RECONCILE_PHASE_scan:
@@ -2286,10 +2315,6 @@ static int do_reconcile(struct moving_context *ctxt)
 		pass.yielded = false;
 		pass.phys_yielded = false;
 
-		/* runtime options: picked up by every context at the next wait */
-		r->move_budget.max_ios		= c->opts.reconcile_move_ios_in_flight;
-		r->move_budget.max_sectors	= c->opts.reconcile_move_bytes_in_flight >> 9;
-
 		for (r->phase = 0; r->phase < ARRAY_SIZE(reconcile_phases); r->phase++) {
 			reconcile_phase_start(c);
 
@@ -2304,6 +2329,7 @@ static int do_reconcile(struct moving_context *ctxt)
 				goto out;
 
 			ret = do_reconcile_phase(&pass, kick);
+			r->phase_start = 0;
 			r->phase_exits[r->phase][ret
 				? RECONCILE_PHASE_EXIT_error
 				: pass.exit]++;
@@ -2522,7 +2548,7 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 	prt_printf(out, "in flight, all contexts: reads %u ios %u sectors, writes %u ios %u sectors, limit %u ios %u sectors\n",
 		   atomic_read(&b->read_ios), atomic_read(&b->read_sectors),
 		   atomic_read(&b->write_ios), atomic_read(&b->write_sectors),
-		   READ_ONCE(b->max_ios), READ_ONCE(b->max_sectors));
+		   READ_ONCE(*b->max_ios_opt), READ_ONCE(*b->max_bytes_opt) >> 9);
 
 	prt_str(out, "kicks:");
 	for (unsigned i = 0; i < RECONCILE_KICK_NR; i++) {
@@ -2714,8 +2740,8 @@ int bch2_fs_reconcile_init(struct bch_fs *c)
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	init_waitqueue_head(&r->move_budget.wait);
-	r->move_budget.max_ios		= c->opts.reconcile_move_ios_in_flight;
-	r->move_budget.max_sectors	= c->opts.reconcile_move_bytes_in_flight >> 9;
+	r->move_budget.max_ios_opt	= &c->opts.reconcile_move_ios_in_flight;
+	r->move_budget.max_bytes_opt	= &c->opts.reconcile_move_bytes_in_flight;
 
 	mutex_init(&r->scans_in_flight_lock);
 	try(rhashtable_init(&r->scans_in_flight, &reconcile_scan_in_flight_params));

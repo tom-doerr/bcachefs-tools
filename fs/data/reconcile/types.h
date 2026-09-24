@@ -125,6 +125,9 @@ struct bch_fs_reconcile {
 	/* In-flight IO across the reconcile thread and its phys workers */
 	struct move_budget		move_budget;
 
+	/* ktime_get_ns() when the running phase started, 0 between phases */
+	u64				phase_start;
+
 	/*
 	 * Per-device laps of the phys phases, [0] hipri, [1] normal, indexed
 	 * by dev * 2 + priority; each written only by that device's worker:

@@ -44,8 +44,9 @@ struct move_budget {
 	atomic_t		write_sectors;
 	atomic_t		read_ios;
 	atomic_t		write_ios;
-	u32			max_sectors;
-	u32			max_ios;
+	/* the limits' option values, read live; 0 means no limit */
+	const u32		*max_bytes_opt;
+	const u32		*max_ios_opt;
 	wait_queue_head_t	wait;
 };
 

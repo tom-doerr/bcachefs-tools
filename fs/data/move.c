@@ -22,6 +22,7 @@
 #include "data/update.h"
 #include "data/read.h"
 #include "data/reconcile/trigger.h"
+#include "data/reconcile/work.h"
 #include "data/reflink.h"
 #include "data/write.h"
 
@@ -598,7 +599,7 @@ static bool move_ctxt_writes_bound(struct bch_fs *c, struct moving_context *ctxt
 	return move_budget_bound(&ctxt->write_sectors, &ctxt->write_ios,
 				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight) ||
 		(b && move_budget_bound(&b->write_sectors, &b->write_ios,
-					READ_ONCE(b->max_sectors), READ_ONCE(b->max_ios)));
+					READ_ONCE(*b->max_bytes_opt) >> 9, READ_ONCE(*b->max_ios_opt)));
 }
 
 static bool move_ctxt_reads_bound(struct bch_fs *c, struct moving_context *ctxt)
@@ -608,7 +609,7 @@ static bool move_ctxt_reads_bound(struct bch_fs *c, struct moving_context *ctxt)
 	return move_budget_bound(&ctxt->read_sectors, &ctxt->read_ios,
 				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight) ||
 		(b && move_budget_bound(&b->read_sectors, &b->read_ios,
-					READ_ONCE(b->max_sectors), READ_ONCE(b->max_ios)));
+					READ_ONCE(*b->max_bytes_opt) >> 9, READ_ONCE(*b->max_ios_opt)));
 }
 
 int bch2_move_ratelimit(struct moving_context *ctxt)
@@ -663,15 +664,28 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 	/*
 	 * Metadata backpressure at admission rather than completion, with the
 	 * same condition a throttled commit waits out; journal reclaim is what
-	 * writes dirty nodes back, so poke it while waiting:
+	 * writes dirty nodes back, so poke it while waiting.
+	 *
+	 * The wait can last as long as the pressure does, so it honours the
+	 * controls that bound the rest of reconcile: switching the option off
+	 * or disabling reconcile ends it (the caller then sees the disable),
+	 * and so does the end of the phase's slice - returning 1 to yield it.
 	 */
 	if (bch2_move_metadata_admission(c, ctxt) && bch2_btree_cache_should_throttle(c)) {
 		u64 metadata_start = local_clock();
+		int yield = 0;
 
 		while (bch2_btree_write_ratelimited(c)) {
 			try(bch2_kthread_cancelled(c));
 			if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)))
 				return bch_err_throw(c, erofs_no_writes);
+			if (!bch2_move_metadata_admission(c, ctxt) ||
+			    !bch2_reconcile_enabled(c))
+				break;
+			if (bch2_reconcile_slice_expired(c)) {
+				yield = 1;
+				break;
+			}
 			if (unlikely(freezing(current))) {
 				bch2_moving_ctxt_flush_all(ctxt);
 				try_to_freeze();
@@ -683,6 +697,8 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 
 		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_metadata],
 				       metadata_start);
+		if (yield)
+			return yield;
 
 		/* writes issued while we waited count against the limits again: */
 		move_ctxt_wait_event(ctxt,
