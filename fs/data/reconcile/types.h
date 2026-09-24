@@ -113,6 +113,12 @@ struct bch_fs_reconcile {
 	u64				destage_deferred;
 	u64				deferred;
 
+	/*
+	 * Per-device laps of the phys phases, [0] hipri, [1] normal, indexed
+	 * by dev * 2 + priority; each written only by that device's worker:
+	 */
+	struct reconcile_lap		*phys_laps;
+
 	/* Written only by the reconcile thread: */
 	struct reconcile_lap		laps[RECONCILE_NR_PHASES];
 	u64				laps_completed[RECONCILE_NR_PHASES];

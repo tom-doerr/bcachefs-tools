@@ -1580,14 +1580,46 @@ static const struct reconcile_phase reconcile_phases[] = {
 		BTREE_ID_reconcile_pending,		POS_MIN, SPOS_MAX },
 };
 
+/*
+ * A run of this many need_copygc deferrals ends a keyed phase for this pass:
+ * each one waited for a copygc run already, and a phase where nothing can be
+ * placed shouldn't hold up the phases after it.
+ */
+#define RECONCILE_MAX_CONSECUTIVE_DEFERRED	16
+
+static struct bpos reconcile_work_pos_successor(struct bbpos pos)
+{
+	return btree_type_has_snapshot_field(pos.btree)
+		? bpos_successor(pos.pos)
+		: bpos_nosnap_successor(pos.pos);
+}
+
+static struct bpos reconcile_work_pos_predecessor(struct bbpos pos)
+{
+	return btree_type_has_snapshot_field(pos.btree)
+		? bpos_predecessor(pos.pos)
+		: bpos_nosnap_predecessor(pos.pos);
+}
+
 typedef struct {
 	struct bch_fs		*c;
 	unsigned		dev;
 	unsigned		reconcile_phase;
+	u32			kick;
 	struct closure		cl;
 
 	struct bch_move_stats	stats;
+
+	enum reconcile_phase_exit exit;
+	u64			deferred;
 } reconcile_phys_thr;
+
+static struct reconcile_lap *reconcile_phys_lap(struct bch_fs *c, unsigned dev,
+						unsigned reconcile_phase)
+{
+	return &c->reconcile.phys_laps[dev * 2 +
+		(reconcile_phases[reconcile_phase].priority != RECONCILE_WORK_hipri)];
+}
 
 DEFINE_DARRAY(reconcile_phys_thr);
 
@@ -1631,37 +1663,135 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	struct wb_maybe_flush last_flushed __cleanup(wb_maybe_flush_exit);
 	wb_maybe_flush_init(&last_flushed);
 
-	struct bbpos work_pos = BBPOS(reconcile_phases[thr->reconcile_phase].btree,
-				      POS(thr->dev, 0));
+	/*
+	 * This device's lap: LBA order from wherever the last one stopped,
+	 * wrapping to the start of the device for the part before it.
+	 */
+	enum btree_id btree = reconcile_phases[thr->reconcile_phase].btree;
+	struct bpos range_start = POS(thr->dev, 0);
+	struct reconcile_lap *lap = reconcile_phys_lap(c, thr->dev, thr->reconcile_phase);
+
+	if (!lap->active)
+		*lap = (struct reconcile_lap) {
+			.cursor	= range_start,
+			.start	= range_start,
+			.active	= true,
+		};
+
+	struct bbpos work_pos = BBPOS(btree, lap->cursor);
+	struct bpos resume = lap->cursor;
+	unsigned consecutive_deferred = 0;
+	u32 copygc_run_count = c->copygc.run_count;
+
+	thr->exit = RECONCILE_PHASE_EXIT_stopped;
 
 	while (!bch2_move_ratelimit(&ctxt)) {
 		if (!bch2_reconcile_enabled(c) ||
 		    test_bit(BCH_FS_going_ro, &c->flags))
 			break;
 
+		if (thr->kick != READ_ONCE(c->reconcile.kick)) {
+			thr->exit = RECONCILE_PHASE_EXIT_kick;
+			break;
+		}
+
 		bch2_trans_begin(trans);
 
-		struct bkey_s_c k = next_reconcile_entry(trans, &work, &work_pos, POS(thr->dev, U64_MAX));
-		if (bkey_err(k) ||
-		    !k.k ||
-		    k.k->p.inode != thr->dev)
+		struct bpos end = lap->wrapped
+			? reconcile_work_pos_predecessor(BBPOS(btree, lap->start))
+			: POS(thr->dev, U64_MAX);
+		struct bkey_s_c k = next_reconcile_entry(trans, &work, &work_pos, end);
+		if (bkey_err(k)) {
+			thr->exit = RECONCILE_PHASE_EXIT_error;
 			break;
+		}
+
+		if (!k.k || k.k->p.inode != thr->dev) {
+			if (!lap->wrapped && bpos_gt(lap->start, range_start)) {
+				lap->wrapped	= true;
+				work_pos.pos	= range_start;
+				resume		= range_start;
+				continue;
+			}
+
+			lap->active = false;
+			thr->exit = RECONCILE_PHASE_EXIT_exhausted;
+			break;
+		}
+
+		struct bpos pos = k.k->p;
 
 		int ret = lockrestart_do(trans,
 			do_reconcile_extent_phys(&ctxt, &snapshot_io_opts,
 						 thr->reconcile_phase,
-						 BBPOS(work_pos.btree, k.k->p),
+						 BBPOS(btree, pos),
 						 &last_flushed,
 						 &stripe_retry));
-		if (ret)
+
+		if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc)) {
+			/*
+			 * As in do_reconcile_phase_iter(): flush our moves
+			 * before waiting (they hold nocow locks copygc needs),
+			 * then step past the entry instead of retrying it.
+			 * Bounded: this is a workqueue worker, and every
+			 * device's worker holds up the pass.
+			 */
+			bch2_moving_ctxt_flush_all(&ctxt);
+			bch2_copygc_wakeup(c);
+			wait_event_timeout(c->copygc.running_wq,
+				   c->copygc.run_count != copygc_run_count ||
+				   test_bit(BCH_FS_going_ro, &c->flags),
+				   10 * HZ);
+			copygc_run_count = c->copygc.run_count;
+			thr->deferred++;
+
+			resume = reconcile_work_pos_successor(BBPOS(btree, pos));
+			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED) {
+				thr->exit = RECONCILE_PHASE_EXIT_deferred_limit;
+				break;
+			}
+			continue;
+		}
+
+		if (ret) {
+			resume = pos;
+			thr->exit = RECONCILE_PHASE_EXIT_error;
 			break;
+		}
+
+		consecutive_deferred = 0;
+		resume = reconcile_work_pos_successor(BBPOS(btree, pos));
 	}
+
+	if (lap->active)
+		lap->cursor = resume;
 
 	bch2_moving_ctxt_exit(&ctxt);
 	closure_return(cl);
 }
 
-static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
+/*
+ * How a phys phase ended, from its per-device workers: the most significant
+ * worker exit wins - a phase is exhausted only if every device's lap is.
+ */
+static enum reconcile_phase_exit reconcile_phys_exit(darray_reconcile_phys_thr *thrs)
+{
+	static const enum reconcile_phase_exit order[] = {
+		RECONCILE_PHASE_EXIT_error,
+		RECONCILE_PHASE_EXIT_stopped,
+		RECONCILE_PHASE_EXIT_kick,
+		RECONCILE_PHASE_EXIT_deferred_limit,
+	};
+
+	for (unsigned i = 0; i < ARRAY_SIZE(order); i++)
+		darray_for_each(*thrs, t)
+			if (t->exit == order[i])
+				return order[i];
+	return RECONCILE_PHASE_EXIT_exhausted;
+}
+
+static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase, u32 kick,
+			     enum reconcile_phase_exit *exit)
 {
 	CLASS(darray_reconcile_phys_thr, thrs)();
 	CLASS(closure_stack, cl)();
@@ -1673,12 +1803,17 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
 						.c			= c,
 						.dev			= ca->dev_idx,
 						.reconcile_phase	= reconcile_phase,
+						.kick			= kick,
 						})));
 
 	darray_for_each(thrs, i)
 		closure_call(&i->cl, do_reconcile_phys_thread, system_unbound_wq, &cl);
 
 	closure_sync_unbounded(&cl);
+
+	darray_for_each(thrs, i)
+		c->reconcile.deferred += i->deferred;
+	*exit = reconcile_phys_exit(&thrs);
 	return 0;
 }
 
@@ -1694,13 +1829,6 @@ static bool reconcile_phase_resumable(unsigned i)
 		(p.type == RECONCILE_PHASE_normal && p.priority != RECONCILE_WORK_pending);
 }
 
-static struct bpos reconcile_work_pos_successor(struct bbpos pos)
-{
-	return btree_type_has_snapshot_field(pos.btree)
-		? bpos_successor(pos.pos)
-		: bpos_nosnap_successor(pos.pos);
-}
-
 /* Inclusive end of the range the current lap still has to cover */
 static struct bpos reconcile_phase_end(struct bch_fs_reconcile *r)
 {
@@ -1710,9 +1838,7 @@ static struct bpos reconcile_phase_end(struct bch_fs_reconcile *r)
 	if (!reconcile_phase_resumable(r->phase) || !lap->wrapped)
 		return p.end;
 
-	return btree_type_has_snapshot_field(p.btree)
-		? bpos_predecessor(lap->start)
-		: bpos_nosnap_predecessor(lap->start);
+	return reconcile_work_pos_predecessor(BBPOS(p.btree, lap->start));
 }
 
 /*
@@ -1867,13 +1993,6 @@ static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
 }
 
 /*
- * A run of this many need_copygc deferrals ends a keyed phase for this pass:
- * each one waited for a copygc run already, and a phase where nothing can be
- * placed shouldn't hold up the phases after it.
- */
-#define RECONCILE_MAX_CONSECUTIVE_DEFERRED	16
-
-/*
  * Iterate one keyed phase (scan / btree / normal / destage) to exhaustion or
  * interrupt. The phys phase doesn't go through here — it's a one-shot,
  * dispatched separately from the outer loop.
@@ -1983,19 +2102,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
  * threads which together consume the whole reconcile_*_phys btree, then we
  * return to advance to the next phase.
  */
-static int do_reconcile_phase_phys(struct reconcile_pass *p)
+static int do_reconcile_phase_phys(struct reconcile_pass *p, u32 kick)
 {
 	struct btree_trans *trans = p->ctxt->trans;
 	struct bch_fs *c = trans->c;
 	struct bch_fs_reconcile *r = &c->reconcile;
 
 	bch2_trans_unlock_long(trans);
-	int ret = do_reconcile_phys(c, r->phase);
+	int ret = do_reconcile_phys(c, r->phase, kick, &p->exit);
 	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart));
-
-	p->exit = test_bit(BCH_FS_going_ro, &c->flags) || !bch2_reconcile_enabled(c)
-		? RECONCILE_PHASE_EXIT_stopped
-		: RECONCILE_PHASE_EXIT_exhausted;
 	return ret;
 }
 
@@ -2012,7 +2127,7 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 	case RECONCILE_PHASE_btree:
 		return do_reconcile_phase_iter(p, kick, do_reconcile_btree_key);
 	case RECONCILE_PHASE_phys:
-		return do_reconcile_phase_phys(p);
+		return do_reconcile_phase_phys(p, kick);
 	case RECONCILE_PHASE_normal:
 		return do_reconcile_phase_iter(p, kick, do_reconcile_extent_key);
 	case RECONCILE_PHASE_destage: {
@@ -2345,6 +2460,26 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		prt_newline(out);
 	}
 
+	prt_printf(out, "\nphys laps (rotational devices):\n");
+	prt_printf(out, "device\thipri\tnormal\n");
+	for_each_member_device(c, ca) {
+		if (!ca->mi.rotational)
+			continue;
+
+		prt_printf(out, "%u %s", ca->dev_idx, ca->name);
+		for (unsigned prio = 0; prio < 2; prio++) {
+			struct reconcile_lap lap = r->phys_laps[ca->dev_idx * 2 + prio];
+
+			prt_tab(out);
+			if (!lap.active)
+				prt_str(out, "idle");
+			else
+				prt_printf(out, "%s %llu", lap.wrapped ? "wrapped" : "at",
+					   lap.cursor.offset);
+		}
+		prt_newline(out);
+	}
+
 	prt_printf(out, "\ncommitted since mount (moves completed and indexed):\n");
 	prt_printf(out, "phase\tkeys\tdata\n");
 	for (unsigned i = 0; i < ARRAY_SIZE(reconcile_phases); i++) {
@@ -2454,6 +2589,9 @@ void bch2_fs_reconcile_exit(struct bch_fs *c)
 		rhashtable_free_and_destroy(&r->scans_in_flight,
 					    reconcile_scan_in_flight_free, NULL);
 
+	kvfree(r->phys_laps);
+	r->phys_laps = NULL;
+
 #ifdef CONFIG_POWER_SUPPLY
 	power_supply_unreg_notifier(&r->power_notifier);
 #endif
@@ -2464,6 +2602,10 @@ int bch2_fs_reconcile_init(struct bch_fs *c)
 	BUILD_BUG_ON(ARRAY_SIZE(reconcile_phases) != RECONCILE_NR_PHASES);
 
 	struct bch_fs_reconcile *r = &c->reconcile;
+
+	r->phys_laps = kvcalloc(BCH_SB_MEMBERS_MAX * 2, sizeof(*r->phys_laps), GFP_KERNEL);
+	if (!r->phys_laps)
+		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	mutex_init(&r->scans_in_flight_lock);
 	try(rhashtable_init(&r->scans_in_flight, &reconcile_scan_in_flight_params));
