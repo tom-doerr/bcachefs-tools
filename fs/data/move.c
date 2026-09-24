@@ -360,6 +360,16 @@ static void move_btree_node_trace(struct bch_fs *c,
 				  struct data_update_opts *data_opts,
 				  struct bkey_s_c k, int ret)
 {
+	bch2_move_count_outcome(c, data_opts->type, ret);
+
+	if (!ret &&
+	    data_opts->type == BCH_DATA_UPDATE_reconcile &&
+	    data_opts->reconcile_phase < RECONCILE_NR_PHASES) {
+		atomic64_inc(&c->reconcile.phase_committed_keys[data_opts->reconcile_phase]);
+		atomic64_add(c->opts.btree_node_size >> 9,
+			     &c->reconcile.phase_committed_sectors[data_opts->reconcile_phase]);
+	}
+
 	if (!ret)
 		event_add_trace(c, data_update, c->opts.btree_node_size >> 9, buf, ({
 			bch2_bkey_val_to_text(&buf, c, k);

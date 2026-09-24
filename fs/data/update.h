@@ -39,6 +39,9 @@ struct data_update_opts {
 	enum bch_read_flags		read_flags;
 	enum bch_write_flags		write_flags;
 	enum bch_trans_commit_flags	commit_flags;
+
+	/* reconcile_phases[] index that started the update, for accounting */
+	u8				reconcile_phase;
 };
 
 struct data_update {
@@ -110,6 +113,8 @@ int bch2_can_do_data_update(struct btree_trans *, struct bch_inode_opts *,
 			    struct printbuf *);
 
 bool bch2_data_update_fail_should_trace(enum bch_data_update_types, int);
+enum move_outcome bch2_move_outcome(int);
+void bch2_move_count_outcome(struct bch_fs *, enum bch_data_update_types, int);
 
 void bch2_data_update_ec_alloc_failed(struct data_update *);
 void bch2_data_update_exit(struct data_update *, int);

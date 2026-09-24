@@ -47,6 +47,28 @@ enum reconcile_phase_exit {
 /* ARRAY_SIZE(reconcile_phases), checked in work.c */
 #define RECONCILE_NR_PHASES		10
 
+/* How a reconcile or copygc data update ended, see bch2_move_outcome(): */
+#define MOVE_OUTCOMES()			\
+	x(ok)				\
+	x(no_io)			\
+	x(in_flight)			\
+	x(need_copygc)			\
+	x(would_block)			\
+	x(blocked)			\
+	x(no_rw_devs)			\
+	x(insufficient_devices)		\
+	x(enospc)			\
+	x(no_snapshot)			\
+	x(erofs)			\
+	x(other)
+
+enum move_outcome {
+#define x(n)	MOVE_OUTCOME_##n,
+	MOVE_OUTCOMES()
+#undef x
+	MOVE_OUTCOME_NR,
+};
+
 struct bch_fs_reconcile {
 	struct task_struct __rcu	*thread;
 	u32				kick;
@@ -80,6 +102,16 @@ struct bch_fs_reconcile {
 
 	/* Since mount, written only by the reconcile thread: */
 	u64				phase_exits[RECONCILE_NR_PHASES][RECONCILE_PHASE_EXIT_NR];
+
+	/*
+	 * Since mount, from move completions and phys workers: work actually
+	 * committed per phase (not just started), how moves ended ([0]
+	 * reconcile, [1] copygc), and why work was parked as pending:
+	 */
+	atomic64_t			phase_committed_keys[RECONCILE_NR_PHASES];
+	atomic64_t			phase_committed_sectors[RECONCILE_NR_PHASES];
+	atomic64_t			move_outcomes[2][MOVE_OUTCOME_NR];
+	atomic64_t			pending_reasons[MOVE_OUTCOME_NR];
 
 	/* In-flight opt changes - see bch2_set_reconcile_needs_scan_pre/post() */
 	struct rhashtable		scans_in_flight;

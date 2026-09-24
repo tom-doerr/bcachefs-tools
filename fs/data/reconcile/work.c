@@ -79,6 +79,11 @@ static const char * const bch2_reconcile_phase_exits[] = {
 	NULL
 };
 
+static const char * const bch2_move_outcomes[] = {
+	MOVE_OUTCOMES()
+	NULL
+};
+
 #undef x
 
 static u64 reconcile_scan_encode(struct reconcile_scan s)
@@ -743,6 +748,8 @@ static int check_reconcile_pending_err(struct btree_trans *trans,
 	     !bch2_err_matches(err, ENOSPC))
 		 return err;
 
+	atomic64_inc(&c->reconcile.pending_reasons[bch2_move_outcome(err)]);
+
 	s64 sectors = bkey_is_btree_ptr(k.k) ? btree_sectors(c) : k.k->size;
 
 	event_add_trace(c, reconcile_set_pending, sectors, buf, ({
@@ -975,7 +982,9 @@ static int do_reconcile_extent(struct moving_context *ctxt,
 	bch2_bkey_buf_reassemble(&stack_k, k);
 
 	struct bch_inode_opts opts;
-	struct data_update_opts data_opts = {};
+	struct data_update_opts data_opts = {
+		.reconcile_phase	= c->reconcile.phase,
+	};
 	try(__do_reconcile_extent(ctxt, snapshot_io_opts, &opts, &data_opts,
 				  work, &iter, 0,
 				  bkey_i_to_s_c(stack_k.k), stripe_retry));
@@ -1052,8 +1061,9 @@ static int do_reconcile_extent_destage(struct moving_context *ctxt,
 
 	struct bch_inode_opts opts;
 	struct data_update_opts data_opts = {
-		.read_dev	= read_dev,
-		.read_flags	= BCH_READ_soft_require_read_device,
+		.read_dev		= read_dev,
+		.read_flags		= BCH_READ_soft_require_read_device,
+		.reconcile_phase	= c->reconcile.phase,
 	};
 	try(__do_reconcile_extent(ctxt, snapshot_io_opts, &opts, &data_opts,
 				  work, &iter, 0,
@@ -1070,6 +1080,7 @@ static int do_reconcile_extent_destage(struct moving_context *ctxt,
 
 static int do_reconcile_extent_phys(struct moving_context *ctxt,
 				    struct per_snapshot_io_opts *snapshot_io_opts,
+				    unsigned reconcile_phase,
 				    struct bbpos work,
 				    struct wb_maybe_flush *last_flushed,
 				    darray_stripe_retry *stripe_retry)
@@ -1109,8 +1120,9 @@ static int do_reconcile_extent_phys(struct moving_context *ctxt,
 
 	struct bch_inode_opts opts;
 	struct data_update_opts data_opts = {
-		.read_dev	= work.pos.inode,
-		.read_flags	= BCH_READ_soft_require_read_device,
+		.read_dev		= work.pos.inode,
+		.read_flags		= BCH_READ_soft_require_read_device,
+		.reconcile_phase	= reconcile_phase,
 	};
 	try(__do_reconcile_extent(ctxt, snapshot_io_opts, &opts,
 				  &data_opts, work, &iter, bp.v->level,
@@ -1147,7 +1159,9 @@ static int do_reconcile_btree(struct moving_context *ctxt,
 	bch2_bkey_buf_reassemble(&stack_k, k);
 
 	struct bch_inode_opts opts;
-	struct data_update_opts data_opts = {};
+	struct data_update_opts data_opts = {
+		.reconcile_phase	= c->reconcile.phase,
+	};
 	try(__do_reconcile_extent(ctxt, snapshot_io_opts, &opts, &data_opts, work, &iter,
 				  bp.v->level, bkey_i_to_s_c(stack_k.k), NULL));
 
@@ -1635,6 +1649,7 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 
 		int ret = lockrestart_do(trans,
 			do_reconcile_extent_phys(&ctxt, &snapshot_io_opts,
+						 thr->reconcile_phase,
 						 BBPOS(work_pos.btree, k.k->p),
 						 &last_flushed,
 						 &stripe_retry));
@@ -2238,6 +2253,24 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 			prt_printf(out, "%llu\t", r->phase_exits[i][j]);
 		prt_newline(out);
 	}
+
+	prt_printf(out, "\ncommitted since mount (moves completed and indexed):\n");
+	prt_printf(out, "phase\tkeys\tdata\n");
+	for (unsigned i = 0; i < ARRAY_SIZE(reconcile_phases); i++) {
+		reconcile_phase_name_to_text(out, i);
+		prt_printf(out, "\t%llu\t", (u64) atomic64_read(&r->phase_committed_keys[i]));
+		prt_human_readable_u64(out, atomic64_read(&r->phase_committed_sectors[i]) << 9);
+		prt_newline(out);
+	}
+
+	prt_printf(out, "\nmove outcomes since mount:\n");
+	prt_printf(out, "outcome\treconcile\tcopygc\tparked pending\n");
+	for (unsigned i = 0; i < MOVE_OUTCOME_NR; i++)
+		prt_printf(out, "%s\t%llu\t%llu\t%llu\n",
+			   bch2_move_outcomes[i],
+			   (u64) atomic64_read(&r->move_outcomes[0][i]),
+			   (u64) atomic64_read(&r->move_outcomes[1][i]),
+			   (u64) atomic64_read(&r->pending_reasons[i]));
 }
 
 __cold void bch2_reconcile_scan_pending_to_text(struct printbuf *out, struct bch_fs *c)

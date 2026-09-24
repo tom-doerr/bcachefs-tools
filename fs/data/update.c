@@ -258,6 +258,17 @@ static void data_update_account_devs(struct bch_fs *c, struct data_update *u,
 	}
 }
 
+static void data_update_account_committed(struct bch_fs *c, struct data_update *u,
+					  u64 sectors)
+{
+	if (u->opts.type != BCH_DATA_UPDATE_reconcile ||
+	    u->opts.reconcile_phase >= RECONCILE_NR_PHASES)
+		return;
+
+	atomic64_inc(&c->reconcile.phase_committed_keys[u->opts.reconcile_phase]);
+	atomic64_add(sectors, &c->reconcile.phase_committed_sectors[u->opts.reconcile_phase]);
+}
+
 static int data_update_index_update_key(struct btree_trans *trans,
 					struct data_update *u,
 					struct btree_iter *iter)
@@ -505,6 +516,7 @@ static int data_update_index_update_key(struct btree_trans *trans,
 			      u->opts.commit_flags));
 
 	data_update_account_devs(c, u, &new->k_i);
+	data_update_account_committed(c, u, new->k.size);
 	bch2_btree_iter_set_pos(iter, next_pos);
 
 	event_add_trace(c, data_update_key, new->k.size, buf, ({
@@ -784,9 +796,47 @@ bool bch2_data_update_fail_should_trace(enum bch_data_update_types type, int ret
 	return true;
 }
 
+enum move_outcome bch2_move_outcome(int ret)
+{
+	if (!ret)
+		return MOVE_OUTCOME_ok;
+	if (bch2_err_matches(ret, BCH_ERR_data_update_done))
+		return MOVE_OUTCOME_no_io;
+	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_in_flight))
+		return MOVE_OUTCOME_in_flight;
+	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc))
+		return MOVE_OUTCOME_need_copygc;
+	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_would_block))
+		return MOVE_OUTCOME_would_block;
+	if (bch2_err_matches(ret, BCH_ERR_operation_blocked))
+		return MOVE_OUTCOME_blocked;
+	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_no_rw_devs))
+		return MOVE_OUTCOME_no_rw_devs;
+	/* an EROFS-class code, so before the EROFS check: */
+	if (bch2_err_matches(ret, BCH_ERR_insufficient_devices))
+		return MOVE_OUTCOME_insufficient_devices;
+	if (bch2_err_matches(ret, ENOSPC))
+		return MOVE_OUTCOME_enospc;
+	if (bch2_err_matches(ret, BCH_ERR_data_update_fail_no_snapshot))
+		return MOVE_OUTCOME_no_snapshot;
+	if (bch2_err_matches(ret, EROFS))
+		return MOVE_OUTCOME_erofs;
+	return MOVE_OUTCOME_other;
+}
+
+/* Every reconcile/copygc update outcome, including the routine ones not traced: */
+void bch2_move_count_outcome(struct bch_fs *c, enum bch_data_update_types type, int ret)
+{
+	if (type == BCH_DATA_UPDATE_reconcile || type == BCH_DATA_UPDATE_copygc)
+		atomic64_inc(&c->reconcile.move_outcomes[type == BCH_DATA_UPDATE_copygc]
+			     [bch2_move_outcome(ret)]);
+}
+
 static void data_update_trace(struct data_update *u, int ret)
 {
 	struct bch_fs *c = u->op.c;
+
+	bch2_move_count_outcome(c, u->opts.type, ret);
 
 	if (!ret)
 		event_add_trace(c, data_update, u->k.k->k.size, buf,
