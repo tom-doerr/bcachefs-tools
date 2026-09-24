@@ -1448,6 +1448,10 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 		}
 
 		if (statechange_to(a->data_type == BCH_DATA_need_discard)) {
+			atomic64_inc(old_a->data_type == BCH_DATA_cached
+				     ? &ca->buckets_evicted
+				     : &ca->buckets_emptied);
+
 			/*
 			 * Bucket becomes empty: mark it as waiting for a
 			 * journal flush, unless updates since empty -> nonempty

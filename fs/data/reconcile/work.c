@@ -2263,6 +2263,13 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 		prt_newline(out);
 	}
 
+	prt_printf(out, "\nbuckets emptied since mount:\n");
+	prt_printf(out, "device\tdata moved/deleted\tcache evicted\n");
+	for_each_member_device(c, ca)
+		prt_printf(out, "%u %s\t%llu\t%llu\n", ca->dev_idx, ca->name,
+			   (u64) atomic64_read(&ca->buckets_emptied),
+			   (u64) atomic64_read(&ca->buckets_evicted));
+
 	prt_printf(out, "\nmove outcomes since mount:\n");
 	prt_printf(out, "outcome\treconcile\tcopygc\tparked pending\n");
 	for (unsigned i = 0; i < MOVE_OUTCOME_NR; i++)

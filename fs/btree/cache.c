@@ -1052,6 +1052,24 @@ err:
 	return ERR_PTR(-BCH_ERR_ENOMEM_btree_node_mem_alloc);
 }
 
+/*
+ * Journal reclaim is single threaded, and a key cache flush that misses the
+ * btree node cache stalls it here; time those reads separately:
+ */
+static void btree_node_fill_read(struct btree_trans *trans, struct btree *b, bool sync)
+{
+	struct bch_fs *c = trans->c;
+
+	if (sync && current == c->journal.reclaim_thread) {
+		u64 start = local_clock();
+
+		bch2_btree_node_read(trans, b, sync);
+		bch2_time_stats_update(&c->times[BCH_TIME_journal_reclaim_btree_node_read], start);
+	} else {
+		bch2_btree_node_read(trans, b, sync);
+	}
+}
+
 /* Slowpath, don't want it inlined into btree_iter_traverse() */
 static noinline struct btree *bch2_btree_node_fill(struct btree_trans *trans,
 				struct btree_path *path,
@@ -1138,14 +1156,14 @@ static noinline struct btree *bch2_btree_node_fill(struct btree_trans *trans,
 			six_unlock_intent(&b->c.lock);
 			bch2_trans_unlock(trans);
 
-			bch2_btree_node_read(trans, b, sync);
+			btree_node_fill_read(trans, b, sync);
 
 			if (!sync)
 				b = NULL;
 			else if (!six_relock_type(&b->c.lock, lock_type, seq))
 				b = NULL;
 		} else {
-			bch2_btree_node_read(trans, b, sync);
+			btree_node_fill_read(trans, b, sync);
 			if (lock_type == SIX_LOCK_read)
 				six_lock_downgrade(&b->c.lock);
 		}

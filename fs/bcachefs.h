@@ -427,6 +427,9 @@ BCH_DEBUG_PARAMS_ALL()
 	  "Blocked: transaction commit waiting for btree node "	\
 	  "writeback (writes in flight, or dirty nodes over 3/4 "	\
 	  "of the btree node cache)")					\
+	x(journal_reclaim_btree_node_read,				\
+	  "Journal reclaim thread waiting on a btree node read "	\
+	  "(a key cache flush missing the btree node cache)")		\
 	x(blocked_allocate,						\
 	  "Blocked: bucket allocation waiting, copygc or "		\
 	  "allocator thread not keeping up")				\
@@ -635,6 +638,10 @@ struct bch_dev {
 	atomic64_t		reconcile_write_sectors;
 	atomic64_t		copygc_read_sectors;
 	atomic64_t		copygc_write_sectors;
+
+	/* Buckets that became empty (-> need_discard) since mount: */
+	atomic64_t		buckets_emptied;	/* last dirty data moved or deleted */
+	atomic64_t		buckets_evicted;	/* cached copies invalidated */
 };
 
 /*
