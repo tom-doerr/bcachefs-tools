@@ -55,6 +55,13 @@ struct moving_context {
 	/* optional: also counted against, and limited by, a shared budget */
 	struct move_budget	*budget;
 
+	/*
+	 * Throttle on dirty btree nodes when starting moves, and let their
+	 * index updates commit without the btree write ratelimit: a completion
+	 * never waits on metadata writeback while holding in-flight budget.
+	 */
+	bool			metadata_throttle;
+
 	wait_queue_head_t	wait;
 	/* &wait, or the shared budget's waitqueue */
 	wait_queue_head_t	*waitq;

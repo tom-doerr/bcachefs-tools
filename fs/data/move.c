@@ -633,6 +633,27 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 #undef move_reads_bound
 #undef move_writes_bound
 
+	/*
+	 * Metadata backpressure at admission rather than completion: journal
+	 * reclaim is what writes dirty nodes back, so poke it while waiting.
+	 */
+	if (ctxt->metadata_throttle && bch2_btree_cache_should_throttle(c)) {
+		u64 metadata_start = local_clock();
+
+		while (bch2_btree_cache_should_throttle(c)) {
+			try(bch2_kthread_cancelled(c));
+			if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)))
+				return bch_err_throw(c, erofs_no_writes);
+
+			journal_reclaim_kick(&c->journal);
+			move_ctxt_wait_event_timeout(ctxt,
+				!bch2_btree_cache_should_throttle(c), HZ / 10);
+		}
+
+		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_metadata],
+				       metadata_start);
+	}
+
 	/* attributed to the limit that was binding when the wait began */
 	if (write_bound || read_bound)
 		bch2_time_stats_update(&c->times[write_bound

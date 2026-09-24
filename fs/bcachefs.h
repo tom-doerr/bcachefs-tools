@@ -377,6 +377,10 @@ BCH_DEBUG_PARAMS_ALL()
 	x(move_blocked_dev_reads,					\
 	  "Mover admission waiting for its source device's "		\
 	  "move_ios_in_flight_per_dev")					\
+	x(move_blocked_metadata,					\
+	  "Mover admission waiting for dirty btree nodes to be "	\
+	  "written back; its index updates are exempt from the "	\
+	  "btree write ratelimit")					\
 	x(journal_flush_write,						\
 	  "Flush journal writes: cache flush to devices "		\
 	  "then FUA journal writes")					\

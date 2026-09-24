@@ -1670,6 +1670,7 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
 	bch2_moving_ctxt_set_budget(&ctxt, &c->reconcile.move_budget);
+	ctxt.metadata_throttle = true;
 
 	struct btree_trans *trans = ctxt.trans;
 
@@ -2393,6 +2394,7 @@ static int bch2_reconcile_thread(void *arg)
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
 	bch2_moving_ctxt_set_budget(&ctxt, &r->move_budget);
+	ctxt.metadata_throttle = true;
 
 	while (!kthread_should_stop() && !do_reconcile(&ctxt))
 		;
