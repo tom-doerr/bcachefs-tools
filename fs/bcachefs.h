@@ -607,6 +607,16 @@ struct bch_dev {
 	u64			congested_last;
 
 	struct io_count __percpu *io_done;
+
+	/*
+	 * Logical sectors moved by reconcile and copygc since mount, by the
+	 * device read from and the devices written to - shown in
+	 * reconcile_status:
+	 */
+	atomic64_t		reconcile_read_sectors;
+	atomic64_t		reconcile_write_sectors;
+	atomic64_t		copygc_read_sectors;
+	atomic64_t		copygc_write_sectors;
 };
 
 /*

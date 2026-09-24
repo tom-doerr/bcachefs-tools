@@ -27,6 +27,18 @@ struct bch_fs_reconcile {
 	struct bbpos			scan_end;
 	struct bch_move_stats		scan_stats;
 
+	/*
+	 * Since mount, written only by the reconcile thread: the destage
+	 * prepass, and need_copygc deferrals in all keyed phases:
+	 */
+	u64				destage_sweeps;
+	u64				destage_ns;
+	u64				destage_skipped;
+	u64				destage_attempted;
+	u64				destage_completed;
+	u64				destage_deferred;
+	u64				deferred;
+
 	/* In-flight opt changes - see bch2_set_reconcile_needs_scan_pre/post() */
 	struct rhashtable		scans_in_flight;
 	bool				scans_in_flight_init_done;

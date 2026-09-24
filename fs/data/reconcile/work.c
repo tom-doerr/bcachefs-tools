@@ -1758,7 +1758,15 @@ static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
 	int ret = lockrestart_do(trans,
 		do_reconcile_extent_destage(p->ctxt, p->snapshot_io_opts, r->work_pos,
 					    p->stripe_retry));
-	return ret > 0 ? 0 : ret;
+	if (ret > 0) {
+		r->destage_skipped++;
+		return 0;
+	}
+
+	r->destage_attempted++;
+	if (!ret)
+		r->destage_completed++;
+	return ret;
 }
 
 /*
@@ -1832,6 +1840,10 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			if (reconcile_phases[r->phase].type == RECONCILE_PHASE_scan)
 				continue;
 
+			r->deferred++;
+			if (reconcile_phases[r->phase].type == RECONCILE_PHASE_destage)
+				r->destage_deferred++;
+
 			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED)
 				return 0;
 		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
@@ -1885,8 +1897,14 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 		return do_reconcile_phase_phys(p);
 	case RECONCILE_PHASE_normal:
 		return do_reconcile_phase_iter(p, kick, do_reconcile_extent_key);
-	case RECONCILE_PHASE_destage:
-		return do_reconcile_phase_iter(p, kick, do_reconcile_destage_key);
+	case RECONCILE_PHASE_destage: {
+		u64 start = ktime_get_ns();
+		int ret = do_reconcile_phase_iter(p, kick, do_reconcile_destage_key);
+
+		r->destage_ns += ktime_get_ns() - start;
+		r->destage_sweeps++;
+		return ret;
+	}
 	default:
 		BUG();
 	}
@@ -2098,6 +2116,34 @@ __cold void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c
 				prt_newline(out);
 			}
 		}
+	}
+
+	prt_newline(out);
+	prt_printf(out, "destage sweeps:\t%llu\n",		r->destage_sweeps);
+	prt_printf(out, "destage time:\t");
+	bch2_pr_time_units(out, r->destage_ns);
+	prt_newline(out);
+	prt_printf(out, "destage keys skipped:\t%llu\n",	r->destage_skipped);
+	prt_printf(out, "destage keys attempted:\t%llu\n",	r->destage_attempted);
+	prt_printf(out, "destage keys completed:\t%llu\n",	r->destage_completed);
+	prt_printf(out, "destage keys deferred:\t%llu\n",	r->destage_deferred);
+	prt_printf(out, "deferred, need copygc:\t%llu\n",	r->deferred);
+
+	prt_newline(out);
+	printbuf_tabstop_push(out, 12);
+	printbuf_tabstop_push(out, 12);
+	prt_printf(out, "moved since mount\treconcile\t\tcopygc\n");
+	prt_printf(out, "device\tread\twritten\tread\twritten\n");
+	for_each_member_device(c, ca) {
+		prt_printf(out, "%u %s\t", ca->dev_idx, ca->name);
+		prt_human_readable_u64(out, atomic64_read(&ca->reconcile_read_sectors) << 9);
+		prt_tab(out);
+		prt_human_readable_u64(out, atomic64_read(&ca->reconcile_write_sectors) << 9);
+		prt_tab(out);
+		prt_human_readable_u64(out, atomic64_read(&ca->copygc_read_sectors) << 9);
+		prt_tab(out);
+		prt_human_readable_u64(out, atomic64_read(&ca->copygc_write_sectors) << 9);
+		prt_newline(out);
 	}
 
 	struct task_struct *t;

@@ -227,6 +227,37 @@ static void count_data_update_key_fail(struct data_update *u,
 	}));
 }
 
+/*
+ * Reconcile and copygc traffic by device: the device the data was read from,
+ * and the devices the new replicas went to. Called once per committed key.
+ */
+static void data_update_account_devs(struct bch_fs *c, struct data_update *u,
+				     struct bkey_i *new)
+{
+	bool copygc = u->opts.type == BCH_DATA_UPDATE_copygc;
+
+	if (!copygc && u->opts.type != BCH_DATA_UPDATE_reconcile)
+		return;
+
+	u64 sectors = new->k.size;
+	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(bkey_i_to_s_c(new));
+
+	guard(rcu)();
+	struct bch_dev *ca = bch2_dev_rcu_noerror(c, u->rbio.pick.ptr.dev);
+	if (ca)
+		atomic64_add(sectors, copygc
+			     ? &ca->copygc_read_sectors
+			     : &ca->reconcile_read_sectors);
+
+	bkey_for_each_ptr(ptrs, ptr) {
+		ca = bch2_dev_rcu_noerror(c, ptr->dev);
+		if (ca)
+			atomic64_add(sectors, copygc
+				     ? &ca->copygc_write_sectors
+				     : &ca->reconcile_write_sectors);
+	}
+}
+
 static int data_update_index_update_key(struct btree_trans *trans,
 					struct data_update *u,
 					struct btree_iter *iter)
@@ -473,6 +504,7 @@ static int data_update_index_update_key(struct btree_trans *trans,
 			      BCH_TRANS_COMMIT_no_enospc|
 			      u->opts.commit_flags));
 
+	data_update_account_devs(c, u, &new->k_i);
 	bch2_btree_iter_set_pos(iter, next_pos);
 
 	event_add_trace(c, data_update_key, new->k.size, buf, ({
