@@ -423,6 +423,10 @@ BCH_DEBUG_PARAMS_ALL()
 	  "in slowpath wait)")						\
 	x(blocked_key_cache_flush,					\
 	  "Blocked: waiting for key cache flush")			\
+	x(blocked_btree_write_ratelimit,				\
+	  "Blocked: transaction commit waiting for btree node "	\
+	  "writeback (writes in flight, or dirty nodes over 3/4 "	\
+	  "of the btree node cache)")					\
 	x(blocked_allocate,						\
 	  "Blocked: bucket allocation waiting, copygc or "		\
 	  "allocator thread not keeping up")				\

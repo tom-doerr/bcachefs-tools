@@ -1390,13 +1390,21 @@ static noinline int bch2_trans_commit_btree_write_ratelimit(struct btree_trans *
 {
 	struct bch_fs *c = trans->c;
 	struct bch_fs_btree_cache *bc = &c->btree.cache;
+	u64 start = local_clock();
 
-	return drop_locks_do(trans, ({
+	atomic64_inc(atomic_long_read(&bc->nr_in_flight_inner) > BTREE_WRITE_IO_LIMIT(c)
+		     ? &bc->write_ratelimit_in_flight
+		     : &bc->write_ratelimit_dirty);
+
+	int ret = drop_locks_do(trans, ({
 		trans_wait_event(trans, &bc->nr_in_flight_wait,
 			atomic_long_read(&bc->nr_in_flight_inner) < BTREE_WRITE_IO_LIMIT(c) * 3 / 4 &&
 			!bch2_btree_cache_should_throttle(c));
 		0;
 	}));
+
+	bch2_time_stats_update(&c->times[BCH_TIME_blocked_btree_write_ratelimit], start);
+	return ret;
 }
 
 int __bch2_trans_commit(struct btree_trans *trans, enum bch_trans_commit_flags flags,

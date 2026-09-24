@@ -289,6 +289,9 @@ struct bch_fs_btree_cache {
 	atomic_long_t		nr_in_flight;
 	atomic_long_t		nr_in_flight_inner;
 	struct closure_waitlist	nr_in_flight_wait;
+	/* commits held by bch2_trans_commit_btree_write_ratelimit(), by cause: */
+	atomic64_t		write_ratelimit_in_flight;
+	atomic64_t		write_ratelimit_dirty;
 	bool			should_throttle ____cacheline_aligned_in_smp;
 
 	/* shrinker stats */

@@ -1937,6 +1937,10 @@ __cold void bch2_btree_cache_to_text(struct printbuf *out, const struct bch_fs_b
 	prt_btree_cache_line(out, c, "dirty:",		bc->live[0].nr_dirty + bc->live[1].nr_dirty);
 	prt_btree_cache_line(out, c, "in flight:",	atomic_long_read(&bc->nr_in_flight));
 	prt_printf(out, "cannibalize lock:\t%s\n",	bc->alloc_lock ? "held" : "not held");
+	prt_printf(out, "commits throttled, writes in flight:\t%llu\n",
+		   (u64) atomic64_read(&bc->write_ratelimit_in_flight));
+	prt_printf(out, "commits throttled, dirty:\t%llu\n",
+		   (u64) atomic64_read(&bc->write_ratelimit_dirty));
 	prt_newline(out);
 
 	for (unsigned i = 0; i < ARRAY_SIZE(bc->nr_by_btree); i++) {
