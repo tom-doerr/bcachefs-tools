@@ -863,7 +863,12 @@ static int do_retry_stripes(struct moving_context *ctxt,
 			return 0;
 		}
 
-		try(lockrestart_do(trans, do_retry_stripe(ctxt, i->idx)));
+		int ret = lockrestart_do(trans, do_retry_stripe(ctxt, i->idx));
+		if (ret) {
+			/* keep this one and the rest, not the ones already retried */
+			darray_remove_items(retry, retry->data, i - retry->data);
+			return ret;
+		}
 	}
 
 	retry->nr = 0;
@@ -2372,7 +2377,22 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			break;
 		} else {
 			consecutive_deferred = 0;
-			do_retry_stripes(ctxt, p->stripe_retry);
+
+			/*
+			 * A stripe retry that gave up at admission ends the
+			 * turn, like a key that does: otherwise every later key
+			 * that starts no move of its own would wait for it
+			 * again. This key is done - step past it first. Other
+			 * errors are reported by the retry, as before.
+			 */
+			int ret2 = do_retry_stripes(ctxt, p->stripe_retry);
+			if (bch2_err_matches(ret2, BCH_ERR_reconcile_interrupted)) {
+				r->work_pos.pos = reconcile_work_pos_successor(r->work_pos);
+				p->exit = bch2_err_matches(ret2, BCH_ERR_reconcile_admission_timeout)
+					? RECONCILE_PHASE_EXIT_admission
+					: RECONCILE_PHASE_EXIT_stopped;
+				break;
+			}
 		}
 
 		r->work_pos.pos = reconcile_work_pos_successor(r->work_pos);
@@ -2583,12 +2603,16 @@ static int do_reconcile(struct moving_context *ctxt)
 				goto out;
 
 			/*
-			 * Any unfinished pending sweep - given up at admission,
-			 * 16 entries deferred on copygc, stopped - runs again next
+			 * A pending sweep given up at admission runs again next
 			 * pass: its durable cookie is gone (see pending_retry).
+			 * Not one that hit the deferral limit: the pending
+			 * phases aren't resumable, so it would restart at the
+			 * same deferred entries, pass after pass. (That loses
+			 * the rest of the sweep, as it always has.) A kick
+			 * reruns the pass in this call, cookie and all.
 			 */
 			if (reconcile_phase_is_pending(r->phase) &&
-			    pass.exit != RECONCILE_PHASE_EXIT_exhausted)
+			    pass.exit == RECONCILE_PHASE_EXIT_admission)
 				r->pending_retry = pending_cookie;
 
 			if (pass.exit == RECONCILE_PHASE_EXIT_yield ||
@@ -2805,7 +2829,7 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 	prt_printf(out, "in flight, all contexts: %u moves %u sectors, limit %u moves %u sectors; "
 		   "peak %u moves %u sectors, largest %u sectors, waited %llu\n",
 		   atomic_read(&b->moves), atomic_read(&b->sectors),
-		   READ_ONCE(*b->max_ios_opt), READ_ONCE(*b->max_bytes_opt) >> 9,
+		   READ_ONCE(*b->max_ios_opt), bch2_move_budget_max_sectors(b),
 		   atomic_read(&b->peak_moves), atomic_read(&b->peak_sectors),
 		   atomic_read(&b->max_item_sectors), (u64) atomic64_read(&b->waits));
 

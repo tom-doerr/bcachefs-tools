@@ -148,6 +148,14 @@ static inline bool bch2_move_dev_reads_room(struct bch_fs *c, struct bch_dev *ca
 	return !cap || (u32) atomic_read(&ca->move_reads_in_flight) < cap;
 }
 
+/* The byte limit in sectors, rounded up (a nonzero limit under 512 bytes isn't "no limit") */
+static inline u32 bch2_move_budget_max_sectors(struct move_budget *b)
+{
+	u32 v = READ_ONCE(*b->max_bytes_opt);
+
+	return (v >> 9) + !!(v & 511);
+}
+
 int bch2_move_budget_get(struct moving_context *, u32, bool *);
 void bch2_move_budget_put(struct move_budget *, u32);
 

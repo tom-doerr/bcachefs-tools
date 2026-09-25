@@ -289,16 +289,11 @@ static inline u32 move_budget_max_moves(struct move_budget *b)
 	return READ_ONCE(*b->max_ios_opt);
 }
 
-static inline u32 move_budget_max_sectors(struct move_budget *b)
-{
-	/* rounded up: a nonzero limit under 512 bytes is not "no limit" */
-	return DIV_ROUND_UP(READ_ONCE(*b->max_bytes_opt), 512);
-}
 
 static bool move_budget_fits(struct move_budget *b, u32 sectors, bool drain_waiter)
 {
 	u32 max_moves	= move_budget_max_moves(b);
-	u32 max_sectors	= move_budget_max_sectors(b);
+	u32 max_sectors	= bch2_move_budget_max_sectors(b);
 	u32 moves	= atomic_read(&b->moves);
 	u32 cur		= atomic_read(&b->sectors);
 
@@ -313,7 +308,7 @@ static bool move_budget_fits(struct move_budget *b, u32 sectors, bool drain_wait
 static bool move_budget_full(struct move_budget *b)
 {
 	u32 max_moves	= move_budget_max_moves(b);
-	u32 max_sectors	= move_budget_max_sectors(b);
+	u32 max_sectors	= bch2_move_budget_max_sectors(b);
 
 	return atomic_read(&b->draining) ||
 		(max_moves && (u32) atomic_read(&b->moves) >= max_moves) ||
@@ -323,7 +318,7 @@ static bool move_budget_full(struct move_budget *b)
 static bool move_budget_try_get(struct move_budget *b, u32 sectors, bool drain_waiter)
 {
 	u32 max_moves	= move_budget_max_moves(b);
-	u32 max_sectors	= move_budget_max_sectors(b);
+	u32 max_sectors	= bch2_move_budget_max_sectors(b);
 
 	if (!drain_waiter && atomic_read(&b->draining))
 		return false;
@@ -384,7 +379,7 @@ int bch2_move_budget_get(struct moving_context *ctxt, u32 sectors, bool *slept)
 
 	while (!move_budget_try_get(b, sectors, drain)) {
 		/* the limit is live: it may have become smaller than this item */
-		u32 max_sectors = move_budget_max_sectors(b);
+		u32 max_sectors = bch2_move_budget_max_sectors(b);
 
 		if (!drain &&
 		    ((max_sectors && sectors > max_sectors) ||

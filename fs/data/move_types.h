@@ -43,7 +43,10 @@ struct bch_move_stats {
 struct move_budget {
 	atomic_t		moves;
 	atomic_t		sectors;
-	/* waiters for an item bigger than the byte limit: everyone else holds back */
+	/*
+	 * waiters bigger than the live byte limit, or that have waited
+	 * MOVE_BUDGET_DRAIN_AFTER_NS: everyone else holds back
+	 */
 	atomic_t		draining;
 	/* the limits' option values, read live; 0 means no limit */
 	const u32		*max_bytes_opt;

@@ -1573,19 +1573,21 @@ retry_pick:
 	if (unlikely(!ret))
 		return read_extent_hole(c, orig, iter, k, flags);
 
-	if (unlikely(ret < 0)) {
-		/*
-		 * The device a move reserved its read on can't be read after
-		 * all (a cached copy went stale, the device went offline since):
-		 * read what it would have read without the reservation.
-		 */
-		if (flags & BCH_READ_reserved_read_device) {
-			flags &= ~(BCH_READ_reserved_read_device|
-				   BCH_READ_hard_require_read_device);
-			goto retry_pick;
-		}
-		return read_extent_pick_err(trans, orig, read_pos, data_btree, k, flags, ret);
+	/*
+	 * The device a move reserved its read on can't be read after all (a
+	 * cached copy went stale, the device went offline since - with an EC'd
+	 * pointer the pick then says reconstruct): read what it would have
+	 * read without the reservation.
+	 */
+	if (unlikely(flags & BCH_READ_reserved_read_device) &&
+	    (ret < 0 || pick.do_ec_reconstruct)) {
+		flags &= ~(BCH_READ_reserved_read_device|
+			   BCH_READ_hard_require_read_device);
+		goto retry_pick;
 	}
+
+	if (unlikely(ret < 0))
+		return read_extent_pick_err(trans, orig, read_pos, data_btree, k, flags, ret);
 	ret = 0;
 
 	if (bch2_csum_type_is_encryption(pick.crc.csum_type) &&

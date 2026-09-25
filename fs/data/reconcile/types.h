@@ -130,9 +130,9 @@ struct bch_fs_reconcile {
 	u64				phase_start;
 
 	/*
-	 * A pending phase that gave up its turn (metadata admission) leaves its
-	 * cookie here: the durable one was consumed by the scan phase, so the
-	 * next pass would otherwise not run the pending phases at all.
+	 * A pending phase that gave up its turn at metadata admission leaves
+	 * its cookie here: the durable one was consumed by the scan phase, so
+	 * the next pass would otherwise not run the pending phases at all.
 	 */
 	struct bkey_i_cookie		pending_retry;
 
