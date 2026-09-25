@@ -754,6 +754,8 @@ static void ec_stripe_create(struct ec_stripe_new *s)
 		unsigned stripe_sectors = le16_to_cpu(v->sectors) * v->nr_blocks;
 		atomic_sub(stripe_sectors, &s->ctxt->write_sectors);
 		atomic_dec(&s->ctxt->write_ios);
+		if (s->budget_sectors)
+			bch2_move_budget_put(s->ctxt->budget, s->budget_sectors);
 		wake_up(s->ctxt->waitq);
 		closure_put(&s->ctxt->cl);
 	}
@@ -2217,7 +2219,26 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 
 	init_new_stripe_from_old(c, new_s, true);
 
-	int ret;
+	/*
+	 * One reservation on the shared move budget for the whole rebuild,
+	 * held until ec_stripe_create() has finished it, taken before any
+	 * buffer or bucket is. The evacuation path above holds nothing
+	 * itself - its moves reserve their own. Past this point @old_s may
+	 * be gone (the wait drops every lock): use the copy.
+	 */
+	u32 budget_sectors = le16_to_cpu(old_s->sectors) *
+		(nr_live_data_blocks + old_s->nr_redundant);
+	const struct bch_stripe *old_v = &new_s->old_stripe.key.v;
+	bool slept = false;
+
+	int ret = bch2_move_budget_get(ctxt, budget_sectors, &slept);
+	if (ret) {
+		bch2_stripe_handle_put(c, &new_s->old_stripe_handle);
+		kfree(new_s);
+		return ret;
+	}
+	if (ctxt->budget)
+		new_s->budget_sectors = budget_sectors;
 
 	CLASS(closure_stack, cl)();
 	while (bch2_err_matches(ret = bch2_ec_stripe_buf_init(c, &new_s->old_stripe, 0,
@@ -2231,6 +2252,8 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 		bch2_ec_stripe_buf_init(c, &new_s->new_stripe, 0, le16_to_cpu(new_s->new_stripe.key.v.sectors), NULL) ?:
 		lockrestart_do(trans, stripe_idx_alloc(trans, new_s));
 	if (ret) {
+		if (new_s->budget_sectors)
+			bch2_move_budget_put(ctxt->budget, new_s->budget_sectors);
 		bch2_stripe_handle_put(c, &new_s->old_stripe_handle);
 		bch2_ec_stripe_buf_exit(&new_s->new_stripe);
 		__bch2_ec_stripe_buf_exit(&new_s->old_stripe);
@@ -2238,8 +2261,8 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 		return ret;
 	}
 
-	unsigned target = old_s->disk_label
-		? group_to_target(old_s->disk_label - 1)
+	unsigned target = old_v->disk_label
+		? group_to_target(old_v->disk_label - 1)
 		: 0;
 
 	bch2_trans_begin(trans); /* avoid unnecessary restarts from dev_stripe_state_get() */
@@ -2248,7 +2271,7 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 		struct ec_dev_stripe_state *dev_stripe = NULL;
 		struct alloc_request *req __free(alloc_request_put) = NULL;
 
-		int ret2 = PTR_ERR_OR_ZERO(dev_stripe = ec_dev_stripe_state_get(trans, old_s->disk_label)) ?:
+		int ret2 = PTR_ERR_OR_ZERO(dev_stripe = ec_dev_stripe_state_get(trans, old_v->disk_label)) ?:
 			   PTR_ERR_OR_ZERO(req = alloc_request_get(trans, target, false, NULL,
 								   0, 0, BCH_WATERMARK_normal, 0, &cl));
 		if (!ret2)
@@ -2272,6 +2295,8 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 		bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&new_s->new_stripe.key.k_i));;
 		prt_printf(&msg.m, "\nret %s", bch2_err_str(ret));
 
+		if (new_s->budget_sectors)
+			bch2_move_budget_put(ctxt->budget, new_s->budget_sectors);
 		bch2_stripe_handle_put(c, &new_s->new_stripe_handle);
 		bch2_stripe_handle_put(c, &new_s->old_stripe_handle);
 		bch2_ec_stripe_buf_exit(&new_s->new_stripe);

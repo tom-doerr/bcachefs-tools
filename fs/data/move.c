@@ -92,20 +92,12 @@ static void move_ctxt_account_reads(struct moving_context *ctxt, int sectors, in
 {
 	atomic_add(sectors, &ctxt->read_sectors);
 	atomic_add(ios, &ctxt->read_ios);
-	if (ctxt->budget) {
-		atomic_add(sectors, &ctxt->budget->read_sectors);
-		atomic_add(ios, &ctxt->budget->read_ios);
-	}
 }
 
 static void move_ctxt_account_writes(struct moving_context *ctxt, int sectors, int ios)
 {
 	atomic_add(sectors, &ctxt->write_sectors);
 	atomic_add(ios, &ctxt->write_ios);
-	if (ctxt->budget) {
-		atomic_add(sectors, &ctxt->budget->write_sectors);
-		atomic_add(ios, &ctxt->budget->write_ios);
-	}
 }
 
 static void move_write_done(struct bch_write_op *op)
@@ -124,6 +116,9 @@ static void move_write_done(struct bch_write_op *op)
 	 */
 	if (bch2_err_matches(op->error, BCH_ERR_ec_alloc_failed))
 		bch2_data_update_ec_alloc_failed(u);
+
+	if (u->budget_charged)
+		bch2_move_budget_put(ctxt->budget, u->budget_sectors);
 
 	bch2_data_update_exit(u, op->error);
 	call_rcu(&u->rcu, data_update_free_rcu);
@@ -316,6 +311,160 @@ void bch2_move_stats_init(struct bch_move_stats *stats, const char *name)
 	scnprintf(stats->name, sizeof(stats->name), "%s", name);
 }
 
+/*
+ * The shared move budget. A move's reservation - one move, its sectors - lasts
+ * from admission until the move is completely done, including while its read
+ * has completed and its write waits to be issued; reservations are taken with
+ * cmpxchg against the limits (read live), so they are hard maxima. Except: an
+ * item bigger than the whole byte limit (a big extent, a stripe rebuild) is
+ * admitted only into an empty budget, and while one waits everyone else holds
+ * back (@draining) so that it can empty.
+ */
+static inline u32 move_budget_max_moves(struct move_budget *b)
+{
+	return READ_ONCE(*b->max_ios_opt);
+}
+
+static inline u32 move_budget_max_sectors(struct move_budget *b)
+{
+	return READ_ONCE(*b->max_bytes_opt) >> 9;
+}
+
+static bool move_budget_fits(struct move_budget *b, u32 sectors, bool drain_waiter)
+{
+	u32 max_moves	= move_budget_max_moves(b);
+	u32 max_sectors	= move_budget_max_sectors(b);
+	u32 moves	= atomic_read(&b->moves);
+	u32 cur		= atomic_read(&b->sectors);
+
+	if (!drain_waiter && atomic_read(&b->draining))
+		return false;
+	if (max_moves && moves >= max_moves)
+		return false;
+	return !max_sectors || !cur || cur + sectors <= max_sectors;
+}
+
+/* for bch2_move_ratelimit(): no point looking for work while this holds */
+static bool move_budget_full(struct move_budget *b)
+{
+	u32 max_moves	= move_budget_max_moves(b);
+	u32 max_sectors	= move_budget_max_sectors(b);
+
+	return atomic_read(&b->draining) ||
+		(max_moves && (u32) atomic_read(&b->moves) >= max_moves) ||
+		(max_sectors && (u32) atomic_read(&b->sectors) >= max_sectors);
+}
+
+static void move_budget_note_peak(atomic_t *peak, int v)
+{
+	int old = atomic_read(peak);
+
+	while (v > old && !atomic_try_cmpxchg(peak, &old, v))
+		;
+}
+
+static bool move_budget_try_get(struct move_budget *b, u32 sectors, bool drain_waiter)
+{
+	u32 max_moves	= move_budget_max_moves(b);
+	u32 max_sectors	= move_budget_max_sectors(b);
+
+	if (!drain_waiter && atomic_read(&b->draining))
+		return false;
+
+	int moves = atomic_read(&b->moves);
+	do {
+		if (max_moves && (u32) moves >= max_moves)
+			return false;
+	} while (!atomic_try_cmpxchg(&b->moves, &moves, moves + 1));
+
+	int cur = atomic_read(&b->sectors);
+	do {
+		if (max_sectors && cur && (u32) cur + sectors > max_sectors) {
+			atomic_dec(&b->moves);
+			return false;
+		}
+	} while (!atomic_try_cmpxchg(&b->sectors, &cur, cur + sectors));
+
+	move_budget_note_peak(&b->peak_moves, moves + 1);
+	move_budget_note_peak(&b->peak_sectors, cur + sectors);
+	move_budget_note_peak(&b->max_item_sectors, sectors);
+	return true;
+}
+
+void bch2_move_budget_put(struct move_budget *b, u32 sectors)
+{
+	atomic_sub(sectors, &b->sectors);
+	atomic_dec(&b->moves);
+	wake_up(&b->wait);
+}
+
+/*
+ * Reserve @sectors of @ctxt's shared budget; nothing to do without one. If it
+ * has to wait, it does so with the transaction's locks dropped (*@slept is
+ * set) and keeps issuing this context's pending writes - their completions
+ * release reservations. Returns 0 once reserved, or an error with nothing
+ * reserved: only when the filesystem is going read-only (the wait is bounded
+ * by the moves in flight completing, so it needs no other exit - and its
+ * callers include stripe repair's nested evacuations, which treat unknown
+ * errors as bugs).
+ */
+int bch2_move_budget_get(struct moving_context *ctxt, u32 sectors, bool *slept)
+{
+	struct bch_fs *c = ctxt->trans->c;
+	struct move_budget *b = ctxt->budget;
+
+	if (!b || move_budget_try_get(b, sectors, false))
+		return 0;
+
+	u32 max_sectors = move_budget_max_sectors(b);
+	bool oversized = max_sectors && sectors > max_sectors;
+	u64 start = local_clock();
+	int ret = 0;
+
+	*slept = true;
+	bch2_trans_unlock_long(ctxt->trans);
+
+	atomic64_inc(&b->waits);
+	if (oversized)
+		atomic_inc(&b->draining);
+
+	while (!move_budget_try_get(b, sectors, oversized)) {
+		if (unlikely(test_bit(BCH_FS_going_ro, &c->flags))) {
+			ret = bch_err_throw(c, erofs_no_writes);
+			break;
+		}
+
+		if (unlikely(freezing(current))) {
+			bch2_moving_ctxt_flush_all(ctxt);
+			try_to_freeze();
+		}
+
+		move_ctxt_wait_event_once(ctxt, move_budget_fits(b, sectors, oversized), HZ / 10);
+	}
+
+	if (oversized) {
+		atomic_dec(&b->draining);
+		wake_up(&b->wait);
+	}
+
+	bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_budget], start);
+	return ret;
+}
+
+/* As bch2_move_budget_get(), for a caller that needs its locks back afterwards */
+static int move_budget_get_relock(struct moving_context *ctxt, u32 sectors)
+{
+	bool slept = false;
+	int ret = bch2_move_budget_get(ctxt, sectors, &slept);
+
+	if (!ret && slept) {
+		ret = bch2_trans_relock(ctxt->trans);
+		if (ret)
+			bch2_move_budget_put(ctxt->budget, sectors);
+	}
+	return ret;
+}
+
 DEFINE_FREE(data_update_free, struct data_update *, if (_T) kfree_rcu(_T, rcu))
 
 static int __bch2_move_extent(struct moving_context *ctxt,
@@ -339,10 +488,22 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	if (ret)
 		return ret;
 
+	/* before bch2_data_update_init(): waiting for it can't hold nocow locks */
+	u32 budget_sectors = k.k->size;
+	ret = move_budget_get_relock(ctxt, budget_sectors);
+	if (ret)
+		return ret;
+
 	ret = bch2_data_update_init(trans, iter, ctxt, u, ctxt->wp,
 				    io_opts, *data_opts, iter->btree_id, k);
-	if (ret)
+	if (ret) {
+		if (ctxt->budget)
+			bch2_move_budget_put(ctxt->budget, budget_sectors);
 		return bch2_err_matches(ret, BCH_ERR_data_update_done) ? 0 : ret;
+	}
+
+	u->budget_sectors	= budget_sectors;
+	u->budget_charged	= ctxt->budget != NULL;
 
 	k = bkey_i_to_s_c(u->k.k);
 
@@ -416,8 +577,12 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 		}
 		if (u->read_ca_counted)
 			atomic_dec(&u->read_ca_counted->move_reads_in_flight);
+		if (u->budget_charged)
+			bch2_move_budget_put(ctxt->budget, u->budget_sectors);
 
 		bch2_data_update_exit(u, ret);
+		/* as move_write_done(): exit doesn't free u or its key */
+		call_rcu(&u->rcu, data_update_free_rcu);
 		u = NULL;
 		return ret;
 	}
@@ -509,10 +674,17 @@ int bch2_move_extent(struct moving_context *ctxt,
 		if ((commit_flags & BCH_WATERMARK_MASK) == BCH_WATERMARK_copygc)
 			commit_flags = btree_update_set_watermark_hipri(commit_flags);
 
-		ret = bch2_btree_node_rewrite_pos(trans, iter->btree_id, level, k.k->p,
+		u32 budget_sectors = btree_sectors(c);
+		try(move_budget_get_relock(ctxt, budget_sectors));
+
+		ret = bch2_btree_node_rewrite_pos(trans, iter->btree_id, level,
+						  node_key.k->k.p,
 						  data_opts->target,
 						  data_opts->commit_flags,
 						  data_opts->write_flags);
+
+		if (ctxt->budget)
+			bch2_move_budget_put(ctxt->budget, budget_sectors);
 
 		/* ENOMEM becomes a restart below and gets retried - not an outcome */
 		if (!bch2_err_matches(ret, BCH_ERR_transaction_restart) &&
@@ -593,22 +765,19 @@ static bool move_budget_bound(atomic_t *sectors, atomic_t *ios, u32 max_sectors,
 
 static bool move_ctxt_writes_bound(struct bch_fs *c, struct moving_context *ctxt)
 {
-	struct move_budget *b = ctxt->budget;
-
 	return move_budget_bound(&ctxt->write_sectors, &ctxt->write_ios,
-				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight) ||
-		(b && move_budget_bound(&b->write_sectors, &b->write_ios,
-					READ_ONCE(*b->max_bytes_opt) >> 9, READ_ONCE(*b->max_ios_opt)));
+				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight);
 }
 
 static bool move_ctxt_reads_bound(struct bch_fs *c, struct moving_context *ctxt)
 {
-	struct move_budget *b = ctxt->budget;
-
 	return move_budget_bound(&ctxt->read_sectors, &ctxt->read_ios,
-				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight) ||
-		(b && move_budget_bound(&b->read_sectors, &b->read_ios,
-					READ_ONCE(*b->max_bytes_opt) >> 9, READ_ONCE(*b->max_ios_opt)));
+				 c->opts.move_bytes_in_flight >> 9, c->opts.move_ios_in_flight);
+}
+
+static bool move_ctxt_budget_full(struct moving_context *ctxt)
+{
+	return ctxt->budget && move_budget_full(ctxt->budget);
 }
 
 int bch2_move_ratelimit(struct moving_context *ctxt)
@@ -649,16 +818,21 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 	u64 start = local_clock();
 	bool write_bound	= move_ctxt_writes_bound(c, ctxt);
 	bool read_bound		= move_ctxt_reads_bound(c, ctxt);
+	bool budget_full	= move_ctxt_budget_full(ctxt);
 
 	/* Also issues pending writes, so it runs even when nothing is bound: */
 	move_ctxt_wait_event(ctxt,
-		!move_ctxt_writes_bound(c, ctxt) && !move_ctxt_reads_bound(c, ctxt));
+		!move_ctxt_writes_bound(c, ctxt) &&
+		!move_ctxt_reads_bound(c, ctxt) &&
+		!move_ctxt_budget_full(ctxt));
 
 	/* attributed to the limit that was binding when the wait began */
 	if (write_bound || read_bound)
 		bch2_time_stats_update(&c->times[write_bound
 						 ? BCH_TIME_move_ratelimit_write
 						 : BCH_TIME_move_ratelimit_read], start);
+	else if (budget_full)
+		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_budget], start);
 
 	return 0;
 }

@@ -83,6 +83,9 @@ struct data_update {
 
 	/* read_dev's device, counted in its move_reads_in_flight until endio */
 	struct bch_dev		*read_ca_counted;
+	/* on u->ctxt->budget, held until the update is done (move_write_done()) */
+	u32			budget_sectors;
+	bool			budget_charged;
 
 	/* local_clock() at each move step, for the move_* time stats: */
 	u64			time_read_submit;

@@ -34,19 +34,25 @@ struct bch_move_stats {
 };
 
 /*
- * In-flight move IO shared by several moving contexts - reconcile's thread
- * and its per-device phys workers - bounded in bch2_move_ratelimit() on top
- * of each context's own limits. Every context using it sleeps on @wait, so
- * any context's completion wakes waiters in all of them.
+ * Moves in flight across several moving contexts - reconcile's thread and its
+ * per-device phys workers - on top of each context's own limits. Every move
+ * holds a reservation (one move, its sectors) from admission until it is
+ * completely done; see bch2_move_budget_get(). Every context using it sleeps
+ * on @wait, so any context's completion wakes waiters in all of them.
  */
 struct move_budget {
-	atomic_t		read_sectors;
-	atomic_t		write_sectors;
-	atomic_t		read_ios;
-	atomic_t		write_ios;
+	atomic_t		moves;
+	atomic_t		sectors;
+	/* waiters for an item bigger than the byte limit: everyone else holds back */
+	atomic_t		draining;
 	/* the limits' option values, read live; 0 means no limit */
 	const u32		*max_bytes_opt;
 	const u32		*max_ios_opt;
+	/* since mount: highest moves/sectors held, largest reservation, waits */
+	atomic_t		peak_moves;
+	atomic_t		peak_sectors;
+	atomic_t		max_item_sectors;
+	atomic64_t		waits;
 	wait_queue_head_t	wait;
 };
 

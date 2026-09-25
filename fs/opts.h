@@ -598,15 +598,17 @@ enum fsck_err_opts {
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, 4096),						\
 	  BCH2_NO_SB_OPT,		0,				\
-	  NULL,		"Maximum IOs in flight across all reconcile\n"	\
-			"move contexts (each also has move_ios_in_flight);\n"	\
+	  NULL,		"Maximum reconcile moves in flight across all\n"	\
+			"reconcile contexts, each from admission until it\n"	\
+			"is done (each context also has move_ios_in_flight);\n" \
 			"0: no limit\n")					\
 	x(reconcile_move_bytes_in_flight, u32,				\
 	  OPT_HUMAN_READABLE|OPT_FS|OPT_MOUNT|OPT_RUNTIME,		\
 	  OPT_UINT(0, U32_MAX),						\
 	  BCH2_NO_SB_OPT,		0,				\
-	  NULL,		"Maximum amount of IO in flight across all\n"	\
-			"reconcile move contexts; 0: no limit\n")		\
+	  NULL,		"Maximum data in reconcile moves in flight across\n"	\
+			"all reconcile contexts; one move bigger than this\n"	\
+			"runs alone; 0: no limit\n")				\
 	x(reconcile_metadata_admission,	u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_BOOL(),							\

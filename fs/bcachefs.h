@@ -381,6 +381,9 @@ BCH_DEBUG_PARAMS_ALL()
 	  "Mover admission waiting for dirty btree nodes to be "	\
 	  "written back; its index updates are exempt from the "	\
 	  "btree write ratelimit")					\
+	x(move_blocked_budget,						\
+	  "Reconcile move waiting for a reservation on the shared "	\
+	  "reconcile move budget")					\
 	x(journal_flush_write,						\
 	  "Flush journal writes: cache flush to devices "		\
 	  "then FUA journal writes")					\

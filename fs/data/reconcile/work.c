@@ -2723,10 +2723,12 @@ __cold void bch2_reconcile_stats_to_text(struct printbuf *out, struct bch_fs *c)
 	struct bch_fs_reconcile *r = &c->reconcile;
 	struct move_budget *b = &r->move_budget;
 
-	prt_printf(out, "in flight, all contexts: reads %u ios %u sectors, writes %u ios %u sectors, limit %u ios %u sectors\n",
-		   atomic_read(&b->read_ios), atomic_read(&b->read_sectors),
-		   atomic_read(&b->write_ios), atomic_read(&b->write_sectors),
-		   READ_ONCE(*b->max_ios_opt), READ_ONCE(*b->max_bytes_opt) >> 9);
+	prt_printf(out, "in flight, all contexts: %u moves %u sectors, limit %u moves %u sectors; "
+		   "peak %u moves %u sectors, largest %u sectors, waited %llu\n",
+		   atomic_read(&b->moves), atomic_read(&b->sectors),
+		   READ_ONCE(*b->max_ios_opt), READ_ONCE(*b->max_bytes_opt) >> 9,
+		   atomic_read(&b->peak_moves), atomic_read(&b->peak_sectors),
+		   atomic_read(&b->max_item_sectors), (u64) atomic64_read(&b->waits));
 
 	prt_str(out, "kicks:");
 	for (unsigned i = 0; i < RECONCILE_KICK_NR; i++) {

@@ -63,6 +63,8 @@ struct ec_stripe_handle {
 struct ec_stripe_new {
 	struct bch_fs		*c;
 	struct moving_context	*ctxt;
+	/* repair: reservation on ctxt->budget, held until ec_stripe_create() is done */
+	u32			budget_sectors;
 	struct mutex		lock;
 	struct list_head	list;
 	struct work_struct	work;

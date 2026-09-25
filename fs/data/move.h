@@ -140,6 +140,9 @@ void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
 int bch2_move_ratelimit(struct moving_context *);
 
+int bch2_move_budget_get(struct moving_context *, u32, bool *);
+void bch2_move_budget_put(struct move_budget *, u32);
+
 static inline bool bch2_move_metadata_admission(struct bch_fs *c, struct moving_context *ctxt)
 {
 	return ctxt && ctxt->metadata_throttle && c->opts.reconcile_metadata_admission;
