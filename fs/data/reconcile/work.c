@@ -1629,6 +1629,9 @@ static struct bpos reconcile_work_pos_successor(struct bbpos pos)
  */
 static u64 reconcile_phase_slice_ms(struct bch_fs *c, unsigned i)
 {
+	if (WARN_ON_ONCE(i >= ARRAY_SIZE(reconcile_phases)))
+		return 0;
+
 	struct reconcile_phase p = reconcile_phases[i];
 
 	if (p.priority != RECONCILE_WORK_normal)
