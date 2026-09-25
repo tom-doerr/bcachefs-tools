@@ -34,6 +34,13 @@ struct data_update_opts {
 	u16				target;
 	bool				no_devs_have:1;
 	bool				checksum_paranoia:1;
+	/*
+	 * Started under reconcile_metadata_admission: throttled on metadata
+	 * when it was admitted, so its index update commits without the btree
+	 * write ratelimit. Latched at admission - an option change later
+	 * doesn't change how a move already in flight completes.
+	 */
+	bool				metadata_admitted:1;
 
 	unsigned			read_dev;
 	enum bch_read_flags		read_flags;

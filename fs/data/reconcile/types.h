@@ -34,6 +34,7 @@ enum reconcile_kick_reason {
 	x(exhausted)			\
 	x(kick)				\
 	x(yield)			\
+	x(admission)			\
 	x(deferred_limit)		\
 	x(skipped)			\
 	x(stopped)			\

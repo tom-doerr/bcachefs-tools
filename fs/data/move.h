@@ -64,6 +64,9 @@ struct moving_context {
 	 * while holding in-flight budget. See bch2_move_metadata_admission().
 	 */
 	bool			metadata_throttle;
+	/* reconcile: the entry waiting for metadata admission, and since when */
+	struct bbpos		admission_pos;
+	u64			admission_since;
 
 	wait_queue_head_t	wait;
 	/* &wait, or the shared budget's waitqueue */
@@ -135,10 +138,6 @@ struct data_update *bch2_moving_ctxt_next_pending_write(struct moving_context *)
 void bch2_moving_ctxt_do_pending_writes(struct moving_context *);
 void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
-/*
- * 0: go ahead; < 0: stop (error); 1: a reconcile context's metadata wait ran
- * into the end of its phase's slice - only contexts with metadata_throttle.
- */
 int bch2_move_ratelimit(struct moving_context *);
 
 static inline bool bch2_move_metadata_admission(struct bch_fs *c, struct moving_context *ctxt)

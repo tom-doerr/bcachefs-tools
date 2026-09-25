@@ -22,7 +22,6 @@
 #include "data/update.h"
 #include "data/read.h"
 #include "data/reconcile/trigger.h"
-#include "data/reconcile/work.h"
 #include "data/reflink.h"
 #include "data/write.h"
 
@@ -660,50 +659,6 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 		bch2_time_stats_update(&c->times[write_bound
 						 ? BCH_TIME_move_ratelimit_write
 						 : BCH_TIME_move_ratelimit_read], start);
-
-	/*
-	 * Metadata backpressure at admission rather than completion, with the
-	 * same condition a throttled commit waits out; journal reclaim is what
-	 * writes dirty nodes back, so poke it while waiting.
-	 *
-	 * The wait can last as long as the pressure does, so it honours the
-	 * controls that bound the rest of reconcile: switching the option off
-	 * or disabling reconcile ends it (the caller then sees the disable),
-	 * and so does the end of the phase's slice - returning 1 to yield it.
-	 */
-	if (bch2_move_metadata_admission(c, ctxt) && bch2_btree_cache_should_throttle(c)) {
-		u64 metadata_start = local_clock();
-		int yield = 0;
-
-		while (bch2_btree_write_ratelimited(c)) {
-			try(bch2_kthread_cancelled(c));
-			if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)))
-				return bch_err_throw(c, erofs_no_writes);
-			if (!bch2_move_metadata_admission(c, ctxt) ||
-			    !bch2_reconcile_enabled(c))
-				break;
-			if (bch2_reconcile_slice_expired(c)) {
-				yield = 1;
-				break;
-			}
-			if (unlikely(freezing(current))) {
-				bch2_moving_ctxt_flush_all(ctxt);
-				try_to_freeze();
-			}
-
-			journal_reclaim_kick(&c->journal);
-			move_ctxt_wait_event_once(ctxt, !bch2_btree_write_ratelimited(c), HZ / 10);
-		}
-
-		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_metadata],
-				       metadata_start);
-		if (yield)
-			return yield;
-
-		/* writes issued while we waited count against the limits again: */
-		move_ctxt_wait_event(ctxt,
-			!move_ctxt_writes_bound(c, ctxt) && !move_ctxt_reads_bound(c, ctxt));
-	}
 
 	return 0;
 }

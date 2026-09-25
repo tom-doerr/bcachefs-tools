@@ -608,7 +608,10 @@
 	x(BCH_ERR_insufficient_devices_to_start,				\
 					insufficient_devices_data_intact, 587)	\
 	x(BCH_ERR_insufficient_devices_to_start,				\
-					insufficient_devices_data_lost, 588)
+					insufficient_devices_data_lost, 588)	\
+	x(0,				reconcile_interrupted, 589)		\
+	x(BCH_ERR_reconcile_interrupted, reconcile_admission_timeout, 590)	\
+	x(BCH_ERR_reconcile_interrupted, reconcile_stopped, 591)
 
 enum bch_errcode {
 	BCH_ERR_START		= 2048,

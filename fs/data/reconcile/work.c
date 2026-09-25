@@ -24,6 +24,8 @@
 #include "init/error.h"
 #include "init/progress.h"
 
+#include "journal/reclaim.h"
+
 #include "fs/inode.h"
 #include "fs/namei.h"
 
@@ -858,6 +860,124 @@ static int do_retry_stripes(struct moving_context *ctxt,
 	return 0;
 }
 
+/* below, next to reconcile_phases[] */
+static u64 reconcile_phase_slice_ms(struct bch_fs *, unsigned);
+static bool reconcile_slice_expired(struct bch_fs *, unsigned, u64);
+
+/*
+ * Longest a move waits for metadata admission in a phase without a time slice
+ * (the hipri, btree and pending phases) before the phase gives up its turn -
+ * the entry stays queued, and the later phases get theirs.
+ */
+#define RECONCILE_ADMISSION_WAIT_MAX_NS		(10ULL * NSEC_PER_SEC)
+
+/*
+ * Metadata admission for one reconcile move, just before it starts: while
+ * btree node writeback is backed up (the condition a throttled commit waits
+ * out), don't start new moves. The wait keeps issuing this context's pending
+ * writes - the completions of moves already started hold nocow locks, and
+ * parking them is the copygc deadlock in do_reconcile_phase_iter().
+ *
+ * Only an entry that really starts a move gets here: scans, empty phases,
+ * phase boundaries and entries that turn out to need no move don't wait.
+ *
+ * Returns
+ *  0:			go ahead; data_opts->metadata_admitted says whether
+ *			the admission policy applied (then the index update
+ *			commits without the btree write ratelimit)
+ *  transaction restart: it slept with every lock dropped - look the entry up
+ *			again and redo every decision made on it
+ *  -BCH_ERR_reconcile_admission_timeout: the phase's slice ended, or the entry
+ *			waited RECONCILE_ADMISSION_WAIT_MAX_NS in a phase without
+ *			one, counted across those restarts
+ *  -BCH_ERR_reconcile_stopped: reconcile disabled, or going read-only
+ * The last two leave the entry queued; the caller must not step past it.
+ */
+static noinline int reconcile_admit_move(struct moving_context *ctxt,
+					 struct data_update_opts *data_opts,
+					 struct bbpos work)
+{
+	struct btree_trans *trans = ctxt->trans;
+	struct bch_fs *c = trans->c;
+	unsigned phase = data_opts->reconcile_phase;
+	int ret = 0;
+
+	if (bbpos_cmp(ctxt->admission_pos, work)) {
+		ctxt->admission_pos	= work;
+		ctxt->admission_since	= 0;
+	}
+
+	data_opts->metadata_admitted = bch2_move_metadata_admission(c, ctxt);
+	if (!data_opts->metadata_admitted ||
+	    !bch2_btree_cache_should_throttle(c)) {
+		ctxt->admission_since = 0;
+		return 0;
+	}
+
+	if (!ctxt->admission_since)
+		ctxt->admission_since = ktime_get_ns();
+
+	u64 start = local_clock();
+	bool slept = false;
+
+	while (bch2_btree_write_ratelimited(c)) {
+		ret = bch2_kthread_cancelled(c);
+		if (ret)
+			break;
+
+		if (test_bit(BCH_FS_going_ro, &c->flags) ||
+		    !bch2_reconcile_enabled(c)) {
+			ret = bch_err_throw(c, reconcile_stopped);
+			break;
+		}
+
+		/* switched off: the move goes ahead, completing like any other */
+		if (!bch2_move_metadata_admission(c, ctxt))
+			break;
+
+		/*
+		 * A sliced phase may wait for the rest of its slice; the
+		 * per-entry bound covers the others (and a phase_start that
+		 * isn't set, which a running phase always has).
+		 */
+		u64 slice_ms = reconcile_phase_slice_ms(c, phase);
+		u64 phase_start = READ_ONCE(c->reconcile.phase_start);
+		if (slice_ms && phase_start
+		    ? reconcile_slice_expired(c, phase, phase_start)
+		    : ktime_get_ns() > ctxt->admission_since + RECONCILE_ADMISSION_WAIT_MAX_NS) {
+			ret = bch_err_throw(c, reconcile_admission_timeout);
+			break;
+		}
+
+		/* both drop the transaction's locks: */
+		slept = true;
+
+		if (unlikely(freezing(current))) {
+			bch2_moving_ctxt_flush_all(ctxt);
+			try_to_freeze();
+		}
+
+		/* journal reclaim is what writes dirty nodes back */
+		journal_reclaim_kick(&c->journal);
+		move_ctxt_wait_event_once(ctxt, !bch2_btree_write_ratelimited(c), HZ / 10);
+	}
+
+	if (slept)
+		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_metadata], start);
+
+	if (ret) {
+		ctxt->admission_since = 0;
+		return ret;
+	}
+
+	if (!slept) {
+		ctxt->admission_since = 0;
+		return 0;
+	}
+
+	return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
+}
+
 static int __do_reconcile_extent(struct moving_context *ctxt,
 				 struct per_snapshot_io_opts *snapshot_io_opts,
 				 struct bch_inode_opts *opts,
@@ -929,6 +1049,10 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 			return bch2_extent_reconcile_pending_mod(trans, iter, level, k, false);
 		}
 	}
+
+	ret = reconcile_admit_move(ctxt, data_opts, work);
+	if (ret)
+		return ret;
 
 	ret = bch2_move_extent(ctxt, NULL, opts, data_opts, iter, level, k);
 	BUG_ON(ret > 0);
@@ -1664,14 +1788,6 @@ static bool reconcile_slice_expired(struct bch_fs *c, unsigned phase, u64 phase_
 	return slice_ms && ktime_get_ns() > phase_start + slice_ms * NSEC_PER_MSEC;
 }
 
-/* The running phase's slice, for waits inside the move path; false between phases */
-bool bch2_reconcile_slice_expired(struct bch_fs *c)
-{
-	struct bch_fs_reconcile *r = &c->reconcile;
-
-	return reconcile_slice_expired(c, READ_ONCE(r->phase), READ_ONCE(r->phase_start));
-}
-
 typedef struct {
 	struct bch_fs		*c;
 	unsigned		dev;
@@ -1754,8 +1870,7 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 
 	thr->exit = RECONCILE_PHASE_EXIT_stopped;
 
-	int rl;
-	while (!(rl = bch2_move_ratelimit(&ctxt))) {
+	while (!bch2_move_ratelimit(&ctxt)) {
 		if (!bch2_reconcile_enabled(c) ||
 		    test_bit(BCH_FS_going_ro, &c->flags))
 			break;
@@ -1806,6 +1921,13 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 				thr->exit = RECONCILE_PHASE_EXIT_deferred_limit;
 				break;
 			}
+		} else if (bch2_err_matches(ret, BCH_ERR_reconcile_interrupted)) {
+			/* gave up its turn before moving this entry: resume at it */
+			resume = pos;
+			thr->exit = bch2_err_matches(ret, BCH_ERR_reconcile_admission_timeout)
+				? RECONCILE_PHASE_EXIT_admission
+				: RECONCILE_PHASE_EXIT_stopped;
+			break;
 		} else if (ret) {
 			resume = pos;
 			thr->exit = RECONCILE_PHASE_EXIT_error;
@@ -1822,10 +1944,6 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 			break;
 		}
 	}
-
-	/* the metadata wait ran into the end of the slice: */
-	if (rl > 0)
-		thr->exit = RECONCILE_PHASE_EXIT_yield;
 
 	if (lap->active)
 		lap->cursor = resume;
@@ -1844,6 +1962,7 @@ static enum reconcile_phase_exit reconcile_phys_exit(darray_reconcile_phys_thr *
 		RECONCILE_PHASE_EXIT_error,
 		RECONCILE_PHASE_EXIT_stopped,
 		RECONCILE_PHASE_EXIT_kick,
+		RECONCILE_PHASE_EXIT_admission,
 		RECONCILE_PHASE_EXIT_yield,
 		RECONCILE_PHASE_EXIT_deferred_limit,
 	};
@@ -2025,6 +2144,8 @@ static int do_reconcile_destage_key(struct reconcile_pass *p, struct bkey_s_c k)
 	int ret = lockrestart_do(trans,
 		do_reconcile_extent_destage(p->ctxt, p->snapshot_io_opts, r->work_pos,
 					    p->stripe_retry));
+	if (bch2_err_matches(ret, BCH_ERR_reconcile_interrupted))
+		return ret;
 	if (ret > 0) {
 		r->destage_skipped++;
 		return 0;
@@ -2060,8 +2181,7 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 
 	p->exit = RECONCILE_PHASE_EXIT_stopped;
 
-	int rl;
-	while (!(rl = bch2_move_ratelimit(ctxt)) &&
+	while (!bch2_move_ratelimit(ctxt) &&
 	       !test_bit(BCH_FS_going_ro, &c->flags) &&
 	       bch2_reconcile_enabled(c) &&
 	       kick == r->kick) {
@@ -2134,6 +2254,16 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
 			continue;
+		} else if (bch2_err_matches(ret, BCH_ERR_reconcile_interrupted)) {
+			/*
+			 * Gave up its turn before moving this entry: stop
+			 * with work_pos on it, so the lap resumes there.
+			 */
+			p->exit = bch2_err_matches(ret, BCH_ERR_reconcile_admission_timeout)
+				? RECONCILE_PHASE_EXIT_admission
+				: RECONCILE_PHASE_EXIT_stopped;
+			ret = 0;
+			break;
 		} else if (ret > 0) {
 			/*
 			 * A positive return means stop, not failure: the scan
@@ -2165,10 +2295,7 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		}
 	}
 
-	/* the metadata wait ran into the end of the slice: */
-	if (rl > 0)
-		p->exit = RECONCILE_PHASE_EXIT_yield;
-	else if (p->exit == RECONCILE_PHASE_EXIT_stopped && kick != r->kick)
+	if (p->exit == RECONCILE_PHASE_EXIT_stopped && kick != r->kick)
 		p->exit = RECONCILE_PHASE_EXIT_kick;
 
 	/* work_pos is past the last entry handled: resume there */
@@ -2361,7 +2488,8 @@ static int do_reconcile(struct moving_context *ctxt)
 			if (ret)
 				goto out;
 
-			if (pass.exit == RECONCILE_PHASE_EXIT_yield) {
+			if (pass.exit == RECONCILE_PHASE_EXIT_yield ||
+			    pass.exit == RECONCILE_PHASE_EXIT_admission) {
 				pass.yielded = true;
 				if (reconcile_phases[r->phase].type == RECONCILE_PHASE_phys)
 					pass.phys_yielded = true;
