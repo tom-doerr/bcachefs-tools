@@ -2134,6 +2134,20 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
 			continue;
+		} else if (ret > 0) {
+			/*
+			 * A positive return means stop, not failure: the scan
+			 * bodies return 1 once reconcile is disabled or the
+			 * thread is stopping. Passing it up as an error made
+			 * do_reconcile() return nonzero, which ends the
+			 * reconcile thread until the next RW transition - so
+			 * disabling reconcile during a scan stopped it for
+			 * good. The cursor stays on the entry; a scan cookie
+			 * is rescanned.
+			 */
+			p->exit = RECONCILE_PHASE_EXIT_stopped;
+			ret = 0;
+			break;
 		} else if (ret) {
 			p->exit = RECONCILE_PHASE_EXIT_error;
 			break;
