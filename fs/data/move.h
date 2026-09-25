@@ -154,7 +154,6 @@ static inline u16 bch2_move_ioprio(struct bch_fs *c)
 		? IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_BE_NR - 1)
 		: IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
 }
-int bch2_move_wait_dev_reads(struct moving_context *, unsigned);
 
 int bch2_move_extent(struct moving_context *,
 		     struct move_bucket *,

@@ -982,6 +982,72 @@ static noinline int reconcile_admit_move(struct moving_context *ctxt,
 	return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 }
 
+/*
+ * Before building a move whose read is expected from @dev: while that device
+ * has move_ios_in_flight_per_dev reconcile reads in flight, wait. A hint - the
+ * read reserves its slot on the device it actually reads, in
+ * __bch2_move_extent() - that keeps a data update from being built (nocow
+ * locks, update_table entry) for a source that is known to be saturated.
+ *
+ * It honours the controls like the admission wait: the cap is re-read every
+ * time, going read-only, the thread stopping or reconcile disabled end it with
+ * -BCH_ERR_reconcile_stopped, and after having waited once, the phase's slice
+ * or RECONCILE_ADMISSION_WAIT_MAX_NS with -BCH_ERR_reconcile_admission_timeout;
+ * both keep the entry queued. It drops the transaction's locks to wait: a
+ * failed relock is a restart.
+ */
+static int reconcile_wait_dev_reads(struct moving_context *ctxt, unsigned dev,
+				    unsigned phase)
+{
+	struct btree_trans *trans = ctxt->trans;
+	struct bch_fs *c = trans->c;
+
+	CLASS(bch2_dev_tryget_noerror, ca)(c, dev);
+	if (!ca)
+		return 0;
+
+	u32 cap = READ_ONCE(c->opts.move_ios_in_flight_per_dev);
+	if (!cap || atomic_read(&ca->move_reads_in_flight) < cap)
+		return 0;
+
+	u64 start = local_clock();
+	u64 since = ktime_get_ns();
+	bool slept = false;
+
+	int ret = drop_locks_do(trans, ({
+		int wait_ret = 0;
+
+		while ((cap = READ_ONCE(c->opts.move_ios_in_flight_per_dev)) &&
+		       atomic_read(&ca->move_reads_in_flight) >= cap) {
+			if (bch2_kthread_cancelled(c) ||
+			    test_bit(BCH_FS_going_ro, &c->flags) ||
+			    !bch2_reconcile_enabled(c)) {
+				wait_ret = bch_err_throw(c, reconcile_stopped);
+				break;
+			}
+
+			u64 slice_ms = reconcile_phase_slice_ms(c, phase);
+			u64 phase_start = READ_ONCE(c->reconcile.phase_start);
+			if (slept &&
+			    (slice_ms && phase_start
+			     ? reconcile_slice_expired(c, phase, phase_start)
+			     : ktime_get_ns() > since + RECONCILE_ADMISSION_WAIT_MAX_NS)) {
+				wait_ret = bch_err_throw(c, reconcile_admission_timeout);
+				break;
+			}
+
+			slept = true;
+			move_ctxt_wait_event_once(ctxt,
+				atomic_read(&ca->move_reads_in_flight) <
+				READ_ONCE(c->opts.move_ios_in_flight_per_dev), HZ / 10);
+		}
+		wait_ret;
+	}));
+
+	bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_dev_reads], start);
+	return ret;
+}
+
 static int __do_reconcile_extent(struct moving_context *ctxt,
 				 struct per_snapshot_io_opts *snapshot_io_opts,
 				 struct bch_inode_opts *opts,
@@ -1216,7 +1282,7 @@ static int do_reconcile_extent_destage(struct moving_context *ctxt,
 	 * takes any locks; drops the btree locks and returns a restart if
 	 * relocking fails, retrying from the lookup above:
 	 */
-	try(bch2_move_wait_dev_reads(ctxt, read_dev));
+	try(reconcile_wait_dev_reads(ctxt, read_dev, c->reconcile.phase));
 
 	struct bkey_buf stack_k __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&stack_k);
@@ -1274,7 +1340,7 @@ static int do_reconcile_extent_phys(struct moving_context *ctxt,
 		return 0;
 
 	/* As for destage; phys reads from the device whose lap this is: */
-	try(bch2_move_wait_dev_reads(ctxt, work.pos.inode));
+	try(reconcile_wait_dev_reads(ctxt, work.pos.inode, reconcile_phase));
 
 	struct bkey_buf stack_bp __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&stack_bp);

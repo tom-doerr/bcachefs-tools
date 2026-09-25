@@ -251,48 +251,6 @@ void bch2_moving_ctxt_init(struct moving_context *ctxt,
 		list_add(&ctxt->list, &c->moving_context_list);
 }
 
-/*
- * Admission control per source device, for callers that pick the device a
- * move reads from: wait while @dev has move_ios_in_flight_per_dev move reads
- * in flight. Call before bch2_move_extent() - nothing held but the
- * transaction's locks, which are dropped. Polls, since the reads it waits on
- * may belong to another context whose completions don't wake this one.
- */
-int bch2_move_wait_dev_reads(struct moving_context *ctxt, unsigned dev)
-{
-	struct btree_trans *trans = ctxt->trans;
-	struct bch_fs *c = trans->c;
-	unsigned max = c->opts.move_ios_in_flight_per_dev;
-
-	if (!max)
-		return 0;
-
-	CLASS(bch2_dev_tryget_noerror, ca)(c, dev);
-	if (!ca || atomic_read(&ca->move_reads_in_flight) < max)
-		return 0;
-
-	u64 start = local_clock();
-	int ret = drop_locks_do(trans, ({
-		int wait_ret = 0;
-
-		while (atomic_read(&ca->move_reads_in_flight) >= max) {
-			wait_ret = bch2_kthread_cancelled(c);
-			if (wait_ret)
-				break;
-			if (unlikely(test_bit(BCH_FS_going_ro, &c->flags))) {
-				wait_ret = bch_err_throw(c, erofs_no_writes);
-				break;
-			}
-
-			move_ctxt_wait_event_once(ctxt,
-				atomic_read(&ca->move_reads_in_flight) < max, HZ / 10);
-		}
-		wait_ret;
-	}));
-	bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_dev_reads], start);
-	return ret;
-}
-
 /* Before the context starts any IO */
 void bch2_moving_ctxt_set_budget(struct moving_context *ctxt, struct move_budget *budget)
 {
