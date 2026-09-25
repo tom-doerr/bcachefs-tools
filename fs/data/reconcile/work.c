@@ -1650,10 +1650,18 @@ static u64 reconcile_phase_slice_ms(struct bch_fs *c, unsigned i)
  */
 static bool reconcile_slice_expired(struct bch_fs *c, unsigned phase, u64 phase_start)
 {
+	/*
+	 * Between phases nothing is running and there is no slice. The move
+	 * path asks from there too - bch2_move_ratelimit() at the top of
+	 * do_reconcile() - when a pass that ran every phase has left r->phase
+	 * at ARRAY_SIZE(reconcile_phases), so check before looking it up:
+	 */
+	if (!phase_start || phase >= ARRAY_SIZE(reconcile_phases))
+		return false;
+
 	u64 slice_ms = reconcile_phase_slice_ms(c, phase);
 
-	return slice_ms && phase_start &&
-		ktime_get_ns() > phase_start + slice_ms * NSEC_PER_MSEC;
+	return slice_ms && ktime_get_ns() > phase_start + slice_ms * NSEC_PER_MSEC;
 }
 
 /* The running phase's slice, for waits inside the move path; false between phases */
