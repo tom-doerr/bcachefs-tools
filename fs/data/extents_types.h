@@ -46,6 +46,7 @@ struct bch_io_failures {
 	x(user_mapped)			\
 	x(soft_require_read_device)	\
 	x(hard_require_read_device)	\
+	x(reserved_read_device)		\
 	x(last_fragment)		\
 	x(must_bounce)			\
 	x(must_clone)			\

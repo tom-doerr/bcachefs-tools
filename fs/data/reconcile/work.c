@@ -1047,9 +1047,7 @@ static int reconcile_wait_dev_reads(struct moving_context *ctxt, unsigned dev,
 			}
 
 			slept = true;
-			move_ctxt_wait_event_once(ctxt,
-				atomic_read(&ca->move_reads_in_flight) <
-				READ_ONCE(c->opts.move_ios_in_flight_per_dev), HZ / 10);
+			move_ctxt_wait_event_once(ctxt, bch2_move_dev_reads_room(c, ca), HZ / 10);
 		}
 		wait_ret;
 	}));

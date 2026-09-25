@@ -430,18 +430,24 @@ static int move_budget_get_relock(struct moving_context *ctxt, u32 sectors)
 }
 
 /*
- * Reconcile move reads count against the device they actually read
- * (ca->move_reads_in_flight, released in move_read_endio(); a retry that
- * reads another device moves the charge there, in __bch2_read_extent()), and
+ * Reads from reconcile contexts (those sharing the reconcile budget - which
+ * includes stripe repair's nested evacuations) count against the device they
+ * actually read (ca->move_reads_in_flight, released in move_read_endio()), and
  * move_ios_in_flight_per_dev caps that: pick the device the read would use,
- * reserve a slot on it, and make the read use exactly that device.
+ * reserve a slot on it, and issue the read with that device required
+ * (BCH_READ_reserved_read_device). If the read can't use it after all - a
+ * cached copy went stale, the device went offline in between - it picks again
+ * as it would have without the reservation, and the charge follows the read,
+ * as it does when a retry reads another device (__bch2_read_extent()).
  *
  * Waiting re-picks - another replica may have room by then - and issues this
  * context's pending writes. It's bounded by that device's reads completing,
  * and its only exit is going read-only: it runs after the data update was
  * built, and in stripe repair's nested evacuations, which treat unknown errors
- * as bugs. The controls act earlier, in reconcile_wait_dev_reads(). Retries
- * don't wait: they can take a device past the cap, by the retries in flight.
+ * as bugs. The controls act earlier, in reconcile_wait_dev_reads(). A read
+ * that lands elsewhere than it reserved doesn't wait: that and retries can
+ * take a device past the cap, by the reads doing so. An EC reconstruct on
+ * retry leaves the charge where it was.
  *
  * No pick (a hole), a pick error and an EC reconstruct are left to the read
  * path, uncharged.
@@ -454,7 +460,7 @@ static int move_read_dev_reserve(struct moving_context *ctxt, struct data_update
 	u64 start = 0;
 	int ret = 0;
 
-	if (data_opts->type != BCH_DATA_UPDATE_reconcile)
+	if (!ctxt->budget)
 		return 0;
 
 	while (1) {
@@ -476,6 +482,7 @@ static int move_read_dev_reserve(struct moving_context *ctxt, struct data_update
 		u32 cap = READ_ONCE(c->opts.move_ios_in_flight_per_dev);
 		int cur = atomic_read(&ca->move_reads_in_flight);
 		bool full = false;
+
 		do {
 			if (cap && (u32) cur >= cap) {
 				full = true;
@@ -488,7 +495,8 @@ static int move_read_dev_reserve(struct moving_context *ctxt, struct data_update
 			u->read_ca_counted = ca;
 			*read_dev	= ca->dev_idx;
 			*read_flags	= (data_opts->read_flags & ~BCH_READ_soft_require_read_device) |
-				BCH_READ_hard_require_read_device;
+				BCH_READ_hard_require_read_device|
+				BCH_READ_reserved_read_device;
 			break;
 		}
 
@@ -505,9 +513,7 @@ static int move_read_dev_reserve(struct moving_context *ctxt, struct data_update
 			try_to_freeze();
 		}
 
-		move_ctxt_wait_event_once(ctxt,
-			atomic_read(&ca->move_reads_in_flight) <
-			READ_ONCE(c->opts.move_ios_in_flight_per_dev), HZ / 10);
+		move_ctxt_wait_event_once(ctxt, bch2_move_dev_reads_room(c, ca), HZ / 10);
 	}
 
 	if (start)

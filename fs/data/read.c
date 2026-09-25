@@ -175,8 +175,9 @@ static inline struct data_update *rbio_data_update(struct bch_read_bio *rbio)
 
 /*
  * A reconcile move's read counts against the device it reads (see
- * move_read_dev_reserve()); a retry reading another device moves the charge
- * there. Without waiting on move_ios_in_flight_per_dev: retries can take a
+ * move_read_dev_reserve()); a read that lands on another device - a retry, or
+ * a first attempt that couldn't use its reserved device - moves the charge
+ * there. Without waiting on move_ios_in_flight_per_dev: such reads can take a
  * device past it. The data update holds refs on every device of the extent.
  */
 static void move_read_charge_to(struct data_update *u, struct bch_dev *ca)
@@ -1565,14 +1566,26 @@ int __bch2_read_extent(struct btree_trans *trans,
 		}
 	}
 
+retry_pick:
 	ret = bch2_bkey_pick_read_device(c, k, failed, &pick, dev, flags);
 
 	/* hole or reservation - just zero fill: */
 	if (unlikely(!ret))
 		return read_extent_hole(c, orig, iter, k, flags);
 
-	if (unlikely(ret < 0))
+	if (unlikely(ret < 0)) {
+		/*
+		 * The device a move reserved its read on can't be read after
+		 * all (a cached copy went stale, the device went offline since):
+		 * read what it would have read without the reservation.
+		 */
+		if (flags & BCH_READ_reserved_read_device) {
+			flags &= ~(BCH_READ_reserved_read_device|
+				   BCH_READ_hard_require_read_device);
+			goto retry_pick;
+		}
 		return read_extent_pick_err(trans, orig, read_pos, data_btree, k, flags, ret);
+	}
 	ret = 0;
 
 	if (bch2_csum_type_is_encryption(pick.crc.csum_type) &&
@@ -1667,7 +1680,7 @@ int __bch2_read_extent(struct btree_trans *trans,
 			goto out;
 		}
 
-		if (unlikely(flags & BCH_READ_in_retry) && orig->data_update)
+		if (orig->data_update)
 			move_read_charge_to(rbio_data_update(orig), ca);
 
 		this_cpu_add(ca->io_done->sectors[READ][BCH_DATA_user],

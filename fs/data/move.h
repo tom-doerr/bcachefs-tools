@@ -140,6 +140,14 @@ void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
 int bch2_move_ratelimit(struct moving_context *);
 
+/* Room for one more reconcile move read on @ca under move_ios_in_flight_per_dev (0: no limit) */
+static inline bool bch2_move_dev_reads_room(struct bch_fs *c, struct bch_dev *ca)
+{
+	u32 cap = READ_ONCE(c->opts.move_ios_in_flight_per_dev);
+
+	return !cap || (u32) atomic_read(&ca->move_reads_in_flight) < cap;
+}
+
 int bch2_move_budget_get(struct moving_context *, u32, bool *);
 void bch2_move_budget_put(struct move_budget *, u32);
 
