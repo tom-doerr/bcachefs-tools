@@ -832,9 +832,19 @@ static bool stripe_retry_must_wait(struct moving_context *ctxt,
 	return u && u->io_seq <= stripe_io_seq;
 }
 
+static int reconcile_admit_move(struct moving_context *, struct data_update_opts *, struct bbpos);
+
 static int do_retry_stripe(struct moving_context *ctxt, u64 idx)
 {
 	struct btree_trans *trans = ctxt->trans;
+
+	/*
+	 * A rebuild retried after its blocks were evacuated writes a whole
+	 * stripe and rewrites its extents' keys, like the first attempt: it
+	 * goes through admission too. Only the phase iterator retries stripes.
+	 */
+	struct data_update_opts data_opts = { .reconcile_phase = trans->c->reconcile.phase };
+	try(reconcile_admit_move(ctxt, &data_opts, BBPOS(BTREE_ID_stripes, POS(0, idx))));
 
 	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, POS(0, idx), BTREE_ITER_cached|BTREE_ITER_intent);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
@@ -2574,8 +2584,13 @@ static int do_reconcile(struct moving_context *ctxt)
 			if (ret)
 				goto out;
 
+			/*
+			 * Any unfinished pending sweep - given up at admission,
+			 * 16 entries deferred on copygc, stopped - runs again next
+			 * pass: its durable cookie is gone (see pending_retry).
+			 */
 			if (reconcile_phase_is_pending(r->phase) &&
-			    pass.exit == RECONCILE_PHASE_EXIT_admission)
+			    pass.exit != RECONCILE_PHASE_EXIT_exhausted)
 				r->pending_retry = pending_cookie;
 
 			if (pass.exit == RECONCILE_PHASE_EXIT_yield ||
