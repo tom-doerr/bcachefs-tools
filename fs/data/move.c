@@ -313,14 +313,6 @@ static bool move_budget_full(struct move_budget *b)
 		(max_sectors && (u32) atomic_read(&b->sectors) >= max_sectors);
 }
 
-static void move_budget_note_peak(atomic_t *peak, int v)
-{
-	int old = atomic_read(peak);
-
-	while (v > old && !atomic_try_cmpxchg(peak, &old, v))
-		;
-}
-
 static bool move_budget_try_get(struct move_budget *b, u32 sectors, bool drain_waiter)
 {
 	u32 max_moves	= move_budget_max_moves(b);
@@ -343,9 +335,9 @@ static bool move_budget_try_get(struct move_budget *b, u32 sectors, bool drain_w
 		}
 	} while (!atomic_try_cmpxchg(&b->sectors, &cur, cur + sectors));
 
-	move_budget_note_peak(&b->peak_moves, moves + 1);
-	move_budget_note_peak(&b->peak_sectors, cur + sectors);
-	move_budget_note_peak(&b->max_item_sectors, sectors);
+	bch2_atomic_max(&b->peak_moves, moves + 1);
+	bch2_atomic_max(&b->peak_sectors, cur + sectors);
+	bch2_atomic_max(&b->max_item_sectors, sectors);
 	return true;
 }
 
@@ -423,6 +415,92 @@ static int move_budget_get_relock(struct moving_context *ctxt, u32 sectors)
 	return ret;
 }
 
+/*
+ * Reconcile move reads count against the device they actually read
+ * (ca->move_reads_in_flight, released in move_read_endio(); a retry that
+ * reads another device moves the charge there, in __bch2_read_extent()), and
+ * move_ios_in_flight_per_dev caps that: pick the device the read would use,
+ * reserve a slot on it, and make the read use exactly that device.
+ *
+ * Waiting re-picks - another replica may have room by then - and issues this
+ * context's pending writes. It's bounded by that device's reads completing,
+ * and its only exit is going read-only: it runs after the data update was
+ * built, and in stripe repair's nested evacuations, which treat unknown errors
+ * as bugs. The controls act earlier, in reconcile_wait_dev_reads(). Retries
+ * don't wait: they can take a device past the cap, by the retries in flight.
+ *
+ * No pick (a hole), a pick error and an EC reconstruct are left to the read
+ * path, uncharged.
+ */
+static int move_read_dev_reserve(struct moving_context *ctxt, struct data_update *u,
+				 struct bkey_s_c k, struct data_update_opts *data_opts,
+				 int *read_dev, enum bch_read_flags *read_flags)
+{
+	struct bch_fs *c = ctxt->trans->c;
+	u64 start = 0;
+	int ret = 0;
+
+	if (data_opts->type != BCH_DATA_UPDATE_reconcile)
+		return 0;
+
+	while (1) {
+		struct extent_ptr_decoded pick;
+		if (bch2_bkey_pick_read_device(c, k, NULL, &pick,
+					       data_opts->read_dev, data_opts->read_flags) <= 0 ||
+		    pick.do_ec_reconstruct)
+			break;
+
+		struct bch_dev *ca = NULL;
+		for (unsigned i = 0; i < ARRAY_SIZE(u->cas); i++)
+			if (u->cas[i] && u->cas[i]->dev_idx == pick.ptr.dev) {
+				ca = u->cas[i];
+				break;
+			}
+		if (!ca)
+			break;
+
+		u32 cap = READ_ONCE(c->opts.move_ios_in_flight_per_dev);
+		int cur = atomic_read(&ca->move_reads_in_flight);
+		bool full = false;
+		do {
+			if (cap && (u32) cur >= cap) {
+				full = true;
+				break;
+			}
+		} while (!atomic_try_cmpxchg(&ca->move_reads_in_flight, &cur, cur + 1));
+
+		if (!full) {
+			bch2_atomic_max(&ca->move_reads_peak, cur + 1);
+			u->read_ca_counted = ca;
+			*read_dev	= ca->dev_idx;
+			*read_flags	= (data_opts->read_flags & ~BCH_READ_soft_require_read_device) |
+				BCH_READ_hard_require_read_device;
+			break;
+		}
+
+		if (!start)
+			start = local_clock();
+
+		if (unlikely(test_bit(BCH_FS_going_ro, &c->flags))) {
+			ret = bch_err_throw(c, erofs_no_writes);
+			break;
+		}
+
+		if (unlikely(freezing(current))) {
+			bch2_moving_ctxt_flush_all(ctxt);
+			try_to_freeze();
+		}
+
+		move_ctxt_wait_event_once(ctxt,
+			atomic_read(&ca->move_reads_in_flight) <
+			READ_ONCE(c->opts.move_ios_in_flight_per_dev), HZ / 10);
+	}
+
+	if (start)
+		bch2_time_stats_update(&c->times[BCH_TIME_move_blocked_dev_reads], start);
+	return ret;
+}
+
 DEFINE_FREE(data_update_free, struct data_update *, if (_T) kfree_rcu(_T, rcu))
 
 static int __bch2_move_extent(struct moving_context *ctxt,
@@ -465,6 +543,18 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 
 	k = bkey_i_to_s_c(u->k.k);
 
+	int read_dev = data_opts->read_dev;
+	enum bch_read_flags read_flags = data_opts->read_flags;
+	ret = move_read_dev_reserve(ctxt, u, k, data_opts, &read_dev, &read_flags);
+	if (ret) {
+		if (u->budget_charged)
+			bch2_move_budget_put(ctxt->budget, u->budget_sectors);
+		bch2_data_update_exit(u, ret);
+		call_rcu(&u->rcu, data_update_free_rcu);
+		u = NULL;
+		return ret;
+	}
+
 	u->op.end_io		= move_write_done;
 	u->rbio.bio.bi_end_io	= move_read_endio;
 	u->rbio.bio.bi_ioprio	= bch2_move_ioprio(c);
@@ -487,21 +577,6 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	}
 
 	/*
-	 * Charge reconcile reads to the source device the caller asked for,
-	 * for bch2_move_wait_dev_reads(); the data update holds refs on every
-	 * device the extent points to, which outlive the read:
-	 */
-	if (data_opts->type == BCH_DATA_UPDATE_reconcile &&
-	    (data_opts->read_flags & (BCH_READ_soft_require_read_device|
-				      BCH_READ_hard_require_read_device)))
-		for (unsigned i = 0; i < ARRAY_SIZE(u->cas); i++)
-			if (u->cas[i] && u->cas[i]->dev_idx == data_opts->read_dev) {
-				u->read_ca_counted = u->cas[i];
-				atomic_inc(&u->read_ca_counted->move_reads_in_flight);
-				break;
-			}
-
-	/*
 	 * dropped by move_read_endio() - guards against use after free of
 	 * ctxt when doing wakeup
 	 */
@@ -512,8 +587,8 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 				 bkey_start_pos(k.k),
 				 iter->btree_id, k, 0,
 				 NULL,
-				 data_opts->read_flags|BCH_READ_last_fragment,
-				 data_opts->read_dev);
+				 read_flags|BCH_READ_last_fragment,
+				 read_dev);
 	if (ret) {
 		/*
 		 * __bch2_read_extent() only returns an error synchronously

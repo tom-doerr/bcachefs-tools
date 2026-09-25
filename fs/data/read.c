@@ -173,6 +173,24 @@ static inline struct data_update *rbio_data_update(struct bch_read_bio *rbio)
 		: NULL;
 }
 
+/*
+ * A reconcile move's read counts against the device it reads (see
+ * move_read_dev_reserve()); a retry reading another device moves the charge
+ * there. Without waiting on move_ios_in_flight_per_dev: retries can take a
+ * device past it. The data update holds refs on every device of the extent.
+ */
+static void move_read_charge_to(struct data_update *u, struct bch_dev *ca)
+{
+	struct bch_dev *old = u->read_ca_counted;
+
+	if (!old || old == ca)
+		return;
+
+	atomic_dec(&old->move_reads_in_flight);
+	bch2_atomic_max(&ca->move_reads_peak, atomic_inc_return(&ca->move_reads_in_flight));
+	u->read_ca_counted = ca;
+}
+
 static bool ptr_being_rewritten(struct bch_fs *c, struct bch_read_bio *orig, unsigned dev)
 {
 	struct data_update *u = rbio_data_update(orig);
@@ -1648,6 +1666,9 @@ int __bch2_read_extent(struct btree_trans *trans,
 				bch_err_throw(c, data_read_retry_device_offline));
 			goto out;
 		}
+
+		if (unlikely(flags & BCH_READ_in_retry) && orig->data_update)
+			move_read_charge_to(rbio_data_update(orig), ca);
 
 		this_cpu_add(ca->io_done->sectors[READ][BCH_DATA_user],
 			     bio_sectors(&rbio->bio));

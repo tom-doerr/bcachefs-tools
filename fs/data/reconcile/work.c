@@ -2876,12 +2876,13 @@ __cold void bch2_reconcile_moves_to_text(struct printbuf *out, struct bch_fs *c)
 			prt_printf(out, "%s: %llu %llu %llu\n", bch2_move_outcomes[i], rc, gc, pending);
 	}
 
-	prt_str(out, "\nper device (buckets emptied, cache evicted, move reads in flight):\n");
+	prt_str(out, "\nper device (buckets emptied, cache evicted, move reads in flight, peak):\n");
 	for_each_member_device(c, ca)
-		prt_printf(out, "%u %s: %llu %llu %u\n", ca->dev_idx, ca->name,
+		prt_printf(out, "%u %s: %llu %llu %u %u\n", ca->dev_idx, ca->name,
 			   (u64) atomic64_read(&ca->buckets_emptied),
 			   (u64) atomic64_read(&ca->buckets_evicted),
-			   atomic_read(&ca->move_reads_in_flight));
+			   atomic_read(&ca->move_reads_in_flight),
+			   atomic_read(&ca->move_reads_peak));
 }
 
 __cold void bch2_reconcile_scan_pending_to_text(struct printbuf *out, struct bch_fs *c)

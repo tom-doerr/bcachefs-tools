@@ -40,7 +40,7 @@ extern const char * const bch2_move_ioprio_opts[];
  * lowest best effort level - mq-deadline doesn't order levels within a class,
  * so moves then compete evenly with other best effort IO. What bounds their
  * load is the mover's in-flight limits (move_ios_in_flight, the reconcile
- * budget) and, for destage and phys reads, move_ios_in_flight_per_dev.
+ * budget) and move_ios_in_flight_per_dev.
  */
 #define BCH_MOVE_IOPRIO_OPTS()		\
 	x(idle,		0)		\
@@ -591,9 +591,10 @@ enum fsck_err_opts {
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, 1024),						\
 	  BCH2_NO_SB_OPT,		0,				\
-	  NULL,		"Maximum reconcile move reads in flight from one\n"	\
-			"device, for moves that choose their source\n"	\
-			"(destage, phys); 0: no limit\n")			\
+	  NULL,		"Maximum reconcile move reads in flight on one\n"	\
+			"device - the device actually read, reserved\n"	\
+			"before the read is issued; a read retried on\n"	\
+			"another device may exceed it; 0: no limit\n")	\
 	x(reconcile_move_ios_in_flight,	u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_UINT(0, 4096),						\

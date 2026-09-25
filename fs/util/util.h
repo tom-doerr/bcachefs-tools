@@ -951,4 +951,13 @@ static inline u64 system_totalram_bytes(void)
 	return i.totalram * i.mem_unit;
 }
 
+/* Raise @v to at least @new: for peak telemetry kept with atomics */
+static inline void bch2_atomic_max(atomic_t *v, int new)
+{
+	int old = atomic_read(v);
+
+	while (new > old && !atomic_try_cmpxchg(v, &old, new))
+		;
+}
+
 #endif /* _BCACHEFS_UTIL_H */

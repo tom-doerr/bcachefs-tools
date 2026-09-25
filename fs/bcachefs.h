@@ -653,8 +653,12 @@ struct bch_dev {
 	atomic64_t		buckets_emptied;	/* last dirty data moved or deleted */
 	atomic64_t		buckets_evicted;	/* cached copies invalidated */
 
-	/* Move reads in flight that named this device as their source */
+	/*
+	 * Reconcile move reads in flight on this device - the device actually
+	 * read - capped by move_ios_in_flight_per_dev; highest since mount:
+	 */
 	atomic_t		move_reads_in_flight;
+	atomic_t		move_reads_peak;
 };
 
 /*
