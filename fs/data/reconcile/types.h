@@ -130,6 +130,13 @@ struct bch_fs_reconcile {
 	u64				phase_start;
 
 	/*
+	 * A pending phase that gave up its turn (metadata admission) leaves its
+	 * cookie here: the durable one was consumed by the scan phase, so the
+	 * next pass would otherwise not run the pending phases at all.
+	 */
+	struct bkey_i_cookie		pending_retry;
+
+	/*
 	 * Per-device laps of the phys phases, [0] hipri, [1] normal, indexed
 	 * by dev * 2 + priority; each written only by that device's worker:
 	 */

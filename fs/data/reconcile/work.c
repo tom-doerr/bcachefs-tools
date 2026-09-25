@@ -921,11 +921,12 @@ static noinline int reconcile_admit_move(struct moving_context *ctxt,
 	bool slept = false;
 
 	while (bch2_btree_write_ratelimited(c)) {
-		ret = bch2_kthread_cancelled(c);
-		if (ret)
-			break;
-
-		if (test_bit(BCH_FS_going_ro, &c->flags) ||
+		/*
+		 * The thread stopping, going read-only or reconcile disabled:
+		 * the entry stays queued, and it isn't an error.
+		 */
+		if (bch2_kthread_cancelled(c) ||
+		    test_bit(BCH_FS_going_ro, &c->flags) ||
 		    !bch2_reconcile_enabled(c)) {
 			ret = bch_err_throw(c, reconcile_stopped);
 			break;
@@ -938,13 +939,16 @@ static noinline int reconcile_admit_move(struct moving_context *ctxt,
 		/*
 		 * A sliced phase may wait for the rest of its slice; the
 		 * per-entry bound covers the others (and a phase_start that
-		 * isn't set, which a running phase always has).
+		 * isn't set, which a running phase always has). Only after
+		 * having waited once: giving up without sleeping, with a tiny
+		 * slice, would turn the pass into a spin.
 		 */
 		u64 slice_ms = reconcile_phase_slice_ms(c, phase);
 		u64 phase_start = READ_ONCE(c->reconcile.phase_start);
-		if (slice_ms && phase_start
-		    ? reconcile_slice_expired(c, phase, phase_start)
-		    : ktime_get_ns() > ctxt->admission_since + RECONCILE_ADMISSION_WAIT_MAX_NS) {
+		if (slept &&
+		    (slice_ms && phase_start
+		     ? reconcile_slice_expired(c, phase, phase_start)
+		     : ktime_get_ns() > ctxt->admission_since + RECONCILE_ADMISSION_WAIT_MAX_NS)) {
 			ret = bch_err_throw(c, reconcile_admission_timeout);
 			break;
 		}
@@ -988,8 +992,11 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 				 struct bkey_s_c k,
 				 darray_stripe_retry *stripe_retry)
 {
-	if (k.k->type == KEY_TYPE_stripe)
+	if (k.k->type == KEY_TYPE_stripe) {
+		/* a rebuild writes a whole stripe and rewrites its extents' keys */
+		try(reconcile_admit_move(ctxt, data_opts, work));
 		return do_reconcile_stripe(ctxt, iter, k, stripe_retry);
+	}
 
 	if (!bkey_extent_is_direct_data(k.k))
 		return 0;
@@ -1022,8 +1029,16 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 	 * bch2_bkey_buf_reassemble()d copy rather than a pointer into a btree
 	 * node, so there's nothing here for the commit to invalidate.
 	 */
+	/*
+	 * Usually empty; when the opts were stale it's one key. Under metadata
+	 * admission it mustn't block on the btree write ratelimit: admission
+	 * is where this context waits for metadata, bounded by its slice.
+	 */
 	CLASS(disk_reservation, res)(c);
-	try(bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc));
+	try(bch2_trans_commit(trans, &res.r, NULL,
+			      BCH_TRANS_COMMIT_no_enospc|
+			      (bch2_move_metadata_admission(c, ctxt)
+			       ? BCH_TRANS_COMMIT_no_write_ratelimit : 0)));
 
 	int ret = reconcile_set_data_opts(trans, iter, level, k, opts, data_opts);
 	if (ret <= 0)
@@ -2374,6 +2389,7 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 
 	/* the slice starts after the flush, which can take a while */
 	r->phase_start = ktime_get_ns();
+	p->ctxt->admission_since = 0;
 
 	switch (phase.type) {
 	case RECONCILE_PHASE_scan:
@@ -2423,6 +2439,10 @@ static int do_reconcile(struct moving_context *ctxt)
 
 	struct bkey_i_cookie pending_cookie;
 	bkey_init(&pending_cookie.k);
+	if (!bkey_deleted(&r->pending_retry.k)) {
+		pending_cookie = r->pending_retry;
+		bkey_init(&r->pending_retry.k);
+	}
 
 	bch2_moving_ctxt_flush_all(ctxt);
 
@@ -2488,10 +2508,15 @@ static int do_reconcile(struct moving_context *ctxt)
 			if (ret)
 				goto out;
 
+			if (reconcile_phase_is_pending(r->phase) &&
+			    pass.exit == RECONCILE_PHASE_EXIT_admission)
+				r->pending_retry = pending_cookie;
+
 			if (pass.exit == RECONCILE_PHASE_EXIT_yield ||
 			    pass.exit == RECONCILE_PHASE_EXIT_admission) {
 				pass.yielded = true;
-				if (reconcile_phases[r->phase].type == RECONCILE_PHASE_phys)
+				if (reconcile_phases[r->phase].type == RECONCILE_PHASE_phys &&
+				    reconcile_phases[r->phase].priority == RECONCILE_WORK_normal)
 					pass.phys_yielded = true;
 			}
 
@@ -2893,6 +2918,7 @@ int bch2_fs_reconcile_init(struct bch_fs *c)
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	init_waitqueue_head(&r->move_budget.wait);
+	bkey_init(&r->pending_retry.k);
 	r->move_budget.max_ios_opt	= &c->opts.reconcile_move_ios_in_flight;
 	r->move_budget.max_bytes_opt	= &c->opts.reconcile_move_bytes_in_flight;
 
