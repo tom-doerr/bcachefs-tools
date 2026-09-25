@@ -1442,21 +1442,29 @@ static int update_reconcile_opts_scan(struct btree_trans *trans,
 }
 
 /*
- * A move limit changed: restart the peaks reported next to the limits, so they
- * show what happened under the new ones (peaks since mount can't tell whether
- * a limit set at runtime holds), and let waiters look at a raised limit now
- * rather than at their next timeout.
+ * A move limit changed: restart the peaks reported next to the limits from
+ * zero, so they show the admissions made under the new ones (peaks since mount
+ * can't tell whether a limit set at runtime holds), and let waiters look at a
+ * raised limit now rather than at their next timeout.
+ *
+ * From zero, not from what is in flight now: a lowered limit - or one set where
+ * there was none - finds more in flight than it allows, admitted under the old
+ * limit and draining, which says nothing about the new one. A peak above its
+ * limit can still come from an admission that decided under the old limit while
+ * it changed, from a read that a retry moves to another device
+ * (move_read_charge_to()), and, for sectors, from an item bigger than the byte
+ * limit admitted into an empty budget ("largest").
  */
 void bch2_reconcile_move_limits_changed(struct bch_fs *c)
 {
 	struct move_budget *b = &c->reconcile.move_budget;
 
-	atomic_set(&b->peak_moves,	 atomic_read(&b->moves));
-	atomic_set(&b->peak_sectors,	 atomic_read(&b->sectors));
+	atomic_set(&b->peak_moves,	 0);
+	atomic_set(&b->peak_sectors,	 0);
 	atomic_set(&b->max_item_sectors, 0);
 
 	for_each_member_device(c, ca)
-		atomic_set(&ca->move_reads_peak, atomic_read(&ca->move_reads_in_flight));
+		atomic_set(&ca->move_reads_peak, 0);
 
 	wake_up(&b->wait);
 }
