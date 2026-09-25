@@ -57,6 +57,7 @@ DEFINE_CLASS(opt_change_scope, struct opt_change_scope,
 	     struct bch_fs *c);
 
 bool bch2_reconcile_enabled(struct bch_fs *);
+void bch2_reconcile_move_limits_changed(struct bch_fs *);
 
 int bch2_set_reconcile_needs_scan_trans(struct btree_trans *, struct reconcile_scan);
 int bch2_set_reconcile_needs_scan(struct bch_fs *, struct reconcile_scan, bool);

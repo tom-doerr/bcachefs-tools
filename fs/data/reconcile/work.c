@@ -1441,6 +1441,26 @@ static int update_reconcile_opts_scan(struct btree_trans *trans,
 					  SET_NEEDS_RECONCILE_opt_change);
 }
 
+/*
+ * A move limit changed: restart the peaks reported next to the limits, so they
+ * show what happened under the new ones (peaks since mount can't tell whether
+ * a limit set at runtime holds), and let waiters look at a raised limit now
+ * rather than at their next timeout.
+ */
+void bch2_reconcile_move_limits_changed(struct bch_fs *c)
+{
+	struct move_budget *b = &c->reconcile.move_budget;
+
+	atomic_set(&b->peak_moves,	 atomic_read(&b->moves));
+	atomic_set(&b->peak_sectors,	 atomic_read(&b->sectors));
+	atomic_set(&b->max_item_sectors, 0);
+
+	for_each_member_device(c, ca)
+		atomic_set(&ca->move_reads_peak, atomic_read(&ca->move_reads_in_flight));
+
+	wake_up(&b->wait);
+}
+
 bool bch2_reconcile_enabled(struct bch_fs *c)
 {
 	return !c->opts.read_only &&

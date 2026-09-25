@@ -740,6 +740,11 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 	case Opt_reconcile_enabled:
 		bch2_reconcile_wakeup(c, RECONCILE_KICK_opt_change);
 		break;
+	case Opt_move_ios_in_flight_per_dev:
+	case Opt_reconcile_move_ios_in_flight:
+	case Opt_reconcile_move_bytes_in_flight:
+		bch2_reconcile_move_limits_changed(c);
+		break;
 	case Opt_copygc_enabled:
 		bch2_copygc_wakeup(c);
 		break;
