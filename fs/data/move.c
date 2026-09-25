@@ -275,9 +275,15 @@ void bch2_move_stats_init(struct bch_move_stats *stats, const char *name)
  * has completed and its write waits to be issued; reservations are taken with
  * cmpxchg against the limits (read live), so they are hard maxima. Except: an
  * item bigger than the whole byte limit (a big extent, a stripe rebuild) is
- * admitted only into an empty budget, and while one waits everyone else holds
- * back (@draining) so that it can empty.
+ * admitted only into an empty budget.
+ *
+ * Waiters are served fairly enough not to starve: one that is bigger than the
+ * limit, or has waited MOVE_BUDGET_DRAIN_AFTER_NS, holds everyone else back
+ * (@draining) - new reservations and bch2_move_ratelimit() - until it's in;
+ * otherwise a stream of small items could keep the budget topped up forever.
  */
+#define MOVE_BUDGET_DRAIN_AFTER_NS	NSEC_PER_SEC
+
 static inline u32 move_budget_max_moves(struct move_budget *b)
 {
 	return READ_ONCE(*b->max_ios_opt);
@@ -285,7 +291,8 @@ static inline u32 move_budget_max_moves(struct move_budget *b)
 
 static inline u32 move_budget_max_sectors(struct move_budget *b)
 {
-	return READ_ONCE(*b->max_bytes_opt) >> 9;
+	/* rounded up: a nonzero limit under 512 bytes is not "no limit" */
+	return DIV_ROUND_UP(READ_ONCE(*b->max_bytes_opt), 512);
 }
 
 static bool move_budget_fits(struct move_budget *b, u32 sectors, bool drain_waiter)
@@ -353,10 +360,10 @@ void bch2_move_budget_put(struct move_budget *b, u32 sectors)
  * has to wait, it does so with the transaction's locks dropped (*@slept is
  * set) and keeps issuing this context's pending writes - their completions
  * release reservations. Returns 0 once reserved, or an error with nothing
- * reserved: only when the filesystem is going read-only (the wait is bounded
- * by the moves in flight completing, so it needs no other exit - and its
- * callers include stripe repair's nested evacuations, which treat unknown
- * errors as bugs).
+ * reserved: only when the filesystem is going read-only. The wait ends as the
+ * moves in flight complete (with the draining rule above, also for a big item
+ * among small ones), so it needs no other exit - and its callers include
+ * stripe repair's nested evacuations, which treat unknown errors as bugs.
  */
 int bch2_move_budget_get(struct moving_context *ctxt, u32 sectors, bool *slept)
 {
@@ -366,19 +373,26 @@ int bch2_move_budget_get(struct moving_context *ctxt, u32 sectors, bool *slept)
 	if (!b || move_budget_try_get(b, sectors, false))
 		return 0;
 
-	u32 max_sectors = move_budget_max_sectors(b);
-	bool oversized = max_sectors && sectors > max_sectors;
 	u64 start = local_clock();
+	bool drain = false;
 	int ret = 0;
 
 	*slept = true;
 	bch2_trans_unlock_long(ctxt->trans);
 
 	atomic64_inc(&b->waits);
-	if (oversized)
-		atomic_inc(&b->draining);
 
-	while (!move_budget_try_get(b, sectors, oversized)) {
+	while (!move_budget_try_get(b, sectors, drain)) {
+		/* the limit is live: it may have become smaller than this item */
+		u32 max_sectors = move_budget_max_sectors(b);
+
+		if (!drain &&
+		    ((max_sectors && sectors > max_sectors) ||
+		     local_clock() > start + MOVE_BUDGET_DRAIN_AFTER_NS)) {
+			atomic_inc(&b->draining);
+			drain = true;
+		}
+
 		if (unlikely(test_bit(BCH_FS_going_ro, &c->flags))) {
 			ret = bch_err_throw(c, erofs_no_writes);
 			break;
@@ -389,10 +403,10 @@ int bch2_move_budget_get(struct moving_context *ctxt, u32 sectors, bool *slept)
 			try_to_freeze();
 		}
 
-		move_ctxt_wait_event_once(ctxt, move_budget_fits(b, sectors, oversized), HZ / 10);
+		move_ctxt_wait_event_once(ctxt, move_budget_fits(b, sectors, drain), HZ / 10);
 	}
 
-	if (oversized) {
+	if (drain) {
 		atomic_dec(&b->draining);
 		wake_up(&b->wait);
 	}
