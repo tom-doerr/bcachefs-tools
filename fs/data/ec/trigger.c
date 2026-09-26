@@ -665,6 +665,43 @@ bool bch2_stripe_handle_tryget(struct bch_fs *c,
 	return ret;
 }
 
+int bch2_stripe_handle_tryget_existing(struct btree_iter *iter,
+				     struct ec_stripe_handle *s, u64 idx)
+{
+	struct btree_trans *trans = iter->trans;
+	struct btree_path *path = btree_iter_path(trans, iter);
+
+	/* A noncached iterator can have obtained the key from the key cache. */
+	if (iter->key_cache_path) {
+		struct btree_path *cached = trans->paths + iter->key_cache_path;
+
+		if (bpos_eq(cached->pos, iter->pos) &&
+		    btree_node_intent_locked(cached, 0))
+			path = cached;
+	}
+
+	EBUG_ON(iter->btree_id != BTREE_ID_stripes);
+	EBUG_ON(iter->pos.offset != idx);
+	EBUG_ON(!bpos_eq(path->pos, iter->pos));
+	EBUG_ON(!btree_node_intent_locked(path, 0));
+
+	if (bch2_stripe_is_open(trans->c, idx))
+		return 0;
+
+	/*
+	 * A deletion or device invalidation may already have checked that the
+	 * stripe is closed, then dropped its locks before committing. An intent
+	 * lock alone does not invalidate that transaction's optimistic relock.
+	 * Publish the handle under a write lock so it must restart and recheck
+	 * the open-stripe state, including re-running transactional triggers.
+	 * Acquire the lock before publishing: a restart must not leak a handle.
+	 */
+	try(bch2_btree_node_lock_write(trans, path, &path->l[0].b->c));
+	int ret = bch2_stripe_handle_tryget(trans->c, s, idx);
+	bch2_btree_node_unlock_write(trans, path, path->l[0].b);
+	return ret;
+}
+
 void bch2_stripe_handle_put(struct bch_fs *c, struct ec_stripe_handle *s)
 {
 	if (!s->idx)
