@@ -16,6 +16,7 @@
 #include "btree/bkey_buf.h"
 #include "btree/bset.h"
 #include "btree/check.h"
+#include "btree/locking.h"
 #include "btree/update.h"
 #include "btree/write_buffer.h"
 
