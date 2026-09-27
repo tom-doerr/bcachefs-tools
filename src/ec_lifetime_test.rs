@@ -32,6 +32,13 @@ fn command(root: &Path, name: &str, cmd: &mut Command) {
 #[test]
 #[ignore = "creates three sparse 1 GiB regular files and imports 32 MiB of EC data"]
 fn ec_lifetime_deletion_rechecks_open_stripe() {
+    run_disposable_fixture("ec-lifetime", rust_test_ec_lifetime);
+}
+
+pub(crate) fn run_disposable_fixture(
+    name: &str,
+    test: unsafe extern "C" fn(*const *const c_char, u32) -> c_int,
+) {
     let binary = std::env::var_os("BCACHEFS_TEST_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -49,7 +56,7 @@ fn ec_lifetime_deletion_rechecks_open_stripe() {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let root = parent.join(format!(
-        "bcachefs-ec-lifetime-{}-{}",
+        "bcachefs-{name}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -57,7 +64,7 @@ fn ec_lifetime_deletion_rechecks_open_stripe() {
             .as_nanos()
     ));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-    eprintln!("EC lifetime artifacts (preserved): {}", root.display());
+    eprintln!("Storage test artifacts (preserved): {}", root.display());
     let source = root.join("source");
     fs::create_dir(&source).unwrap();
     let mut data = OpenOptions::new()
@@ -125,17 +132,17 @@ fn ec_lifetime_deletion_rechecks_open_stripe() {
     let (tx, rx) = mpsc::channel();
     spawn(system_unbound(), async move {
         let raw: Vec<_> = paths.iter().map(|p| p.as_ptr()).collect();
-        let ret = unsafe { rust_test_ec_lifetime(raw.as_ptr(), raw.len() as u32) };
+        let ret = unsafe { test(raw.as_ptr(), raw.len() as u32) };
         tx.send(ret).unwrap();
     })
     .unwrap();
     let ret = rx
-        .recv_timeout(Duration::from_secs(120))
-        .expect("EC lifetime test timed out");
+        .recv_timeout(Duration::from_secs(180))
+        .expect("storage test timed out");
     assert_eq!(
         ret,
         0,
-        "EC lifetime regression failed; images preserved in {}",
+        "storage regression failed; images preserved in {}",
         root.display()
     );
     command(

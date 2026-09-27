@@ -24,6 +24,8 @@ mod eytzinger_test;
 mod workqueue_test;
 #[cfg(test)]
 mod ec_lifetime_test;
+#[cfg(test)]
+mod correctness_test;
 
 use std::process::ExitCode;
 use bch_bindgen::c;
