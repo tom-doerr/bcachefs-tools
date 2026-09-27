@@ -50,6 +50,8 @@ struct journal_buf {
 	struct bch_dev		*cas[BCH_REPLICAS_MAX];
 	struct bch_devs_list	devs_written;
 	struct bch_io_failures	failed;
+	/* Protected by err_lock; separate from concurrently modified bitfields. */
+	bool			preflush_error;
 
 	u64			last_seq;	/* copy of data->last_seq */
 

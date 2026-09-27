@@ -321,7 +321,7 @@ static CLOSURE_CALLBACK(journal_write_done)
 			prt_printf(&msg.m, "error writing journal entry %llu\n", seq_wrote);
 			bch2_io_failures_to_text(&msg.m, c, &w->failed);
 
-			if (!w->devs_written.nr)
+			if (w->preflush_error || !w->devs_written.nr)
 				err = bch_err_throw(c, journal_write_err);
 
 			/*
@@ -558,6 +558,18 @@ static void journal_write_endio(struct bio *bio)
 	bio_put(bio);
 }
 
+static void journal_preflush_endio(struct bio *bio)
+{
+	struct journal_bio *jbio = container_of(bio, struct journal_bio, bio);
+	struct journal_buf *w = jbio->buf;
+
+	if (bio->bi_status) {
+		guard(spinlock_irqsave)(&w->j->err_lock);
+		w->preflush_error = true;
+	}
+	journal_write_endio(bio);
+}
+
 static CLOSURE_CALLBACK(journal_write_submit)
 {
 	closure_type(w, struct journal_buf, io);
@@ -565,6 +577,16 @@ static CLOSURE_CALLBACK(journal_write_submit)
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	unsigned sectors = vstruct_sectors(w->data, c->block_bits);
 	bool flush = !JSET_NO_FLUSH(w->data);
+
+	/* A journal replica cannot replace a failed flush of another member's data. */
+	if (w->preflush_error) {
+		unsigned ptr_idx = 0;
+		extent_for_each_ptr(bkey_i_to_s_extent(&w->key), ptr)
+			enumerated_ref_put(&w->cas[ptr_idx++]->io_ref[WRITE],
+					   BCH_DEV_WRITE_REF_journal_write);
+		w->devs_written.nr = 0;
+		continue_at(cl, journal_write_done, j->wq);
+	}
 
 	event_inc_trace(c, journal_write, buf, ({
 		prt_printf(&buf, "seq %llu flush %u sectors %u\n",
@@ -652,7 +674,7 @@ static CLOSURE_CALLBACK(journal_write_preflush)
 			jbio->buf		= w;
 			jbio->submit_time	= local_clock();
 
-			bio->bi_end_io		= journal_write_endio;
+			bio->bi_end_io		= journal_preflush_endio;
 			bio->bi_private		= ca;
 			closure_bio_submit(bio, cl);
 		}
