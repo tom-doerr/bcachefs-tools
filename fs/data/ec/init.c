@@ -329,7 +329,7 @@ void bch2_fs_ec_init_early(struct bch_fs *c)
 	init_waitqueue_head(&c->ec.stripe_new_wait);
 	spin_lock_init(&c->ec.stripe_new_seq_lock);
 
-	INIT_WORK(&c->ec.stripe_delete_work, bch2_ec_stripe_delete_work);
+	INIT_DELAYED_WORK(&c->ec.stripe_delete_work, bch2_ec_stripe_delete_work);
 }
 
 int bch2_fs_ec_init(struct bch_fs *c)

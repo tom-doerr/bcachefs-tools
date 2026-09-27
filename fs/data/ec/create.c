@@ -113,7 +113,7 @@ static int ec_stripe_delete(struct btree_trans *trans, u64 idx, bool is_open)
 	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, POS(0, idx), BTREE_ITER_intent);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 
-	if (!is_open && bch2_stripe_is_open(c, idx))
+	if (!is_open && bch2_stripe_defer_delete(c, idx))
 		return 0;
 
 	/*
@@ -139,12 +139,19 @@ static int ec_stripe_delete(struct btree_trans *trans, u64 idx, bool is_open)
  * XXX
  * can we kill this and delete stripes from the trigger?
  */
+static void queue_stripe_deletes(struct bch_fs *c, unsigned long delay)
+{
+	if (enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_stripe_delete) &&
+	    !queue_delayed_work(c->write_ref_wq, &c->ec.stripe_delete_work, delay))
+		enumerated_ref_put(&c->writes, BCH_WRITE_REF_stripe_delete);
+}
+
 void bch2_ec_stripe_delete_work(struct work_struct *work)
 {
 	struct bch_fs *c =
-		container_of(work, struct bch_fs, ec.stripe_delete_work);
+		container_of(to_delayed_work(work), struct bch_fs, ec.stripe_delete_work);
 
-	bch2_trans_run(c,
+	int ret = bch2_trans_run(c,
 		bch2_btree_write_buffer_tryflush(trans) ?:
 		for_each_btree_key_max_commit(trans, lru_iter, BTREE_ID_lru,
 				lru_pos(BCH_LRU_STRIPE_FRAGMENTATION, 1, 0),
@@ -154,14 +161,16 @@ void bch2_ec_stripe_delete_work(struct work_struct *work)
 				BCH_TRANS_COMMIT_no_enospc, ({
 			ec_stripe_delete(trans, lru_k.k->p.offset, false);
 		})));
+	if (ret && !bch2_err_matches(ret, EROFS) && !bch2_journal_error(&c->journal)) {
+		bch_err_fn_ratelimited(c, ret);
+		queue_stripe_deletes(c, HZ);
+	}
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_stripe_delete);
 }
 
 void bch2_do_stripe_deletes(struct bch_fs *c)
 {
-	if (enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_stripe_delete) &&
-	    !queue_work(c->write_ref_wq, &c->ec.stripe_delete_work))
-		enumerated_ref_put(&c->writes, BCH_WRITE_REF_stripe_delete);
+	queue_stripe_deletes(c, 0);
 }
 
 /* stripe creation */

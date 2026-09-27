@@ -650,6 +650,15 @@ bool bch2_stripe_is_open(struct bch_fs *c, u64 idx)
 	return bch2_open_stripe_find(c, idx) != NULL;
 }
 
+bool bch2_stripe_defer_delete(struct bch_fs *c, u64 idx)
+{
+	guard(spinlock)(&c->ec.stripes_new_lock);
+	struct ec_stripe_handle *s = bch2_open_stripe_find(c, idx);
+	if (s)
+		s->delete_pending = true;
+	return s != NULL;
+}
+
 bool bch2_stripe_handle_tryget(struct bch_fs *c,
 			       struct ec_stripe_handle *s,
 			       u64 idx)
@@ -663,6 +672,7 @@ bool bch2_stripe_handle_tryget(struct bch_fs *c,
 		unsigned hash = hash_64(idx, ilog2(ARRAY_SIZE(c->ec.stripes_new)));
 
 		s->idx = idx;
+		s->delete_pending = false;
 		hlist_add_head(&s->hash, &c->ec.stripes_new[hash]);
 	}
 	return ret;
@@ -710,9 +720,14 @@ void bch2_stripe_handle_put(struct bch_fs *c, struct ec_stripe_handle *s)
 	if (!s->idx)
 		return;
 
-	guard(spinlock)(&c->ec.stripes_new_lock);
-	BUG_ON(bch2_open_stripe_find(c, s->idx) != s);
-	hlist_del_init(&s->hash);
-
-	s->idx = 0;
+	bool retry_delete;
+	scoped_guard(spinlock, &c->ec.stripes_new_lock) {
+		BUG_ON(bch2_open_stripe_find(c, s->idx) != s);
+		hlist_del_init(&s->hash);
+		s->idx = 0;
+		retry_delete = s->delete_pending;
+		s->delete_pending = false;
+	}
+	if (retry_delete)
+		bch2_do_stripe_deletes(c);
 }

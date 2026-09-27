@@ -233,6 +233,7 @@ void bch2_stripe_new_buckets_add(struct bch_fs *c, struct ec_stripe_new *s);
 void bch2_stripe_new_buckets_del(struct bch_fs *, struct ec_stripe_new *);
 
 bool bch2_stripe_is_open(struct bch_fs *, u64);
+bool bch2_stripe_defer_delete(struct bch_fs *, u64);
 
 struct ec_stripe_handle;
 /* Hash-only claim for an unallocated stripe slot. */

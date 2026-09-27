@@ -58,6 +58,7 @@ struct ec_stripe_new_bucket {
 struct ec_stripe_handle {
 	struct hlist_node	hash;
 	u64			idx;
+	bool			delete_pending;
 };
 
 struct ec_stripe_new {

@@ -50,7 +50,7 @@ struct bch_fs_ec {
 	struct workqueue_struct	*stripe_create_wq;
 	u64			stripe_hint;
 
-	struct work_struct	stripe_delete_work;
+	struct delayed_work	stripe_delete_work;
 
 	struct bio_set		block_bioset;
 
