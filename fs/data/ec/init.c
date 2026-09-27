@@ -239,7 +239,7 @@ static bool bch2_fs_ec_flush_outstanding_done(struct bch_fs *c, u64 wait_seq)
 
 	guard(mutex)(&c->ec.stripe_new_lock);
 	struct ec_stripe_new *s;
-	list_for_each_entry(s, &c->ec.stripe_new_list, list)
+	list_for_each_entry(s, &c->ec.stripe_new_list, list) {
 		/*
 		 * seq == 0: stripe still has writes in flight (accumulating).
 		 * seq is assigned when STRIPE_REF_io hits zero, which is the
@@ -249,8 +249,10 @@ static bool bch2_fs_ec_flush_outstanding_done(struct bch_fs *c, u64 wait_seq)
 		 * wait_seq, skipped) or get cancelled via their io_refs,
 		 * which we shouldn't block on from under state_lock.
 		 */
-		if (s->seq && s->seq <= wait_seq)
+		u64 seq = READ_ONCE(s->seq);
+		if (seq && seq <= wait_seq)
 			return false;
+	}
 	return true;
 }
 
@@ -263,7 +265,10 @@ static bool bch2_fs_ec_flush_outstanding_done(struct bch_fs *c, u64 wait_seq)
  */
 void bch2_fs_ec_flush_outstanding(struct bch_fs *c)
 {
-	u64 wait_seq = atomic64_read(&c->ec.stripe_new_seq);
+	u64 wait_seq;
+	/* Snapshot only after both the global and per-stripe sequence are visible. */
+	scoped_guard(spinlock_irqsave, &c->ec.stripe_new_seq_lock)
+		wait_seq = atomic64_read(&c->ec.stripe_new_seq);
 	wait_event(c->ec.stripe_new_wait,
 		   bch2_fs_ec_flush_outstanding_done(c, wait_seq));
 }
@@ -322,6 +327,7 @@ void bch2_fs_ec_init_early(struct bch_fs *c)
 	INIT_LIST_HEAD(&c->ec.stripe_new_list);
 	mutex_init(&c->ec.stripe_new_lock);
 	init_waitqueue_head(&c->ec.stripe_new_wait);
+	spin_lock_init(&c->ec.stripe_new_seq_lock);
 
 	INIT_WORK(&c->ec.stripe_delete_work, bch2_ec_stripe_delete_work);
 }

@@ -231,8 +231,11 @@ static inline void ec_stripe_new_put(struct bch_fs *c, struct ec_stripe_new *s,
 			 * seq is the commit-ready marker, assigned here;
 			 * bch2_fs_ec_flush_outstanding() waits on it.
 			 */
-			s->state = EC_STRIPE_NEW_in_flight;
-			s->seq = atomic64_inc_return(&c->ec.stripe_new_seq);
+			/* Final IO refs can be dropped from atomic context. */
+			scoped_guard(spinlock_irqsave, &c->ec.stripe_new_seq_lock) {
+				s->state = EC_STRIPE_NEW_in_flight;
+				WRITE_ONCE(s->seq, atomic64_inc_return(&c->ec.stripe_new_seq));
+			}
 			wake_up(&c->ec.stripe_new_wait);
 			bch2_ec_stripe_create_start(c, s);
 			break;

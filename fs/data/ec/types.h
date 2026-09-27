@@ -45,6 +45,7 @@ struct bch_fs_ec {
 	struct mutex		stripe_new_lock;
 	wait_queue_head_t	stripe_new_wait;
 	atomic64_t		stripe_new_seq;
+	spinlock_t		stripe_new_seq_lock;
 
 	struct workqueue_struct	*stripe_create_wq;
 	u64			stripe_hint;
