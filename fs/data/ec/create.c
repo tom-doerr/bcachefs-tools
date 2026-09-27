@@ -2173,6 +2173,8 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 
 	unsigned need_evacuate = max(0,
 			(int) (nr_live_data_blocks + old_s->nr_redundant) - (int) dev_mask_nr(&devs));
+	/* If even parity will not fit, evacuate all remaining data blocks. */
+	need_evacuate = min(need_evacuate, nr_live_data_blocks);
 
 	if (need_evacuate) {
 		unsigned blocks_used[BCH_BKEY_PTRS_MAX], nr = 0;
