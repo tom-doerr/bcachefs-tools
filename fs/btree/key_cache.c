@@ -534,12 +534,10 @@ int bch2_btree_key_cache_journal_flush(struct journal *j,
 	 * work) are fine — reclaim retries. Avoids taking ck's intent lock on
 	 * the hot reclaim path when there's nothing to do.
 	 *
-	 * The intent lock taken below serializes against
-	 * btree_key_cache_flush_pos(), which reads ck->journal.seq while the
-	 * cached path's intent lock is held: a read lock here would let
-	 * pin_update advance the pin out from under that reader, leaving it
-	 * with a captured ck->journal.seq < j->last_seq and BUG'ing in
-	 * bch2_journal_pin_set() once the trans commit fed it back in.
+	 * A flush can drop its intent lock after capturing ck->journal.seq
+	 * while reading the backing leaf. Advancing the pin must take the
+	 * write lock too: changing the lock sequence forces that flush to
+	 * restart instead of committing with an unprotected old sequence.
 	 */
 	if (READ_ONCE(ck->journal.seq) == seq &&
 	    test_bit(BKEY_CACHED_DIRTY, &ck->flags)) {
@@ -558,8 +556,13 @@ int bch2_btree_key_cache_journal_flush(struct journal *j,
 				    !test_bit(BKEY_CACHED_DIRTY, &ck->flags)) {
 					/* raced; nothing to do */
 				} else if (ck->seq != seq) {
-					bch2_journal_pin_update(&c->journal, ck->seq, &ck->journal,
+					struct btree_path *path = trans->paths + path_idx;
+					_ret = bch2_btree_node_lock_write(trans, path, &ck->c);
+					if (!_ret) {
+						bch2_journal_pin_update(&c->journal, ck->seq, &ck->journal,
 								bch2_btree_key_cache_journal_flush);
+						bch2_btree_node_unlock_write(trans, path, path->l[0].b);
+					}
 				} else {
 					do_flush = true;
 				}
