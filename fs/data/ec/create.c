@@ -1478,9 +1478,10 @@ static int get_old_stripe(struct btree_trans *trans,
 	struct bch_fs *c = trans->c;
 
 	/*
-	 * We require an intent lock here until we have the stripe open, for
-	 * exclusion with bch2_trigger_stripe() - which will delete empty
-	 * stripes if they're not open, but it can't actually open them:
+	 * Keep the key intent-locked until tryget_existing() publishes the
+	 * handle under a write lock. Besides excluding an active deletion,
+	 * publication must invalidate a deletion that dropped its locks after
+	 * checking whether the stripe was open.
 	 */
 	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, POS(0, idx),
 				BTREE_ITER_intent|
