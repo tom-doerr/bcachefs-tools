@@ -15,6 +15,8 @@
 struct nocow_flush {
 	struct closure	*cl;
 	struct bch_dev	*ca;
+	struct bch_inode_info *inode;
+	atomic_t	*error;
 	struct bio	bio;
 };
 

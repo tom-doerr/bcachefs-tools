@@ -50,6 +50,11 @@ static void nocow_flush_endio(struct bio *_bio)
 {
 	struct nocow_flush *bio = container_of(_bio, struct nocow_flush, bio);
 
+	if (_bio->bi_status) {
+		atomic_cmpxchg(bio->error, 0, blk_status_to_errno(_bio->bi_status));
+		set_bit(bio->ca->dev_idx, bio->inode->ei_devs_need_flush.d);
+	}
+
 	closure_put(bio->cl);
 	enumerated_ref_put(&bio->ca->io_ref[WRITE],
 			   BCH_DEV_WRITE_REF_nocow_flush);
@@ -58,7 +63,7 @@ static void nocow_flush_endio(struct bio *_bio)
 
 static void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
 						struct bch_inode_info *inode,
-						struct closure *cl)
+						struct closure *cl, atomic_t *error)
 {
 	/*
 	 * Fetch-and-clear must be atomic: bch2_write_endio() sets bits here
@@ -88,8 +93,11 @@ static void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
 				ca = NULL;
 		}
 
-		if (!ca)
+		if (!ca) {
+			atomic_cmpxchg(error, 0, -EIO);
+			set_bit(dev, inode->ei_devs_need_flush.d);
 			continue;
+		}
 
 		struct nocow_flush *bio = container_of(bio_alloc_bioset(ca->disk_sb.bdev, 0,
 									REQ_OP_WRITE|REQ_PREFLUSH,
@@ -98,6 +106,8 @@ static void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
 						       struct nocow_flush, bio);
 		bio->cl			= cl;
 		bio->ca			= ca;
+		bio->inode		= inode;
+		bio->error		= error;
 		bio->bio.bi_end_io	= nocow_flush_endio;
 		closure_bio_submit(&bio->bio, cl);
 	}
@@ -107,8 +117,10 @@ static int bch2_inode_flush_nocow_writes(struct bch_fs *c,
 					 struct bch_inode_info *inode)
 {
 	CLASS(closure_stack, cl)();
-	bch2_inode_flush_nocow_writes_async(c, inode, &cl);
-	return 0;
+	atomic_t error = ATOMIC_INIT(0);
+	bch2_inode_flush_nocow_writes_async(c, inode, &cl, &error);
+	closure_sync(&cl);
+	return atomic_read(&error);
 }
 
 /* i_size updates: */
