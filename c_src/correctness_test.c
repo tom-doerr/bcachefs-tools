@@ -189,6 +189,7 @@ int rust_test_storage_correctness(const char **paths, unsigned nr)
 	struct bch_opts opts = bch2_opts_empty();
 	opt_set(opts, read_only, true);
 	opt_set(opts, copygc_enabled, false);
+	opt_set(opts, journal_rewind_discard_buffer_percent, 0);
 	opt_set(opts, reconcile_enabled, false);
 	opt_set(opts, auto_snapshot_deletion, false);
 	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
@@ -221,6 +222,7 @@ int rust_test_storage_flush_error(const char **paths, unsigned nr)
 	opt_set(opts, auto_snapshot_deletion, false);
 	/* Journal goes to member 0; member 1 still needs its data flushed. */
 	opt_set(opts, metadata_target, dev_to_target(0));
+	opt_set(opts, journal_rewind_discard_buffer_percent, 0);
 	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	if (IS_ERR(c))
 		return PTR_ERR(c);

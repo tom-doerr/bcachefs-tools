@@ -254,6 +254,8 @@ tags:
 SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './vendor/*' ! -path './fs/vendor/kernel-rust/*' ! -path './debian/*' ! -path './target/*' ! -path './build/*' ! -path './ktest-out/*' -iname '*.c'))
 # KUnit test — kernel-only, no userspace equivalent for <kunit/test.h>
 SRCS:=$(filter-out %/mean_and_variance_test.c, $(SRCS))
+# Standalone storage-test preload library; never link its fdatasync override.
+SRCS:=$(filter-out %/storage_flush_error.c, $(SRCS))
 # Strip find(1)'s leading './' so objects land at build/<path>, not build/./<path>.
 SRCS:=$(patsubst ./%,%,$(SRCS))
 
