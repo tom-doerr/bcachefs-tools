@@ -15,6 +15,7 @@
 #include "data/keylist.h"
 #include "data/move.h"
 #include "data/nocow_locking.h"
+#include "data/read.h"
 #include "data/reconcile/trigger.h"
 #include "data/ec/create.h"
 #include "data/reconcile/work.h"
@@ -23,6 +24,7 @@
 
 #include "fs/inode.h"
 
+#include "init/damage.h"
 #include "init/dev.h"
 #include "init/error.h"
 #include "init/fs.h"
@@ -683,6 +685,22 @@ void bch2_data_update_read_done(struct data_update *u)
 	u->read_done = true;
 
 	/*
+	 * Must come before the bitrot fixup below: that clears rbio->ret, and
+	 * then nothing downstream can tell a failed read from a clean one.
+	 * read.c has only read_pos, which for an indirect extent is a reflink
+	 * position - u->btree_id is what makes the narrowing exact.
+	 * Journal scrub cannot commit here: its recovery keys are frozen and
+	 * repairs are queued for the later writable phase.
+	 */
+	if (unlikely(rbio->ret) && u->opts.type != BCH_DATA_UPDATE_scrub_no_repair) {
+		CLASS(btree_trans, trans)(c);
+		int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+			bch2_damage_record_key(trans, u->btree_id, u->k.k->k.p,
+					       bch2_data_read_sb_err(rbio->ret)));
+		bch_err_fn_ratelimited(c, ret);
+	}
+
+	/*
 	 * If the extent has been bitrotted, we're going to have to give it a
 	 * new checksum in order to move it - but the poison bit will ensure
 	 * that userspace still gets the appropriate error.
@@ -709,7 +727,7 @@ void bch2_data_update_read_done(struct data_update *u)
 			};
 			bkey_copy(&r.k, u->k.k);
 			mutex_lock(&c->scrub_journal_repairs_lock);
-			darray_push(&c->scrub_journal_repairs, r);
+			u->op.error = darray_push(&c->scrub_journal_repairs, r);
 			mutex_unlock(&c->scrub_journal_repairs_lock);
 		}
 		u->op.end_io(&u->op);
