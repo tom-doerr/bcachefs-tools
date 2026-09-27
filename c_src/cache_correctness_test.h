@@ -52,7 +52,10 @@ int bch2_test_cache_cannibalize(struct bch_fs *c)
 	CLASS(btree_trans, trans)(c);
 	try(bch2_btree_write_buffer_flush_sync(trans));
 	bch2_trans_unlock(trans);
-	try(bch2_btree_key_cache_flush_going_ro(c));
+	/* Positive means that the flush made progress, not an error. */
+	int ret = bch2_btree_key_cache_flush_going_ro(c);
+	if (ret < 0)
+		return ret;
 	bch2_btree_flush_all_writes(c);
 
 	/* Keep journal reclaim from writing the selected leaf before the test. */
@@ -66,7 +69,7 @@ int bch2_test_cache_cannibalize(struct bch_fs *c)
 
 	struct bch_fs_btree_cache *bc = &c->btree.cache;
 	CLASS(darray_test_cache_nodes, held)();
-	int ret = bch2_btree_cache_cannibalize_lock(trans, NULL);
+	ret = bch2_btree_cache_cannibalize_lock(trans, NULL);
 	if (ret)
 		goto out;
 
