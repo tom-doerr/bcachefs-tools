@@ -389,7 +389,7 @@ int bch2_move_extent(struct moving_context *ctxt,
 
 		ret = bch2_btree_node_rewrite_pos(trans, iter->btree_id, level, k.k->p,
 						  data_opts->target,
-						  data_opts->commit_flags,
+						  commit_flags,
 						  data_opts->write_flags);
 
 		/* ENOMEM becomes a restart below and gets retried - not an outcome */
@@ -689,9 +689,15 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 
 		if (ca &&
 		    check_mismatch_done < bp_pos_to_bucket(ca, k.k->p).offset) {
-			while (check_mismatch_done < bp_pos_to_bucket(ca, k.k->p).offset)
-				bch2_check_bucket_backpointer_mismatch(trans, ca, check_mismatch_done++,
-								       copygc, &last_flushed);
+			while (check_mismatch_done < bp_pos_to_bucket(ca, k.k->p).offset) {
+				ret = bch2_check_bucket_backpointer_mismatch(trans, ca, check_mismatch_done,
+									     copygc, &last_flushed);
+				if (ret)
+					break;
+				check_mismatch_done++;
+			}
+			if (ret)
+				break;
 			continue;
 		}
 
@@ -763,9 +769,12 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 	 * the thing a user waits on after hitting ctrl-C.
 	 */
 	while (!ret && ca &&
-	       check_mismatch_done < sector_to_bucket(ca, sector_end))
-		bch2_check_bucket_backpointer_mismatch(trans, ca, check_mismatch_done++,
-						       copygc, &last_flushed);
+	       check_mismatch_done < sector_to_bucket(ca, sector_end)) {
+		ret = bch2_check_bucket_backpointer_mismatch(trans, ca, check_mismatch_done,
+							     copygc, &last_flushed);
+		if (!ret)
+			check_mismatch_done++;
+	}
 
 	return ret;
 }
