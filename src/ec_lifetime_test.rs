@@ -42,7 +42,10 @@ pub(crate) fn run_disposable_fixture(
 	// cargo's test entrypoint does not run bcachefs main(), which initializes
 	// the memory totals and block IO shim needed by writable filesystems.
 	static INIT: Once = Once::new();
-	INIT.call_once(|| unsafe { bch_bindgen::c::linux_shrinkers_init() });
+	INIT.call_once(|| unsafe {
+		bch_bindgen::c::raid_init();
+		bch_bindgen::c::linux_shrinkers_init();
+	});
     let binary = std::env::var_os("BCACHEFS_TEST_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

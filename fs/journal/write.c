@@ -586,6 +586,7 @@ static CLOSURE_CALLBACK(journal_write_submit)
 					   BCH_DEV_WRITE_REF_journal_write);
 		w->devs_written.nr = 0;
 		continue_at(cl, journal_write_done, j->wq);
+		return;
 	}
 
 	event_inc_trace(c, journal_write, buf, ({
