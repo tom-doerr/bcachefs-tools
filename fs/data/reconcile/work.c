@@ -784,17 +784,17 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 	}));
 
 	if (ret == -BCH_ERR_stripe_needs_block_evacuate) {
+		ret = 0;
 		if (retry) {
-			darray_push(retry, ((stripe_retry) {
-					    .idx	= k.k->p.offset,
+			ret = darray_push(retry, ((stripe_retry) {
+					    .idx	= s.k->p.offset,
 					    .io_seq	= ctxt->io_seq,
 			}));
 		} else {
 			CLASS(bch_log_msg_ratelimited, msg)(c);
-			prt_printf(&msg.m, "error retrying stripe: %s\n", bch2_err_str(ret));
+			prt_printf(&msg.m, "stripe still needs block evacuation\n");
 			bch2_bkey_val_to_text(&msg.m, c, s.s_c);
 		}
-		ret = 0;
 	}
 
 	/* Suppress trans_was_restarted() check */
@@ -807,7 +807,7 @@ static bool stripe_retry_must_wait(struct moving_context *ctxt,
 {
 	guard(mutex)(&ctxt->lock);
 	struct data_update *u = !list_empty(&ctxt->ios)
-		? list_last_entry(&ctxt->ios, struct data_update, io_list)
+		? list_first_entry(&ctxt->ios, struct data_update, io_list)
 		: NULL;
 
 	return u && u->io_seq <= stripe_io_seq;
@@ -1862,7 +1862,9 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			break;
 		} else {
 			consecutive_deferred = 0;
-			do_retry_stripes(ctxt, p->stripe_retry);
+			ret = do_retry_stripes(ctxt, p->stripe_retry);
+			if (ret)
+				break;
 		}
 
 		r->work_pos.pos = btree_type_has_snapshot_field(r->work_pos.btree)
