@@ -1439,7 +1439,9 @@ static int do_reconcile_scan(struct moving_context *ctxt,
 					    r->scan_start.pos, r->scan_end.pos));
 	}
 
-	try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
+	/* A pending cookie acknowledges the completed sweep, not this scan. */
+	if (s.type != RECONCILE_SCAN_pending)
+		try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
 
 	*sectors_scanned += atomic64_read(&r->scan_stats.sectors_seen);
 	/*
@@ -1560,6 +1562,21 @@ static const struct reconcile_phase reconcile_phases[] = {
 		BTREE_ID_reconcile_pending,		POS_MIN, SPOS_MAX },
 };
 
+/* A disabled or stalled copygc must not prevent reconcile from stopping. */
+static void reconcile_wait_copygc(struct moving_context *ctxt, u32 *run_count)
+{
+	struct bch_fs *c = ctxt->trans->c;
+	bch2_moving_ctxt_flush_all(ctxt);
+	bch2_copygc_wakeup(c);
+	wait_event_timeout(c->copygc.running_wq,
+		READ_ONCE(c->copygc.run_count) != *run_count ||
+		!READ_ONCE(c->opts.copygc_enabled) ||
+		!bch2_reconcile_enabled(c) ||
+		test_bit(BCH_FS_going_ro, &c->flags) ||
+		kthread_should_stop(), 10 * HZ);
+	*run_count = READ_ONCE(c->copygc.run_count);
+}
+
 typedef struct {
 	struct bch_fs		*c;
 	unsigned		dev;
@@ -1567,6 +1584,8 @@ typedef struct {
 	struct closure		cl;
 
 	struct bch_move_stats	stats;
+	int			ret;
+	bool			deferred;
 } reconcile_phys_thr;
 
 DEFINE_DARRAY(reconcile_phys_thr);
@@ -1596,8 +1615,8 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	struct btree_trans *trans = ctxt.trans;
 
 	CLASS(darray_reconcile_work, work)();
-	darray_make_room(&work, RECONCILE_WORK_BUF_NR);
-	if (!work.size) {
+	thr->ret = darray_make_room(&work, RECONCILE_WORK_BUF_NR);
+	if (thr->ret) {
 		bch_err(c, "%s: unable to allocate memory", __func__);
 		bch2_moving_ctxt_exit(&ctxt);
 		closure_return(cl);
@@ -1614,6 +1633,7 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	struct bbpos work_pos = BBPOS(reconcile_phases[thr->reconcile_phase].btree,
 				      POS(thr->dev, 0));
 
+	u32 copygc_run_count = READ_ONCE(c->copygc.run_count);
 	while (!bch2_move_ratelimit(&ctxt)) {
 		if (!bch2_reconcile_enabled(c) ||
 		    test_bit(BCH_FS_going_ro, &c->flags))
@@ -1622,25 +1642,40 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 		bch2_trans_begin(trans);
 
 		struct bkey_s_c k = next_reconcile_entry(trans, &work, &work_pos, POS(thr->dev, U64_MAX));
-		if (bkey_err(k) ||
+		thr->ret = bkey_err(k);
+		if (thr->ret ||
 		    !k.k ||
 		    k.k->p.inode != thr->dev)
 			break;
 
-		int ret = lockrestart_do(trans,
+		thr->ret = lockrestart_do(trans,
 			do_reconcile_extent_phys(&ctxt, &snapshot_io_opts,
 						 BBPOS(work_pos.btree, k.k->p),
 						 &last_flushed,
 						 &stripe_retry));
-		if (ret)
+		if (!thr->ret)
+			thr->ret = do_retry_stripes(&ctxt, &stripe_retry);
+		if (bch2_err_matches(thr->ret, BCH_ERR_data_update_fail_need_copygc)) {
+			thr->deferred = true;
+			reconcile_wait_copygc(&ctxt, &copygc_run_count);
+			thr->ret = 0;
+		} else if (thr->ret) {
 			break;
+		}
 	}
 
+	bch2_moving_ctxt_flush_all(&ctxt);
+	if (!thr->ret)
+		thr->ret = do_retry_stripes(&ctxt, &stripe_retry);
+	if (bch2_err_matches(thr->ret, BCH_ERR_data_update_fail_need_copygc)) {
+		thr->deferred = true;
+		thr->ret = 0;
+	}
 	bch2_moving_ctxt_exit(&ctxt);
 	closure_return(cl);
 }
 
-static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
+static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase, bool *deferred)
 {
 	CLASS(darray_reconcile_phys_thr, thrs)();
 	CLASS(closure_stack, cl)();
@@ -1658,7 +1693,13 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
 		closure_call(&i->cl, do_reconcile_phys_thread, system_unbound_wq, &cl);
 
 	closure_sync_unbounded(&cl);
-	return 0;
+	int ret = 0;
+	darray_for_each(thrs, i) {
+		*deferred |= i->deferred;
+		if (!ret)
+			ret = i->ret;
+	}
+	return ret;
 }
 
 static void reconcile_phase_start(struct bch_fs *c)
@@ -1703,6 +1744,10 @@ struct reconcile_pass {
 	struct bkey_i_cookie		*pending_cookie;
 	u64				*sectors_scanned;
 	u32				*copygc_run_count;
+	bool				deferred;
+	bool				pending_deferred;
+	bool				pending_complete;
+	bool				phase_exhausted;
 };
 
 /* Per-key handler: returns the result of processing one key in a keyed phase. */
@@ -1713,7 +1758,8 @@ static int do_reconcile_scan_key(struct reconcile_pass *p, struct bkey_s_c k)
 	struct btree_trans *trans = p->ctxt->trans;
 	struct bch_fs *c = trans->c;
 
-	if (reconcile_scan_decode(c, k.k->p.offset).type == RECONCILE_SCAN_pending)
+	if (reconcile_scan_decode(c, k.k->p.offset).type == RECONCILE_SCAN_pending &&
+	    !reconcile_scan_in_flight(c, k.k->p.offset))
 		bkey_reassemble(&p->pending_cookie->k_i, k);
 
 	int ret = do_reconcile_scan(p->ctxt, p->snapshot_io_opts, k.k->p,
@@ -1810,12 +1856,16 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		if (ret)
 			break;
 
-		if (!k.k)
-			return 0;	/* phase exhausted */
+		if (!k.k) {
+			p->phase_exhausted = true;
+			return 0;
+		}
 
 		r->work_pos.pos = k.k->p;
 
 		ret = handler(p, k);
+		if (!ret)
+			ret = do_retry_stripes(ctxt, p->stripe_retry);
 
 		if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc)) {
 			/*
@@ -1825,16 +1875,13 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			 * needs those locks to evacuate the buckets, so parking
 			 * them here while waiting for copygc deadlocks.
 			 */
-			bch2_moving_ctxt_flush_all(ctxt);
-			bch2_copygc_wakeup(c);
-			wait_event(c->copygc.running_wq,
-				   c->copygc.run_count != *p->copygc_run_count ||
-				   kthread_should_stop());
-			*p->copygc_run_count = c->copygc.run_count;
+			p->deferred = true;
+			p->pending_deferred |= reconcile_phase_is_pending(r->phase);
+			reconcile_wait_copygc(ctxt, p->copygc_run_count);
 			ret = 0;
 
 			/*
-			 * Scan cookies are retried in place. Keyed work is
+			 * Scan cookies remain queued for the next pass. Keyed work is
 			 * deferred: step past the entry and leave its work
 			 * entry for the next pass. Retrying in place let one
 			 * entry that couldn't be placed stall every later
@@ -1842,13 +1889,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			 * got the same key back after every copygc run.
 			 */
 			if (reconcile_phases[r->phase].type == RECONCILE_PHASE_scan)
-				continue;
+				return 0; /* The durable scan cookie remains queued. */
 
 			r->deferred++;
 			if (reconcile_phases[r->phase].type == RECONCILE_PHASE_destage)
 				r->destage_deferred++;
 
-			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED)
+			/* Pending sweeps must reach entries beyond a blocked prefix. */
+			if (++consecutive_deferred >= RECONCILE_MAX_CONSECUTIVE_DEFERRED &&
+			    !reconcile_phase_is_pending(r->phase))
 				return 0;
 		} else if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
@@ -1862,9 +1911,6 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			break;
 		} else {
 			consecutive_deferred = 0;
-			ret = do_retry_stripes(ctxt, p->stripe_retry);
-			if (ret)
-				break;
 		}
 
 		r->work_pos.pos = btree_type_has_snapshot_field(r->work_pos.btree)
@@ -1887,7 +1933,7 @@ static int do_reconcile_phase_phys(struct reconcile_pass *p)
 	struct bch_fs_reconcile *r = &c->reconcile;
 
 	bch2_trans_unlock_long(trans);
-	int ret = do_reconcile_phys(c, r->phase);
+	int ret = do_reconcile_phys(c, r->phase, &p->deferred);
 	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart));
 	return ret;
 }
@@ -1897,7 +1943,7 @@ static int do_reconcile_phase(struct reconcile_pass *p, u32 kick)
 	struct btree_trans *trans = p->ctxt->trans;
 	struct bch_fs_reconcile *r = &trans->c->reconcile;
 
-	bch2_btree_write_buffer_flush_sync(trans);
+	try(bch2_btree_write_buffer_flush_sync(trans));
 
 	switch (reconcile_phases[r->phase].type) {
 	case RECONCILE_PHASE_scan:
@@ -1980,6 +2026,9 @@ static int do_reconcile(struct moving_context *ctxt)
 		 * asking for more work.
 		 */
 		kick = r->kick;
+		pass.pending_complete = true;
+		pass.pending_deferred = false;
+		bkey_init(&pending_cookie.k);
 
 		for (r->phase = 0; r->phase < ARRAY_SIZE(reconcile_phases); r->phase++) {
 			reconcile_phase_start(c);
@@ -1994,7 +2043,10 @@ static int do_reconcile(struct moving_context *ctxt)
 			    bkey_deleted(&pending_cookie.k))
 				goto out;
 
+			pass.phase_exhausted = false;
 			ret = do_reconcile_phase(&pass, kick);
+			if (reconcile_phase_is_pending(r->phase) && !pass.phase_exhausted)
+				pass.pending_complete = false;
 			if (ret)
 				goto out;
 
@@ -2006,8 +2058,16 @@ static int do_reconcile(struct moving_context *ctxt)
 			    bch2_move_ratelimit(ctxt))
 				break;
 
-			/* Drain pending moves before the next phase. */
+			/* Drain pending moves before retrying stripes or starting the next phase. */
 			bch2_moving_ctxt_flush_all(ctxt);
+			ret = do_retry_stripes(ctxt, &stripe_retry);
+			if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc)) {
+				pass.deferred = true;
+				pass.pending_deferred |= reconcile_phase_is_pending(r->phase);
+				ret = 0;
+			} else if (ret) {
+				goto out;
+			}
 		}
 
 		/* Completed a clean pass through all phases — we're done. */
@@ -2015,13 +2075,27 @@ static int do_reconcile(struct moving_context *ctxt)
 			break;
 	}
 out:
-	if (!ret && !bkey_deleted(&pending_cookie.k))
-		try(bch2_clear_reconcile_needs_scan(trans,
-				pending_cookie.k.p, pending_cookie.v.cookie));
+	if (!ret && r->phase == ARRAY_SIZE(reconcile_phases) &&
+	    pass.pending_complete && !pass.pending_deferred &&
+	    !bkey_deleted(&pending_cookie.k))
+		ret = bch2_clear_reconcile_needs_scan(trans,
+			pending_cookie.k.p, le64_to_cpu(pending_cookie.v.cookie));
+
+	if (!ret && pass.deferred) {
+		bch2_moving_ctxt_flush_all(ctxt);
+		bch2_trans_unlock_long(trans);
+		/* Retain retries without spinning when placement remains blocked. */
+		wait_event_timeout(c->copygc.running_wq,
+			READ_ONCE(c->copygc.run_count) != copygc_run_count ||
+			kick != READ_ONCE(r->kick) ||
+			!bch2_reconcile_enabled(c) ||
+			test_bit(BCH_FS_going_ro, &c->flags) ||
+			kthread_should_stop(), HZ);
+	}
 
 	bch2_move_stats_exit(&r->work_stats, c);
 
-	if (!ret &&
+	if (!ret && !pass.deferred &&
 	    !kthread_should_stop() &&
 	    !atomic64_read(&r->work_stats.sectors_seen) &&
 	    !sectors_scanned &&
