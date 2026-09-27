@@ -127,7 +127,10 @@ static int bch2_bucket_is_movable(struct btree_trans *trans,
 	b->sectors	= bch2_bucket_sectors_dirty(*a);
 	u64 lru_idx	= alloc_lru_idx_fragmentation(*a, ca);
 
-	if (!lru_idx || lru_idx > time) {
+	/* Stripe reclamation may need the last full bucket of a sparse stripe. */
+	if (!b->sectors || a->data_type >= BCH_DATA_NR ||
+	    !data_type_movable(a->data_type) ||
+	    (time != U64_MAX && (!lru_idx || lru_idx > time))) {
 		bch_err_throw(c, bucket_not_moveable_lru_race);
 		return 0;
 	}
