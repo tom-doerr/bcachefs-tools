@@ -18,6 +18,9 @@
 #include "fs/journal/sb.h"
 
 int rust_test_storage_correctness(const char **, unsigned);
+int rust_test_storage_flush_error(const char **, unsigned);
+extern void bch_test_fail_next_flush(int) __attribute__((weak));
+extern unsigned bch_test_flush_failures(void) __attribute__((weak));
 
 #define check(cond) do { \
 	if (!(cond)) { \
@@ -205,4 +208,37 @@ int rust_test_storage_correctness(const char **paths, unsigned nr)
 		ret = key_cache_pin_relock(c, stripe.k->k.p, fixed);
 	int exit_ret = bch2_fs_exit(c);
 	return ret ?: exit_ret;
+}
+
+int rust_test_storage_flush_error(const char **paths, unsigned nr)
+{
+	check(bch_test_fail_next_flush && bch_test_flush_failures);
+	check(nr == 3);
+	darray_const_str devs = { .data = paths, .nr = nr };
+	struct bch_opts opts = bch2_opts_empty();
+	opt_set(opts, copygc_enabled, false);
+	opt_set(opts, reconcile_enabled, false);
+	opt_set(opts, auto_snapshot_deletion, false);
+	/* Journal goes to member 0; member 1 still needs its data flushed. */
+	opt_set(opts, metadata_target, dev_to_target(0));
+	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
+	if (IS_ERR(c))
+		return PTR_ERR(c);
+	struct bch_dev *ca = bch2_dev_have_ref(c, 1);
+	int ret = bch2_journal_meta(&c->journal);
+	if (!ret) {
+		u64 previous = ca->prev_journal_sector;
+		bch_test_fail_next_flush(ca->disk_sb.bdev->bd_fd);
+		int flush_ret = bch2_journal_meta(&c->journal);
+		unsigned failures = bch_test_flush_failures();
+		bch_test_fail_next_flush(-1);
+		fprintf(stderr, "storage reliability: nonjournal member flush failures=%u ret=%d journal_error=%d\n",
+			failures, flush_ret, bch2_journal_error(&c->journal));
+		ret = failures == 1 && flush_ret && bch2_journal_error(&c->journal) &&
+			ca->prev_journal_sector == previous ? 0 : -EINVAL;
+	}
+	int exit_ret = bch2_fs_exit(c);
+	if (exit_ret && !bch2_err_matches(exit_ret, BCH_ERR_shutdown_with_emergency_ro))
+		ret = ret ?: exit_ret;
+	return ret;
 }
