@@ -510,13 +510,15 @@ int bch2_trigger_stripe(struct btree_trans *trans, struct btree_trigger_op op)
 			 *
 			 * Also: when we bring back runtime gc, locking
 			 */
-			gc->alive	= true;
-			gc->sectors	= le16_to_cpu(new_s->sectors);
-			gc->nr_blocks	= new_s->nr_blocks;
-			gc->nr_redundant	= new_s->nr_redundant;
+			gc->alive = new_s != NULL;
+			if (new_s) {
+				gc->sectors	= le16_to_cpu(new_s->sectors);
+				gc->nr_blocks	= new_s->nr_blocks;
+				gc->nr_redundant	= new_s->nr_redundant;
 
-			for (unsigned i = 0; i < new_s->nr_blocks; i++)
-				gc->ptrs[i] = new_s->ptrs[i];
+				for (unsigned i = 0; i < new_s->nr_blocks; i++)
+					gc->ptrs[i] = new_s->ptrs[i];
+			}
 
 			/*
 			 * gc recalculates this field from stripe ptr
