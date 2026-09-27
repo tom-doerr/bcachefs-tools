@@ -662,10 +662,8 @@ static int __btree_node_reclaim_checks(struct bch_fs *c, struct btree *b,
 	if (btree_node_will_make_reachable(b))
 		return btree_node_noreclaim(c, flags, BCH_BTREE_CACHE_NOT_FREED_will_make_reachable);
 
-	if (flags & BTREE_NODE_RECLAIM_allow_dirty)
-		return 0;
-
-	if (btree_node_dirty(b))
+	if (btree_node_dirty(b) &&
+	    (!(flags & BTREE_NODE_RECLAIM_allow_dirty) || btree_node_never_write(b)))
 		return btree_node_noreclaim(c, flags, BCH_BTREE_CACHE_NOT_FREED_dirty);
 
 	if (btree_node_read_in_flight(b))
@@ -906,8 +904,11 @@ static struct btree *bch2_btree_node_grab(struct bch_fs *c, struct list_head *he
 	list_for_each_entry(b, head, list)
 		if (pcpu_read_locks == (b->c.lock.readers != NULL) &&
 		    !btree_node_reclaim(c, b, flags)) {
-			bch2_btree_evicted_size_record(c, b->hash_val, b->nr.live_u64s);
-			bch2_btree_node_transition_state_locked(bc, b, BTREE_NODE_CACHE_NONE);
+			/* Dirty candidates remain discoverable until writeback completes. */
+			if (!btree_node_dirty(b)) {
+				bch2_btree_evicted_size_record(c, b->hash_val, b->nr.live_u64s);
+				bch2_btree_node_transition_state_locked(bc, b, BTREE_NODE_CACHE_NONE);
+			}
 			return b;
 		}
 
@@ -926,18 +927,29 @@ static struct btree *btree_node_cannibalize(struct btree_trans *trans, bool pcpu
 				return b;
 		}
 
+		if (bch2_journal_error(&c->journal))
+			return NULL;
+
+		bool wrote = false;
 		for (unsigned i = 0; i < ARRAY_SIZE(bc->live); i++) {
 			struct btree *b = bch2_btree_node_grab(c, &bc->live[i].dirty, pcpu_read_locks,
 							       BTREE_NODE_RECLAIM_allow_dirty);
 			if (b) {
-				if (btree_node_dirty(b))
-					__bch2_btree_node_write(trans, b, BTREE_WRITE_cache_reclaim);
+				if (!btree_node_dirty(b))
+					return b;
 
-				bch2_btree_node_wait_on_read(trans, b);
+				__bch2_btree_node_write(trans, b, BTREE_WRITE_cache_reclaim);
+				/* Completion takes a read lock before clearing write_in_flight. */
+				six_unlock_write(&b->c.lock);
+				six_unlock_intent(&b->c.lock);
 				bch2_btree_node_wait_on_write(trans, b);
-				return b;
+				wrote = true;
 			}
 		}
+
+		/* Reclaim afresh: the node may have been redirtied or reused. */
+		if (wrote)
+			continue;
 
 		/*
 		 * Rare case: all matching-type nodes were intent-locked.
@@ -982,9 +994,11 @@ struct btree *bch2_btree_node_mem_alloc(struct btree_trans *trans, bool pcpu_rea
 	 */
 	if (unlikely(system_memory_usage_high(c))) {
 		bc->nr_self_reclaim++;
-		b = bch2_btree_node_grab(c, &bc->live[pcpu_read_locks].clean, pcpu_read_locks, 0);
-		if (b)
-			goto got_mem;
+		for (unsigned i = 0; i < ARRAY_SIZE(bc->live); i++) {
+			b = bch2_btree_node_grab(c, &bc->live[i].clean, pcpu_read_locks, 0);
+			if (b)
+				goto got_mem;
+		}
 	}
 
 	struct btree_node_bufs bufs = { .byte_order = ilog2(c->opts.btree_node_size) };
