@@ -24,7 +24,8 @@ static void test_pending_fill(darray_reconcile_work *work)
 	for (unsigned i = 0; i < 17; i++) {
 		bkey_init(&work->data[i].k);
 		work->data[i].k.type = KEY_TYPE_set;
-		work->data[i].k.p = POS(0, 17 - i);
+		/* Keep the simulated prefetched range after the fixture's real work. */
+		work->data[i].k.p = POS(U64_MAX, 17 - i);
 	}
 }
 
