@@ -47,6 +47,7 @@ enum reconcile_phase_type {
 #define x(n)	RECONCILE_PHASE_##n,
 	RECONCILE_PHASE_TYPES()
 #undef x
+
 };
 
 #define x(n) #n,
@@ -2367,3 +2368,7 @@ int bch2_fs_reconcile_init(struct bch_fs *c)
 #endif
 	return 0;
 }
+
+#ifndef __KERNEL__
+#include "../../../c_src/reconcile_correctness_test.h"
+#endif
