@@ -3,14 +3,14 @@
 //! ec_lifetime -- --ignored --nocapture --test-threads=1
 
 use bcachefs_kernel::util::async_exec::{spawn, system_unbound};
-use std::ffi::{c_char, c_int, CString};
+use std::ffi::{CString, c_char, c_int};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{mpsc, Once};
+use std::sync::{Once, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 unsafe extern "C" {
@@ -39,23 +39,25 @@ pub(crate) fn run_disposable_fixture(
     name: &str,
     test: unsafe extern "C" fn(*const *const c_char, u32) -> c_int,
 ) {
-	// cargo's test entrypoint does not run bcachefs main(), which initializes
-	// the memory totals and block IO shim needed by writable filesystems.
-	static INIT: Once = Once::new();
-	INIT.call_once(|| {
-		let (ready, wait) = mpsc::channel();
-		std::thread::spawn(move || {
-			unsafe {
-				bch_bindgen::c::raid_init();
-				bch_bindgen::c::linux_shrinkers_init();
-			}
-			ready.send(()).unwrap();
-			// Initialization registers this thread with liburcu. Give it
-			// process lifetime, as main() has in the normal executable.
-			loop { std::thread::park(); }
-		});
-		wait.recv().unwrap();
-	});
+    // cargo's test entrypoint does not run bcachefs main(), which initializes
+    // the memory totals and block IO shim needed by writable filesystems.
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let (ready, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            unsafe {
+                bch_bindgen::c::raid_init();
+                bch_bindgen::c::linux_shrinkers_init();
+            }
+            ready.send(()).unwrap();
+            // Initialization registers this thread with liburcu. Give it
+            // process lifetime, as main() has in the normal executable.
+            loop {
+                std::thread::park();
+            }
+        });
+        wait.recv().unwrap();
+    });
     let binary = std::env::var_os("BCACHEFS_TEST_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

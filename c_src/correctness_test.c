@@ -204,8 +204,10 @@ int rust_test_storage_correctness(const char **paths, unsigned nr)
 		ret = lockrestart_do(trans, first_stripe(trans, &stripe)) ?:
 			lockrestart_do(trans, stripe_reconcile_marker(trans, &stripe));
 	}
-	if (!ret)
+	if (!ret) {
+		c->opts.read_only = false;
 		ret = bch2_fs_read_write(c);
+	}
 	for (unsigned fixed = 0; !ret && fixed < 2; fixed++)
 		ret = key_cache_pin_relock(c, stripe.k->k.p, fixed);
 	if (!ret)

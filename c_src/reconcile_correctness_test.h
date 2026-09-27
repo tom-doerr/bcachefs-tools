@@ -79,6 +79,8 @@ int bch2_test_reconcile_pending(struct bch_fs *c)
 	visited = 0;
 	u64 start = ktime_get_ns();
 	int ret = do_reconcile_phase_iter(&pass, c->reconcile.kick, test_pending_blocked_prefix);
+	fprintf(stderr, "storage reliability: pending visited=%llx deferred=%u exhausted=%u ret=%d\n",
+		(unsigned long long) visited, pass.pending_deferred, pass.phase_exhausted, ret);
 	if (!ret && (visited != (BIT_ULL(18) - 2) || !pass.pending_deferred ||
 		     !pass.phase_exhausted || ktime_get_ns() - start > 5 * NSEC_PER_SEC))
 		ret = -EINVAL;
