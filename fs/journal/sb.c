@@ -242,7 +242,7 @@ int bch2_sb_journal_sort(struct bch_fs *c)
 			struct journal_device *ja = &ca->journal;
 
 			sort(ja->buckets, ja->nr, sizeof(ja->buckets[0]), u64_cmp, NULL);
-			bch2_journal_buckets_to_sb(c, ca, ja->buckets, ja->nr);
+			try(bch2_journal_buckets_to_sb(c, ca, ja->buckets, ja->nr));
 			sb_dirty(&w);
 		}
 	}
