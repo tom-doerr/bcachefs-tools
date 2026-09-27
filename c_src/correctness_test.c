@@ -110,18 +110,21 @@ static int key_cache_pin_relock(struct bch_fs *c, struct bpos pos, bool fixed)
 	check(!test_bit(BKEY_CACHED_DIRTY, &ck->flags));
 	check(!ck->journal.seq);
 	u64 saved_seq = ck->seq;
+	CLASS(closure_stack, cl)();
 	struct journal_res res = {};
-	try(bch2_journal_res_get(j, &res, jset_u64s(0), 0, NULL));
+	try(bch2_journal_res_get(j, &res, jset_u64s(0), BCH_WATERMARK_reclaim, NULL));
 	u64 old_seq = res.seq;
 	set_bit(BKEY_CACHED_DIRTY, &ck->flags);
 	atomic_long_inc(&c->btree.key_cache.nr_dirty);
 	bch2_journal_pin_set(j, old_seq, &ck->journal, bch2_btree_key_cache_journal_flush);
+	bch2_journal_res_flush(j, &res, &cl);
 	bch2_journal_res_put(j, &res);
 	bch2_trans_unlock(observer);
-	int ret = bch2_journal_meta(j);
+	closure_sync(&cl);
+	int ret = bch2_journal_error(j);
 	if (!ret) {
 		res = (struct journal_res) {};
-		ret = bch2_journal_res_get(j, &res, jset_u64s(0), 0, NULL);
+		ret = bch2_journal_res_get(j, &res, jset_u64s(0), BCH_WATERMARK_reclaim, NULL);
 	}
 	if (!ret) {
 		ck->seq = res.seq;
