@@ -1693,7 +1693,8 @@ static int stripe_idx_alloc(struct btree_trans *trans, struct ec_stripe_new *s)
 			ret = bch2_ec_stripe_mem_alloc(trans, &iter);
 			if (ret)
 				bch2_stripe_handle_put(c, &s->new_stripe_handle);
-			s->new_stripe.key.k.p = iter.pos;
+			else
+				s->new_stripe.key.k.p = iter.pos;
 			break;
 		}
 	}
@@ -1839,6 +1840,7 @@ __cold void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
 
 	scoped_guard(mutex, &c->ec.stripe_head_lock)
 		list_for_each_entry(h, &c->ec.stripe_head_list, list) {
+			guard(mutex)(&h->lock);
 			prt_printf(out, "disk label %u algo %u redundancy %u %s nr created %llu:\n",
 			       h->disk_label, h->algo, h->redundancy,
 			       bch2_watermarks[h->watermark],
