@@ -18,6 +18,7 @@
 #include "fs/journal/sb.h"
 
 int bch2_test_reconcile_pending(struct bch_fs *);
+int bch2_test_cache_cannibalize(struct bch_fs *);
 int rust_test_storage_correctness(const char **, unsigned);
 int rust_test_storage_flush_error(const char **, unsigned);
 extern void bch_test_fail_next_flush(int) __attribute__((weak));
@@ -212,6 +213,8 @@ int rust_test_storage_correctness(const char **paths, unsigned nr)
 		ret = key_cache_pin_relock(c, stripe.k->k.p, fixed);
 	if (!ret)
 		ret = bch2_test_reconcile_pending(c);
+	if (!ret)
+		ret = bch2_test_cache_cannibalize(c);
 	int exit_ret = bch2_fs_exit(c);
 	return ret ?: exit_ret;
 }

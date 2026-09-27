@@ -1971,3 +1971,7 @@ __cold void bch2_btree_cache_to_text(struct printbuf *out, const struct bch_fs_b
 		prt_printf(out, "  %s\t%llu\n",
 			   bch2_btree_cache_not_freed_reasons_strs[i], bc->not_freed[i]);
 }
+
+#ifndef __KERNEL__
+#include "c_src/cache_correctness_test.h"
+#endif
