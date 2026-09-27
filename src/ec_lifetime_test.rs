@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 unsafe extern "C" {
@@ -39,6 +39,10 @@ pub(crate) fn run_disposable_fixture(
     name: &str,
     test: unsafe extern "C" fn(*const *const c_char, u32) -> c_int,
 ) {
+	// cargo's test entrypoint does not run bcachefs main(), which initializes
+	// the memory totals and block IO shim needed by writable filesystems.
+	static INIT: Once = Once::new();
+	INIT.call_once(|| unsafe { bch_bindgen::c::linux_shrinkers_init() });
     let binary = std::env::var_os("BCACHEFS_TEST_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
