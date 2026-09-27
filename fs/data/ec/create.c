@@ -2149,6 +2149,19 @@ static bool stripe_degraded(struct bch_fs *c, const struct bch_stripe *s)
 	return false;
 }
 
+static int stripe_repair_clear_pending(struct btree_trans *trans,
+				       struct btree_iter *iter, struct bkey_s_c_stripe s)
+{
+	if (!s.v->needs_reconcile)
+		return 0;
+
+	struct bkey_s_c k = s.s_c;
+	struct bkey_i_stripe *update =
+		errptr_try(bch2_bkey_make_mut_typed(trans, iter, &k, 0, stripe));
+	update->v.needs_reconcile = false;
+	return bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc);
+}
+
 int bch2_stripe_repair(struct moving_context *ctxt,
 		       struct btree_iter *iter, struct bkey_s_c_stripe s)
 {
@@ -2168,7 +2181,7 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 	if (!stripe_degraded(c, old_s)) {
 		event_inc_trace(c, stripe_repair_race, buf,
 				bch2_bkey_val_to_text(&buf, c, s.s_c));
-		return 0;
+		return stripe_repair_clear_pending(trans, iter, s);
 	}
 
 	unsigned nr_data = old_s->nr_blocks - old_s->nr_redundant;
@@ -2177,7 +2190,7 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 		nr_live_data_blocks += stripe_blockcount_get(old_s, i) != 0;
 
 	if (!nr_live_data_blocks)
-		return 0;
+		return stripe_repair_clear_pending(trans, iter, s);
 
 	struct bch_devs_mask devs;
 	bch2_disk_label_ec_devs(c, old_s->disk_label, &devs, le16_to_cpu(old_s->sectors));
