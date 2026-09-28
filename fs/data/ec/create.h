@@ -81,9 +81,11 @@ struct ec_stripe_new {
 	/*
 	 * Set by ec_old_stripe_fold() from the read's completion, read by
 	 * create: its own field so neither side needs a lock to say what
-	 * happened.
+	 * happened. @old_stripe_lost_blocks is the blocks that were carried forward
+	 * and are unreadable, i.e. the data the failure actually cost us.
 	 */
 	int			old_stripe_err;
+	u32			old_stripe_lost_blocks;
 
 	struct bch_devs_mask	devs;
 	enum bch_watermark	watermark;
@@ -173,7 +175,7 @@ unsigned bch2_disk_label_ec_devs(struct bch_fs *, unsigned, struct bch_devs_mask
 void bch2_disk_label_ec_rw_member_devs(struct bch_fs *, unsigned,
 				       struct bch_devs_mask *, unsigned);
 
-bool bch2_can_form_ec_stripe(struct bch_fs *, unsigned, unsigned);
+bool bch2_can_form_ec_stripe(struct bch_fs *, unsigned, unsigned, struct printbuf *);
 
 /*
  * Lazy per-(disk_label, sectors) cache of RW member counts (the can_widen
@@ -192,7 +194,8 @@ int bch2_widen_cache_init(widen_cache *);
 int bch2_widen_cache_lookup(widen_cache *, struct bch_fs *,
 			    u8 disk_label, u16 sectors, unsigned *nr_devs);
 
-void bch2_ec_stripe_new_cancel(struct bch_fs *, struct ec_stripe_head *, int);
+void bch2_ec_stripe_new_cancel(struct bch_fs *, struct ec_stripe_head *,
+			       struct ec_stripe_new *, int);
 void bch2_ec_bucket_cancel(struct bch_fs *, struct open_bucket *, int);
 
 int bch2_ec_stripe_new_alloc(struct bch_fs *, struct ec_stripe_head *);
@@ -249,6 +252,10 @@ void bch2_new_stripes_to_text(struct printbuf *, struct bch_fs *);
 
 struct moving_context;
 int bch2_stripe_repair(struct moving_context *, struct btree_iter *, struct bkey_s_c_stripe);
+
+struct wb_maybe_flush;
+int bch2_ec_record_lost_block(struct btree_trans *, struct bkey_s_c_stripe, unsigned,
+			      enum bch_sb_error_id, struct wb_maybe_flush *);
 
 void bch2_logged_op_stripe_update_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 

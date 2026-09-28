@@ -277,17 +277,7 @@ property is weakened --- after a crash, a nocow extent may contain newer data
 than moment $T$, and without checksums this cannot be detected.
 \end{itemize}
 
-The common write-temporary-then-rename-over pattern gets a stronger
-guarantee: when a rename \emph{overwrites} an existing file, bcachefs first
-completes writeback of the source file's data, so the data's extents are
-journalled before the rename is. Combined with prefix consistency this makes
-the replacement atomic and complete without any fsync: after a crash, either
-the old file is intact, or the rename happened and all of the new file's data
-is present --- the empty-or-truncated-file outcome cannot occur. Note this
-orders the rename behind the data but does not make the rename itself durable
-(no journal flush is issued); an application that must know the replacement
-has happened still needs fsync. Plain renames that don't overwrite anything
-get no implicit writeback.
+\bchdoc{replace-in-place}
 
 Related interfaces, briefly: \texttt{fdatasync(2)} is implemented
 identically to \texttt{fsync(2)} (stronger than POSIX requires).
@@ -299,13 +289,7 @@ so until a journal flush a crash simply recovers to a moment before the
 write. Crash semantics are identical to a buffered write whose writeback has
 completed; fsync or fdatasync is still what makes the write survive. The \texttt{O\_TMPFILE}-then-\texttt{linkat} pattern is
 covered by fsync's own-inode completeness: the link updates the inode, so a
-subsequent fsync of the file persists it. Finally, truncate-then-rewrite of an existing file
-(\texttt{O\_TRUNC}) is inherently unsafe as a replacement strategy on any
-filesystem: the old contents are destroyed before the new contents exist, so
-no placement of fsync can provide an old-or-new guarantee --- a crash after
-the truncate persists but before the rewrite does recovers an empty file,
-and fsync only narrows that window. Atomic replacement is what
-rename-over is for.
+subsequent fsync of the file persists it.
 
 \subsection{Bucket based allocation}
 
@@ -742,6 +726,10 @@ btrfs. A new subvolume may be created empty, or it may be created as a snapshot
 of another subvolume. Snapshots are writeable by default and may be snapshotted
 again, creating a tree of snapshots; they can also be created as read-only with
 the \texttt{--read-only} (or \texttt{-r}) flag.
+
+Because snapshots are writable, a subvolume and its snapshots can set different
+per-file io path options on data they still share; \S\ref{sec:file-options-snapshots}
+covers what happens then.
 
 Snapshots are very cheap to create: they're not based on cloning of COW btrees
 as with btrfs, but instead are based on versioning of individual keys in the
@@ -1703,6 +1691,33 @@ $ getfattr -d -m '^bcachefs_effective\.' filename
 Options may be set via the extended attribute interface, but it is preferable to
 use the \texttt{bcachefs set-file-option} command as it will correctly
 propagate options recursively.
+
+\subsubsection{Options and snapshots}
+\label{sec:file-options-snapshots}
+
+An extent takes its io path options from the inode version at the nearest
+ancestor of the snapshot it was written at, so data written before a snapshot
+reads the options preserved with that snapshot rather than the ones on the inode
+just changed. Setting an option therefore also updates those ancestor versions,
+so that the older data follows the change.
+
+Writable snapshots of a subvolume share that older data but have their own
+inodes, so they can ask for different things while only one ancestor version
+holds the answer. Then:
+
+\begin{itemize}
+\item \texttt{data\_replicas} takes the largest value asked for.
+\item Otherwise, if one of them is the master subvolume -- the one subvolume in
+      a snapshot tree that is not itself a snapshot -- its value wins.
+\item Otherwise the shared data keeps the option it has, which in practice means
+      whichever branch set it first, while nothing yet disagreed. Letting the
+      most recent change win would rewrite all of the shared data every time
+      either branch changed its mind.
+\end{itemize}
+
+Data written after a branch diverges always uses that branch's own options; only
+the older, shared data is subject to the above. The ancestor versions are an
+invariant that \texttt{fsck} checks and repairs.
 
 \subsection{Inode number sharding}
 

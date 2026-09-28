@@ -1443,6 +1443,14 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 			bch2_inode_opts_get(c, &io_opts, bkey_is_btree_ptr(k.k));
 
 			bkey_for_each_ptr(ptrs, ptr) {
+				/*
+				 * A device that isn't there tells us nothing
+				 * about whether it honoured flush/FUA - don't
+				 * let it read as a checksum error and rewind.
+				 */
+				if (!bch2_dev_idx_is_online(c, ptr->dev))
+					continue;
+
 				struct data_update_opts data_opts = {
 					.type		= BCH_DATA_UPDATE_scrub_no_repair,
 					.read_flags	= BCH_READ_hard_require_read_device,
@@ -1450,6 +1458,7 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 				};
 				ret = lockrestart_do(trans, ({
 					struct bkey_s_c k2;
+					u32 restart_count = trans->restart_count;
 
 					CLASS(btree_node_iter, iter)(trans, jk->btree_id, k.k->p, 0, jk->level,
 								     BTREE_ITER_all_snapshots);
@@ -1457,8 +1466,20 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 
 					BUG_ON(!ret2 && !bkey_and_val_eq(k, k2));
 
-					ret2 ?:
+					ret2 = ret2 ?:
 					bch2_move_extent(&ctxt, NULL, &io_opts, &data_opts, &iter, jk->level, k);
+
+					/*
+					 * Suppress trans_was_restarted() check: move_extent
+					 * reports read errors by resolving the inode path,
+					 * which restarts - and the move is finished either
+					 * way. Restoring the count has to happen in here,
+					 * not outside: the check that fires is
+					 * lockrestart_do()'s own, against the counter it
+					 * captured after its bch2_trans_begin().
+					 */
+					trans->restart_count = restart_count;
+					ret2;
 				}));
 
 				if (ret)

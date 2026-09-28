@@ -33,8 +33,16 @@ struct bkey_i *bch2_damage_keys_merge(struct btree_trans *, struct bpos,
 				      struct bkey_s_c, struct bkey_s_c);
 int bch2_damage_delete(struct btree_trans *, u64, u32);
 int bch2_damage_clear(struct btree_trans *, subvol_inum);
+int bch2_damage_record_key(struct btree_trans *, enum btree_id,
+			   struct bpos, enum bch_sb_error_id);
 int bch2_damage_record_data_loss(struct btree_trans *, enum btree_id,
 				 struct bpos, enum bch_sb_error_id);
+
+void bch2_damage_note_lost_extents(struct bch_fs *, enum btree_id, struct bkey_s_c);
+void bch2_damage_record_lost_extents(struct bch_fs *);
+
+void bch2_fs_damage_exit(struct bch_fs *);
+void bch2_fs_damage_init_early(struct bch_fs *);
 
 int bch2_check_damage(struct bch_fs *);
 

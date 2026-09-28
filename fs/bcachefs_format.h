@@ -477,7 +477,10 @@ enum bch_bkey_type_flags {
 	x(damage,		38,	BKEY_TYPE_strict_btree_checks,	\
 	  "Errors that damaged an inode, recorded in the same "		\
 	  "transaction as the repair that did the damage: a sorted "	\
-	  "list of bch_sb_error_id")
+	  "list of bch_sb_error_id")					\
+	x(logged_op_inode_opt_propagate, 39, BKEY_TYPE_strict_btree_checks, \
+	  "Logged propagation of inode io options to ancestor "		\
+	  "snapshot versions")
 
 enum bch_bkey_type {
 #define x(name, nr, ...) KEY_TYPE_##name	= nr,
@@ -749,6 +752,7 @@ enum btree_id_flags {
 	  BIT_ULL(KEY_TYPE_logged_op_truncate)|					\
 	  BIT_ULL(KEY_TYPE_logged_op_finsert)|					\
 	  BIT_ULL(KEY_TYPE_logged_op_stripe_update)|				\
+	  BIT_ULL(KEY_TYPE_logged_op_inode_opt_propagate)|			\
 	  BIT_ULL(KEY_TYPE_inode_alloc_cursor),					\
 	  "In-progress logged operations for crash recovery")			\
 	x(reconcile_work,	18,						\
@@ -1404,7 +1408,8 @@ enum bch_sb_feature {
 	x(extents_above_btree_updates_done,	2)	\
 	x(bformat_overflow_done,		3)	\
 	x(no_stale_ptrs,			4)	\
-	x(stripe_frag_accounting,		5)
+	x(stripe_frag_accounting,		5)	\
+	x(inode_opts_propagated,		6)
 
 enum bch_sb_compat {
 #define x(f, n) BCH_COMPAT_##f,

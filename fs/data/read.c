@@ -720,10 +720,34 @@ static int rbio_mark_io_failure(struct bch_read_bio *rbio,
 	return ret;
 }
 
+/*
+ * data_read_csum_err is the terminal error - thrown by
+ * bch2_bkey_pick_read_device() once every replica has been tried and the
+ * failures were checksum errors. It is a sibling of the data_read_retry_*
+ * codes, not a descendant, so it has to be matched on its own: a read that
+ * recovered reports the retry code and one that didn't reports this, and
+ * missing it labels every unrecoverable checksum error an IO error.
+ */
 static bool data_read_err_is_csum(int ret)
 {
-	return bch2_err_matches(ret, BCH_ERR_data_read_retry_csum_err) ||
+	return bch2_err_matches(ret, BCH_ERR_data_read_csum_err) ||
+	       bch2_err_matches(ret, BCH_ERR_data_read_retry_csum_err) ||
 	       bch2_err_matches(ret, BCH_ERR_data_read_retry_csum_err_maybe_userspace);
+}
+
+/*
+ * The sb error id naming a failed read, for damage records: a file whose
+ * extents won't decompress is a different repair problem from one with bad
+ * checksums, and which compression type failed is the first thing we'd ask.
+ * @ret must be a failure - a recovered read is a different event.
+ */
+enum bch_sb_error_id bch2_data_read_sb_err(int ret)
+{
+	return bch2_err_matches(ret, BCH_ERR_decompress)
+		? bch2_decompress_sb_err(ret)
+		: data_read_err_is_csum(ret)
+		? BCH_FSCK_ERR_data_read_csum_err
+		: BCH_FSCK_ERR_data_read_io_err;
 }
 
 static void bch2_rbio_retry(struct work_struct *work)
@@ -855,14 +879,11 @@ static void bch2_rbio_retry(struct work_struct *work)
 			}
 
 			/*
-			 * Damage names the reason where we have one: a file
-			 * whose extents won't decompress is a different repair
-			 * problem from one with bad checksums, and which
-			 * compression type failed is the first thing we'd ask.
+			 * A read that recovered has nothing to name beyond the
+			 * outcome; one that failed names why it failed.
 			 */
-			enum bch_sb_error_id damage =
-				bch2_err_matches(ret, BCH_ERR_decompress)
-				? bch2_decompress_sb_err(ret)
+			enum bch_sb_error_id damage = ret
+				? bch2_data_read_sb_err(ret)
 				: e;
 
 			if (!rbio->data_update && inum.subvol && !bkey_deleted(&sk.k->k))
@@ -885,7 +906,7 @@ static int bch2_rbio_error(struct bch_read_bio *rbio, int ret)
 
 	if (!(rbio->flags & BCH_READ_in_retry)) {
 		if (data_read_err_should_retry(ret)) {
-			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_unbound_wq);
+			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_dfl_wq);
 		} else {
 			rbio = bch2_rbio_free(rbio);
 			rbio->ret = ret;
@@ -1173,7 +1194,7 @@ static void bch2_read_endio(struct bio *bio)
 	    rbio->promote ||
 	    crc_is_compressed(rbio->pick.crc) ||
 	    bch2_csum_type_is_encryption(rbio->pick.crc.csum_type))
-		context = RBIO_CONTEXT_UNBOUND,	wq = system_unbound_wq;
+		context = RBIO_CONTEXT_UNBOUND,	wq = system_dfl_wq;
 	else if (rbio->pick.crc.csum_type)
 		context = RBIO_CONTEXT_HIGHPRI,	wq = system_highpri_wq;
 
@@ -1714,7 +1735,7 @@ retry_pick:
 		trans->notrace_relock_fail = true;
 	} else {
 		if (!(flags & BCH_READ_in_retry)) {
-			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_unbound_wq);
+			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_dfl_wq);
 			return 0;
 		}
 

@@ -121,6 +121,12 @@ static inline subvol_inum inode_inum(const struct bch_inode_info *inode)
 #define EI_INODE_SNAPSHOT		1
 #define EI_INODE_HASHED			2
 
+/*
+ * Set by a truncate of a nonempty file to 0: start writeback on close. See
+ * DOC(replace-in-place) in fs.c:
+ */
+#define EI_INODE_FLUSH_ON_CLOSE		3
+
 #define to_bch_ei(_inode)					\
 	container_of_or_null(_inode, struct bch_inode_info, v)
 

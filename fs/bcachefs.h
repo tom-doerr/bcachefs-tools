@@ -55,11 +55,16 @@
 #include <linux/zstd.h>
 #include <linux/unicode.h>
 
-/* WQ_PERCPU is 6.17+; before that, per-cpu was the unflagged default: */
+/*
+ * WQ_PERCPU and system_dfl_wq are 6.17+ (128ea9f6ccfb): before that, per-cpu
+ * was the unflagged default and the unbound queue was system_unbound_wq. We
+ * support back to 6.16, so both need an alias there.
+ */
 #ifdef __KERNEL__
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,17,0)
 #define WQ_PERCPU	0
+#define system_dfl_wq	system_unbound_wq
 #endif
 #endif
 
@@ -101,6 +106,7 @@
 
 #include "fs/quota_types.h"
 
+#include "init/damage_types.h"
 #include "init/error_types.h"
 #include "init/passes_types.h"
 #include "init/dev_types.h"
@@ -612,6 +618,9 @@ struct bch_dev {
 	 */
 	atomic_t		alloc_wake_counter;
 
+	/* Buckets copygc has queued for evacuation on this device: */
+	atomic_t		copygc_in_flight;
+
 	unsigned		nr_open_buckets;
 	unsigned		nr_partial_buckets;
 	unsigned		nr_btree_reserve;
@@ -920,6 +929,10 @@ struct bch_fs {
 	darray_scrub_journal_repair		scrub_journal_repairs;
 	struct mutex				scrub_journal_repairs_lock;
 
+	/* Extents btree ranges from lost btree nodes, awaiting attribution */
+	darray_lost_extents_range		lost_extents_ranges;
+	struct mutex				lost_extents_ranges_lock;
+
 	struct bch_fs_compress	compress;
 	struct bch_fs_reconcile	reconcile;
 	struct bch_fs_copygc	copygc;
@@ -938,6 +951,13 @@ struct bch_fs {
 	struct bch_memquota_type quotas[QTYP_NR];
 
 	/* DEBUG JUNK */
+
+	/*
+	 * Test knob: KEY_TYPE_logged_op_* whose next cursor update should fail,
+	 * or 0. Armed via sysfs, one shot, disarms itself as it fires.
+	 */
+	unsigned		logged_op_fail_next;
+
 #ifdef CONFIG_DEBUG_FS
 	struct dentry		*fs_debug_dir;
 	struct dentry		*btree_debug_dir;

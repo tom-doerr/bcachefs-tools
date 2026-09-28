@@ -36,6 +36,96 @@ static const unsigned long BCH_BLKGETSIZE64	= BLKGETSIZE64;
 static const unsigned long BCH_BLKPBSZGET	= BLKPBSZGET;
 static const unsigned long BCH_BLKROTATIONAL	= BLKROTATIONAL;
 
+/*
+ * FS_IOC_GETFSSYSFSPATH is a generic VFS ioctl, so it's in neither the block
+ * list above nor the bcachefs inventory below - and it was open-coded in Rust
+ * as (2 << 30) | (size << 16) | (0x15 << 8) | 1, which is the same asm-generic
+ * restatement #904 was about, still wrong on ppc64le, three files from the fix.
+ * Reported by logan2611.
+ *
+ * It arrived in 6.11, so building against older headers means supplying it -
+ * but the fallback asks _IOR() rather than writing the bits down. We supply the
+ * struct; the target supplies the encoding.
+ *
+ * The opcode encodes sizeof(struct fs_sysfs_path), and Rust carries its own
+ * definition because linux/fs.h's types don't survive the bindgen blocklist. So
+ * export the size too: the two have to agree, and disagreeing would otherwise
+ * surface as an ENOTTY at runtime rather than an error at build time.
+ */
+#ifndef FS_IOC_GETFSSYSFSPATH
+struct fs_sysfs_path {
+	__u8			len;
+	__u8			name[128];
+};
+#define FS_IOC_GETFSSYSFSPATH	_IOR(0x15, 1, struct fs_sysfs_path)
+#endif
+
+static const unsigned long BCH_FS_IOC_GETFSSYSFSPATH = FS_IOC_GETFSSYSFSPATH;
+static const size_t BCH_SIZEOF_FS_SYSFS_PATH = sizeof(struct fs_sysfs_path);
+
+/*
+ * Same story for FIEMAP, one layer out: the fiemap crate had it as a literal
+ * 0xC020660B, so migrate and copy_fs couldn't read an extent map on any
+ * architecture that isn't asm-generic. We vendor that crate now (fs/vendor/
+ * fiemap) for this one line.
+ */
+#include <linux/fiemap.h>
+static const unsigned long BCH_FS_IOC_FIEMAP = FS_IOC_FIEMAP;
+
+/*
+ * bcachefs's own ioctl numbers, for the same reason: the generated Rust
+ * inventory used to compute these with a hand-written opcode(), which baked in
+ * asm-generic's layout - dir at bit 30, 14 size bits - and so was wrong on
+ * every architecture that doesn't use it. ppc64le got opcodes it answered with
+ * ENOTTY, and only the ones whose fields happened to line up worked (#904).
+ */
+#define BCH_IOCTL_BIND(_name)						\
+	static const unsigned bch_ioctl_op_##_name = _name
+
+BCH_IOCTL_BIND(BCH_IOCTL_QUERY_UUID);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_ADD);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_ADD_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_REMOVE);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_REMOVE_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_ONLINE);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_ONLINE_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_OFFLINE);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_OFFLINE_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_SET_STATE);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_SET_STATE_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_DATA);
+BCH_IOCTL_BIND(BCH_IOCTL_FS_USAGE);
+BCH_IOCTL_BIND(BCH_IOCTL_DEV_USAGE);
+BCH_IOCTL_BIND(BCH_IOCTL_READ_SUPER);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_GET_IDX);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE_JOURNAL);
+BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE_JOURNAL_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_CREATE);
+BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_CREATE_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_DESTROY);
+BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_DESTROY_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_DEV_USAGE_V2);
+BCH_IOCTL_BIND(BCH_IOCTL_FSCK_OFFLINE);
+BCH_IOCTL_BIND(BCH_IOCTL_FSCK_ONLINE);
+BCH_IOCTL_BIND(BCH_IOCTL_QUERY_ACCOUNTING);
+BCH_IOCTL_BIND(BCH_IOCTL_QUERY_COUNTERS);
+BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_LIST);
+BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_TO_PATH);
+BCH_IOCTL_BIND(BCH_IOCTL_SNAPSHOT_TREE);
+BCH_IOCTL_BIND(BCH_IOCTL_QUERY_BTREE_KEYS);
+BCH_IOCTL_BIND(BCH_IOCTL_SNAPSHOT_TREE_v2);
+BCH_IOCTL_BIND(BCH_IOCTL_RECOVERY_STATUS);
+BCH_IOCTL_BIND(BCHFS_IOC_REINHERIT_ATTRS);
+BCH_IOCTL_BIND(BCHFS_IOC_SET_REFLINK_P_MAY_UPDATE_OPTS);
+BCH_IOCTL_BIND(BCHFS_IOC_PROPAGATE_REFLINK_P_OPTS);
+BCH_IOCTL_BIND(BCHFS_IOC_PREAD_RAW);
+BCH_IOCTL_BIND(BCHFS_IOC_UNPOISON);
+BCH_IOCTL_BIND(BCHFS_IOC_GET_DAMAGE);
+BCH_IOCTL_BIND(BCHFS_IOC_READDIR_FLAGS);
+BCH_IOCTL_BIND(BCHFS_IOC_CLEAR_DAMAGE);
+
 struct bch_fs;
 struct bch_sb;
 struct bch_csum;

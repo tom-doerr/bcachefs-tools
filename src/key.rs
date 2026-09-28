@@ -331,17 +331,24 @@ impl Passphrase {
         let waited = crate::prompt::wait(stdin().as_fd(), None, watch);
 
         let mut line = Zeroizing::new(String::new());
-        let res = match waited {
-            Ok(Waited::Readable) => stdin().read_line(&mut line).map(|_| ()),
-            _ => Ok(()),
+        let read = match waited {
+            Ok(Waited::Readable) => stdin().read_line(&mut line),
+            _ => Ok(0),
         };
 
         termios::tcsetattr(stdin(), termios::OptionalActions::Flush, &old)?;
         eprintln!();
-        res?;
+        let read = read?;
 
         match waited? {
-            Waited::Readable => Ok(Some(Self::from_line(&line)?)),
+            Waited::Readable => {
+                // End of file, not an empty passphrase: stdin closed, or input
+                // that arrived before the prompt and was discarded by the flush
+                // above. Calling that a wrong passphrase sends whoever hits it
+                // looking for the wrong thing entirely.
+                ensure!(read > 0, "no passphrase read: end of file on stdin");
+                Ok(Some(Self::from_line(&line)?))
+            }
             // Moot and Timeout can't arrive: no timeout is passed, and nothing
             // withdraws a passphrase prompt.
             _ => Ok(None),
@@ -369,9 +376,14 @@ impl Passphrase {
         info!("Trying to read passphrase from stdin...");
 
         let mut line = Zeroizing::new(String::new());
-        stdin().read_line(&mut line)?;
+        // Zero bytes is end of file, not an empty passphrase: whoever piped us
+        // nothing would otherwise be told their passphrase was wrong.
+        ensure!(
+            stdin().read_line(&mut line)? > 0,
+            "no passphrase read: end of file on stdin"
+        );
 
-        Ok(Self(CString::new(line.trim_end_matches('\n'))?))
+        Self::from_line(&line)
     }
 
     pub fn read_from_file(passphrase_file: impl AsRef<Path>) -> Result<Self> {
@@ -384,13 +396,22 @@ impl Passphrase {
 
         let passphrase = Zeroizing::new(fs::read_to_string(passphrase_file)?);
 
-        Ok(Self(CString::new(passphrase.trim_end_matches('\n'))?))
+        Self::from_line(&passphrase)
     }
 
-    fn derive(&self, crypt: &bch_sb_field_crypt) -> bch_key {
+    /// Errors if the superblock's KDF parameters are unusable - notably when
+    /// the key was never wrapped with a passphrase, so nothing ever set them.
+    fn derive(&self, crypt: &bch_sb_field_crypt) -> Result<bch_key> {
         let crypt_ptr = (crypt as *const bch_sb_field_crypt).cast_mut();
+        let mut key = bch_key::default();
 
-        unsafe { bch_bindgen::c::derive_passphrase(crypt_ptr, self.get().as_ptr()) }
+        let ret = unsafe {
+            bch_bindgen::c::derive_passphrase(crypt_ptr, self.get().as_ptr(), &mut key)
+        };
+        ensure!(ret == 0, "deriving key from passphrase: {}",
+                crate::wrappers::bch_err_str(ret));
+
+        Ok(key)
     }
 
     /// Re-encrypt a filesystem key with this passphrase.
@@ -399,11 +420,11 @@ impl Passphrase {
         &self,
         sb: &bch_sb_handle,
         key: bch_key,
-    ) -> bch_encrypted_key {
+    ) -> Result<bch_encrypted_key> {
         let crypt = sb.sb().crypt().expect("called on encrypted fs");
         let mut new_key = bch_encrypted_key::new_unencrypted(key);
-        
-        let mut passphrase_key: bch_key = self.derive(crypt);
+
+        let mut passphrase_key: bch_key = self.derive(crypt)?;
 
         unsafe {
             bch2_chacha20(
@@ -414,7 +435,7 @@ impl Passphrase {
             )
         };
 
-        new_key
+        Ok(new_key)
     }
 
     pub fn check(&self, sb: &bch_sb_handle) -> Option<PassphraseCorrect> {
@@ -427,7 +448,13 @@ impl Passphrase {
             "sb_key should be encrypted when calling Passphrase::check",
         );
 
-        let mut passphrase_key: bch_key = self.derive(crypt);
+        // The key is encrypted (asserted above), so a passphrase was set on
+        // it, so the KDF parameters exist. Failing here means a corrupt
+        // superblock, not a wrong passphrase - returning None would report it
+        // as the latter.
+        let mut passphrase_key: bch_key = self
+            .derive(crypt)
+            .expect("sb key is encrypted, so its KDF parameters must be usable");
 
         let mut cleartext_sb_key = crypt.key().clone();
         unsafe {

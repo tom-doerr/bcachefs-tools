@@ -953,7 +953,13 @@ static inline struct bkey_s_c __bch2_bkey_get_typed(struct btree_iter *iter,
 static inline void __bkey_val_copy_pad(void *dst_v, unsigned dst_size, struct bkey_s_c src_k)
 {
 	unsigned b = min_t(unsigned, dst_size, bkey_val_bytes(src_k.k));
-	memcpy(dst_v, src_k.v, b);
+	/*
+	 * __bch2_bkey_get_i_typed() passes &bkey_i->v, and struct bch_val is
+	 * zero length: the bytes belong to the caller's bkey_i_<type>, which
+	 * fortify cannot see through a struct bkey_i pointer. b is clamped to
+	 * dst_size above, so the write stays within what the caller declared.
+	 */
+	unsafe_memcpy(dst_v, src_k.v, b, "bkey value, sized by the caller");
 	if (unlikely(b < dst_size))
 		memset(dst_v + b, 0, dst_size - b);
 }
@@ -1037,6 +1043,12 @@ u32 bch2_trans_begin(struct btree_trans *);
 			break;							\
 										\
 		_ret3 = (_do);							\
+		if (_ret3 == -BCH_ERR_fc_continue)				\
+			_ret3 = 0;						\
+		if (_ret3 == -BCH_ERR_fc_break) {				\
+			_ret3 = 0;						\
+			break;							\
+		}								\
 		if (_ret3)							\
 			continue;						\
 										\
@@ -1175,6 +1187,12 @@ static inline int btree_trans_too_many_iters(struct btree_trans *trans)
 			break;						\
 									\
 		_ret3 = bkey_err(_k) ?: (_do);				\
+		if (_ret3 == -BCH_ERR_fc_continue)			\
+			_ret3 = 0;					\
+		if (_ret3 == -BCH_ERR_fc_break) {			\
+			_ret3 = 0;					\
+			break;						\
+		}							\
 		if (!_ret3)						\
 			bch2_trans_verify_not_restarted(_trans, _restart_count);\
 	} while (bch2_err_matches(_ret3, BCH_ERR_transaction_restart) ||\

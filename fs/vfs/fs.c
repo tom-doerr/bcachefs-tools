@@ -142,11 +142,16 @@ static int bch2_write_inode_trans(struct btree_trans *trans,
 				  struct bch_inode_info *inode,
 				  inode_set_fn set,
 				  void *p, unsigned fields,
-				  bool *reconcile_changed)
+				  bool *reconcile_changed,
+				  struct bkey_i_logged_op_inode_opt_propagate *propagate)
 {
 	struct bch_fs *c = trans->c;
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bch_inode_unpacked inode_u;
+
+	/* First thing: a restart discards the update, so it can't stay armed */
+	bkey_init(&propagate->k);
+
 	try(bch2_inode_peek(trans, &iter, &inode_u, inode_inum(inode), BTREE_ITER_intent));
 
 	struct bch_extent_reconcile old_r = bch2_inode_reconcile_opts_get(c, &inode_u);
@@ -158,11 +163,21 @@ static int bch2_write_inode_trans(struct btree_trans *trans,
 
 	struct bch_extent_reconcile new_r = bch2_inode_reconcile_opts_get(c, &inode_u);
 	*reconcile_changed = memcmp(&old_r, &new_r, sizeof(new_r));
-	if (*reconcile_changed)
+	if (*reconcile_changed) {
 		try(bch2_set_reconcile_needs_scan_trans(trans,
 				(struct reconcile_scan) {
 					.type = RECONCILE_SCAN_inum,
 					.inum = inode_u.bi_inum }));
+		/*
+		 * Data written before this subvolume branched off is keyed at
+		 * an ancestor snapshot, and takes its options from the inode
+		 * version there: the new options have to be pushed up to reach
+		 * it. iter.snapshot, not inode_u.bi_snapshot - peek() can find
+		 * the key at an ancestor, but we write here.
+		 */
+		try(bch2_inode_opt_propagate_start(trans, inode_u.bi_inum,
+						   iter.snapshot, propagate));
+	}
 
 	try(bch2_inode_write(trans, &iter, &inode_u));
 	try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
@@ -182,17 +197,24 @@ int __must_check bch2_write_inode(struct bch_fs *c,
 {
 	CLASS(btree_trans, trans)(c);
 	bool reconcile_changed = false;
-	int ret = lockrestart_do(trans, bch2_write_inode_trans(trans, inode, set, p,
-							       fields, &reconcile_changed));
+	/* On the stack: it has to outlive the commit that inserts it */
+	struct bkey_i_logged_op_inode_opt_propagate propagate;
 
-	if (!ret && reconcile_changed)
-		bch2_reconcile_wakeup(c, RECONCILE_KICK_inode_opts);
+	int ret = lockrestart_do(trans, bch2_write_inode_trans(trans, inode, set, p, fields,
+							       &reconcile_changed, &propagate));
 
 	bch2_fs_fatal_err_on(bch2_err_matches(ret, ENOENT), c,
 			     "%s: inode %llu:%llu not found when updating",
 			     bch2_err_str(ret),
 			     inode_inum(inode).subvol,
 			     inode_inum(inode).inum);
+
+	if (!ret) {
+		if (propagate.k.type == KEY_TYPE_logged_op_inode_opt_propagate)
+			ret = bch2_inode_opt_propagate_finish(trans, &propagate);
+		if (reconcile_changed)
+			bch2_reconcile_wakeup(c, RECONCILE_KICK_inode_opts);
+	}
 
 	return ret < 0 ? ret : 0;
 }
@@ -1784,6 +1806,63 @@ static int bch2_open(struct inode *vinode, struct file *file)
 	return generic_file_open(vinode, file);
 }
 
+/* DOC(replace-in-place)
+ *
+ * Applications commonly replace a file's contents in one of two ways, often
+ * without fsync. POSIX promises nothing for either, but both get special
+ * handling, as they do on ext4, XFS and btrfs - in one case more strongly.
+ *
+ * **Write a temporary file, then rename it over the original.** When a
+ * rename overwrites an existing file, bcachefs first completes writeback of
+ * the source file's data, so the data's extents are journalled before the
+ * rename is. Combined with prefix consistency this makes the replacement
+ * atomic and complete without any fsync: after a crash, either the old file
+ * is intact, or the rename happened and all of the new file's data is
+ * present; the empty-or-truncated-file outcome cannot occur. This orders the
+ * rename behind the data but does not make the rename itself durable (no
+ * journal flush is issued); an application that must know the replacement has
+ * happened still needs fsync. Plain renames that don't overwrite anything get
+ * no implicit writeback.
+ *
+ * This is stronger than the other filesystems: ext4 (`auto_da_alloc`) and
+ * btrfs only start writeback of the source on an overwriting rename without
+ * waiting for it, so a crash shortly afterwards can still recover an empty
+ * file, and XFS does nothing here. The cost is that each overwriting rename
+ * waits for its source's data to be written, which shows up in workloads that
+ * replace many files this way, such as package managers.
+ *
+ * **Truncate and rewrite** (`O_TRUNC`). Some applications replace a file by
+ * opening it with `O_TRUNC`, writing the new contents and closing it, without
+ * fsync. The truncate is journalled within `journal_flush_delay` (default one
+ * second), but the new data can stay in the page cache for the dirty writeback
+ * delay (default thirty seconds). A crash in between recovers an empty file:
+ * both the old and the new contents are lost.
+ *
+ * As a workaround, as on ext4, XFS and btrfs, truncating a nonempty file to
+ * zero length makes the next close start writeback of the file's data.
+ *
+ * This is an implicit fsync on close, minus waiting for the writeback and
+ * minus the journal commit, and it does not make the pattern safe. The file is
+ * empty on disk from the moment the truncate is journalled until the new data
+ * is written back, and a crash anywhere in that interval still loses both
+ * versions; no flush can prevent that, it can only shorten the interval.
+ *
+ * Applications that do this and need the old or the new contents to survive a
+ * crash are buggy, on every filesystem, and need to be fixed. The correct way
+ * to replace a file is to write the new contents to a new file - a temporary
+ * file, or an `O_TMPFILE` given a name with `linkat` - and rename it over the
+ * old one, fsyncing the new file first if the new contents must be durable.
+ */
+
+static int bch2_release(struct inode *vinode, struct file *file)
+{
+	struct bch_inode_info *inode = to_bch_ei(vinode);
+
+	if (test_and_clear_bit(EI_INODE_FLUSH_ON_CLOSE, &inode->ei_flags))
+		filemap_flush(vinode->i_mapping);
+	return 0;
+}
+
 /* bcachefs inode flags -> FS_IOC_GETFLAGS: */
 static const __maybe_unused unsigned bch_flags_to_uflags[] = {
 	[__BCH_INODE_sync]		= FS_SYNC_FL,
@@ -1933,6 +2012,7 @@ err:
 
 static const struct file_operations bch_file_operations = {
 	.open		= bch2_open,
+	.release	= bch2_release,
 	.llseek		= bch2_llseek,
 	.read_iter	= bch2_read_iter,
 	.write_iter	= bch2_write_iter,
@@ -3247,8 +3327,12 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 
 			sb->s_flags |= SB_RDONLY;
 		} else {
+			/* __bch2_fs_read_write() gates reconcile on this: */
+			c->opts.read_only = false;
+
 			ret = bch2_fs_read_write(c);
 			if (ret) {
+				c->opts.read_only = true;
 				/* bch_err() says which filesystem, errorfc() reaches
 				 * the caller; the throw below discards the errcode. */
 				bch_err(c, "error going read-write: %s", bch2_err_str(ret));

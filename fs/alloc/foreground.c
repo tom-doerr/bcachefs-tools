@@ -357,10 +357,10 @@ static struct open_bucket *try_alloc_bucket_pos(struct btree_trans *trans,
 	u8 gen;
 	u64 journal_seq_empty;
 	int ret = bch2_check_freespace_key_async(trans, &iter, &gen, &journal_seq_empty);
-	if (ret < 0)
-		return ERR_PTR(ret);
-	if (ret)
+	if (ret == -BCH_ERR_bucket_not_allocatable)
 		return NULL;
+	if (ret)
+		return ERR_PTR(ret);
 
 	if (!may_alloc_bucket_journal_seq(c, req, journal_seq_empty))
 		return NULL;
@@ -665,7 +665,7 @@ static noinline __cold void bucket_alloc_to_text(struct printbuf *out,
 		prt_printf(out, "dev\t%s (%u)\n",	req->ca->name, req->ca->dev_idx);
 		prt_printf(out, "avail\t%llu\n",	__dev_buckets_free(req->ca, req->usage, req->watermark));
 		scoped_guard(percpu_read_noio, &c->capacity.mark_lock)
-			prt_printf(out, "copygc dev wait\t%lli\n", bch2_copygc_dev_wait_amount(req->ca));
+			prt_printf(out, "copygc dev wait\t%lli\n", bch2_copygc_dev_wait_amount(req->ca, NULL));
 	}
 
 	prt_printf(out, "watermark\t%s\n",	bch2_watermarks[req->watermark]);
@@ -1168,39 +1168,49 @@ int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
  * it's to a device we don't want:
  */
 
-static int bucket_alloc_from_stripe(struct btree_trans *trans,
-				    struct alloc_request *req)
+/*
+ * Claim a block of @s: the first one on a device we may allocate from that
+ * nobody else has taken. 0 without claiming anything means this stripe has
+ * nothing for us - its free blocks are all on devices we're excluded from.
+ */
+static int stripe_alloc_bucket(struct bch_fs *c, struct alloc_request *req,
+			       struct ec_stripe_new *s)
 {
-	struct bch_fs *c = trans->c;
-	int ret = 0;
-
-	struct ec_stripe_head *h = errptr_try(bch2_ec_stripe_head_get(trans, req, 0));
-	if (!h)
-		return 0;
-
-	bch2_dev_alloc_list(c, &req->wp->stripe, req);
-
 	darray_for_each(req->devs_sorted, i)
-		for (unsigned ec_idx = 0; ec_idx < ec_stripe_new_nr_data(h->s); ec_idx++) {
-			if (!h->s->blocks[ec_idx])
+		for (unsigned ec_idx = 0; ec_idx < ec_stripe_new_nr_data(s); ec_idx++) {
+			if (!s->blocks[ec_idx])
 				continue;
 
-			struct open_bucket *ob = c->allocator.open_buckets + h->s->blocks[ec_idx];
-			if (ob->dev == *i && !test_and_set_bit(ec_idx, h->s->blocks_allocated)) {
+			struct open_bucket *ob = c->allocator.open_buckets + s->blocks[ec_idx];
+			if (ob->dev == *i && !test_and_set_bit(ec_idx, s->blocks_allocated)) {
 				ob->ec_idx	= ec_idx;
-				ob->ec		= h->s;
-				ec_stripe_new_get(h->s, STRIPE_REF_io);
+				ob->ec		= s;
+				ec_stripe_new_get(s, STRIPE_REF_io);
 
-				ret = add_new_bucket(c, req, ob);
+				int ret = add_new_bucket(c, req, ob);
 
 				event_inc_trace(c, bucket_alloc_from_stripe, buf, ({
 					bch2_open_bucket_to_text(&buf, c, ob);
 				}));
 
-				goto out;
+				return ret;
 			}
 		}
-out:
+
+	return 0;
+}
+
+static int bucket_alloc_from_stripe(struct btree_trans *trans,
+				    struct alloc_request *req)
+{
+	struct bch_fs *c = trans->c;
+
+	struct ec_stripe_head *h = errptr_try(bch2_ec_stripe_head_get(trans, req, 0));
+
+	bch2_dev_alloc_list(c, &req->wp->stripe, req);
+
+	int ret = stripe_alloc_bucket(c, req, h->s);
+
 	bch2_ec_stripe_head_put(c, h);
 	return ret;
 }
@@ -1697,6 +1707,21 @@ retry:
 
 		ret = min(ret, 0); /* We return 1 earlier to terminate allocating */
 
+		/*
+		 * Has to come before the retry branches below: they're gated on
+		 * ret, and the first clears req->target - a targeted write would
+		 * spill outside its target instead of replicating within it.
+		 */
+		if (bch2_err_matches(ret, BCH_ERR_ec_alloc_failed)) {
+			if (req->flags & BCH_WRITE_must_ec)
+				goto err;
+
+			req->ec				= false;
+			req->will_retry_target_devices	= true;
+			req->will_retry_all_devices	= req->target && !(req->flags & BCH_WRITE_only_specified_devs);
+			continue;
+		}
+
 		if (ret &&
 		    !bch2_err_matches(ret, BCH_ERR_freelist_empty) &&
 		    !bch2_err_matches(ret, BCH_ERR_insufficient_devices))
@@ -1722,7 +1747,7 @@ retry:
 
 		if (req->nr_effective < req->nr_replicas && req->ec) {
 			if ((req->flags & BCH_WRITE_must_ec)) {
-				ret = bch_err_throw(c, ec_alloc_failed);
+				ret = bch_err_throw(c, ec_alloc_failed_no_usable_block);
 				goto err;
 			}
 
@@ -1759,7 +1784,7 @@ retry:
 	if (req->ec &&
 	    (req->flags & BCH_WRITE_must_ec) &&
 	    !ec_open_bucket(c, &req->ptrs)) {
-		ret = bch_err_throw(c, ec_alloc_failed);
+		ret = bch_err_throw(c, ec_alloc_failed_no_ec_bucket);
 		goto err;
 	}
 
@@ -2131,7 +2156,7 @@ static inline bool dev_may_alloc(struct bch_fs *c, struct bch_dev *ca, struct al
 			return false;
 	}
 
-	return ca->mi.state == BCH_MEMBER_STATE_rw &&
+	return bch2_dev_is_rw(ca) &&
 		bch2_dev_is_online(ca) &&
 		(ca->mi.data_allowed & BIT(req->data_type));
 }

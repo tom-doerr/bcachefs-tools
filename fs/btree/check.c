@@ -146,8 +146,9 @@ static int set_node_min(struct bch_fs *c, struct btree *b, struct bpos new_min)
 	return 0;
 }
 
-static int set_node_max(struct bch_fs *c, struct btree *b, struct bpos new_max)
+static int set_node_max(struct btree_trans *trans, struct btree *b, struct bpos new_max)
 {
+	struct bch_fs *c = trans->c;
 	struct bkey_i_btree_ptr_v2 *new;
 
 	if (c->opts.verbose) {
@@ -181,10 +182,42 @@ static int set_node_max(struct bch_fs *c, struct btree *b, struct bpos new_max)
 
 	struct bch_fs_btree_cache *bc = &c->btree.cache;
 
+	/*
+	 * max_key is b->key.k.p, which is the cache's hash key - so unlike
+	 * set_node_min() this has to leave the hash table and come back.
+	 * Unhashing asserts SIX_LOCK_write, callers hold read, and six won't
+	 * upgrade; roots additionally can't be unhashed while flagged.
+	 */
+	bool permanent = btree_node_permanent(b);
+	if (permanent) {
+		scoped_guard(mutex_noio, &bc->lock)
+			clear_btree_node_permanent(b);
+	}
+
+	six_unlock_read(&b->c.lock);
+
+	trans->locking_hash_val = 0;
+	trans->locking_root_id	= -1;
+	btree_node_lock_nopath(trans, &b->c, SIX_LOCK_intent, true, _THIS_IP_, false);
+	btree_node_lock_nopath(trans, &b->c, SIX_LOCK_write, true, _THIS_IP_, false);
+
 	/* unhash, rehash */
 	BUG_ON(bch2_btree_node_transition_state(bc, b, BTREE_NODE_CACHE_FREEABLE));
 	bkey_copy(&b->key, &new->k_i);
 	BUG_ON(bch2_btree_node_transition_state(bc, b, btree_node_live_state(b)));
+
+	six_unlock_write(&b->c.lock);
+	six_unlock_intent(&b->c.lock);
+	btree_node_lock_nopath(trans, &b->c, SIX_LOCK_read, true, _THIS_IP_, false);
+
+	/*
+	 * Still the root - but it was on bc->freeable with roots_b[] pointing at
+	 * it, which only single-threaded recovery makes safe.
+	 */
+	if (permanent) {
+		scoped_guard(mutex_noio, &bc->lock)
+			set_btree_node_permanent(b);
+	}
 	return 0;
 }
 
@@ -270,7 +303,7 @@ static int btree_check_node_boundaries(struct btree_trans *trans, struct btree *
 				if (mustfix_fsck_err(trans, btree_node_topology_bad_max_key,
 						     "btree node with incorrect max_key%s", buf.buf)) {
 					try(commit_topology_repair_log(trans));
-					return set_node_max(c, prev, bpos_predecessor(cur->data->min_key));
+					return set_node_max(trans, prev, bpos_predecessor(cur->data->min_key));
 				}
 			}
 		} else {
@@ -314,7 +347,7 @@ static int btree_check_root_boundaries(struct btree_trans *trans, struct btree *
 	if (mustfix_fsck_err_on(!bpos_eq(b->data->max_key, SPOS_MAX),
 				trans, btree_node_topology_bad_root_max_key,
 			     "btree root with incorrect min_key%s", buf.buf))
-		try(set_node_max(c, b, SPOS_MAX));
+		try(set_node_max(trans, b, SPOS_MAX));
 fsck_err:
 	return ret;
 }
@@ -349,7 +382,7 @@ static int btree_repair_node_end(struct btree_trans *trans, struct btree *b, str
 		if (nodes_found)
 			return bch_err_throw(c, topology_repair_did_fill_from_scan);
 		else
-			return set_node_max(c, child, b->key.k.p);
+			return set_node_max(trans, child, b->key.k.p);
 	}
 fsck_err:
 	return ret;
@@ -687,14 +720,34 @@ recover:
 		six_unlock_read(&b->c.lock);
 
 		if (bch2_err_matches(ret, BCH_ERR_topology_repair_drop_this_node)) {
-			bch2_btree_node_transition_state(&c->btree.cache, b,
-								  BTREE_NODE_CACHE_FREEABLE);
-
+			/*
+			 * Undo bch2_btree_set_root_inmem() before dropping the
+			 * node: the cache state machine BUG_ONs on reclaiming a
+			 * node that still says it's a root.
+			 */
 			scoped_guard(mutex, &c->btree.cache.root_lock) {
 				r->b = NULL;
 				if (likely(i < BTREE_ID_NR))
 					WRITE_ONCE(c->btree.cache.roots_b[i], 0);
 			}
+
+			scoped_guard(mutex_noio, &c->btree.cache.lock)
+				clear_btree_node_permanent(b);
+
+			/*
+			 * Unhashing asserts SIX_LOCK_write even here, where
+			 * recovery is the only thing running:
+			 */
+			trans->locking_hash_val = 0;
+			trans->locking_root_id	= -1;
+			btree_node_lock_nopath(trans, &b->c, SIX_LOCK_intent, true, _THIS_IP_, false);
+			btree_node_lock_nopath(trans, &b->c, SIX_LOCK_write, true, _THIS_IP_, false);
+
+			bch2_btree_node_transition_state(&c->btree.cache, b,
+								  BTREE_NODE_CACHE_FREEABLE);
+
+			six_unlock_write(&b->c.lock);
+			six_unlock_intent(&b->c.lock);
 
 			if (!reconstructed_root) {
 				r->error = -EIO;
@@ -1251,21 +1304,39 @@ int bch2_gc_gens(struct bch_fs *c)
 			ca->oldest_gen[b] = gens->b[b];
 	}
 
-	for (unsigned i = 0; i < BTREE_ID_NR; i++)
-		if (btree_type_has_data_ptrs(i)) {
-			c->gc_gens.pos = BBPOS(i, POS_MIN);
+	/*
+	 * Dropping a stale pointer is not an allocation, but the reconcile
+	 * trigger may pad the key with invalid-device pointers to restore its
+	 * accounted durability, and charges extra_disk_res for those - so the
+	 * commit needs a reservation to put the charge in. Released per key so
+	 * it can't accumulate across the walk.
+	 *
+	 * Scoped to just this walk: nothing below uses it, and @err is reachable
+	 * from above it - a goto into the scope of a __cleanup__ variable, past
+	 * its initializer, is a clang error and would run the destructor on an
+	 * uninitialized res.
+	 */
+	{
+		CLASS(disk_reservation, res)(c);
 
-			ret = bch2_trans_run(c,
-				for_each_btree_key_commit(trans, iter, i,
-						POS_MIN,
-						BTREE_ITER_prefetch|BTREE_ITER_all_snapshots,
-						k,
-						NULL, NULL,
-						BCH_TRANS_COMMIT_no_enospc,
-					gc_btree_gens_key(trans, &iter, k)));
-			if (ret)
-				goto err;
-		}
+		for (unsigned i = 0; i < BTREE_ID_NR; i++)
+			if (btree_type_has_data_ptrs(i)) {
+				c->gc_gens.pos = BBPOS(i, POS_MIN);
+
+				ret = bch2_trans_run(c,
+					for_each_btree_key_commit(trans, iter, i,
+							POS_MIN,
+							BTREE_ITER_prefetch|BTREE_ITER_all_snapshots,
+							k,
+							&res.r, NULL,
+							BCH_TRANS_COMMIT_no_enospc, ({
+						bch2_disk_reservation_put(c, &res.r);
+						gc_btree_gens_key(trans, &iter, k);
+					})));
+				if (ret)
+					goto err;
+			}
+	}
 
 	struct bch_dev *ca = NULL;
 	ret = bch2_trans_run(c,

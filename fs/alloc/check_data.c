@@ -14,6 +14,7 @@
 #include "data/ec/trigger.h"
 #include "data/extents.h"
 
+#include "init/damage.h"
 #include "init/error.h"
 #include "init/recovery.h"
 
@@ -73,11 +74,26 @@ int bch2_bkey_drop_device_and_update(struct btree_trans *trans, enum btree_id bt
 		CLASS(printbuf, buf)();
 		prt_printf(&buf, "btree node with no readable replicas, dropping pointer:\n");
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(n));
+		bch2_damage_note_lost_extents(c, btree, bkey_i_to_s_c(n));
 		return bch2_btree_lost_data(c, &buf, btree);
 	}
 
-	if (!bch2_bkey_can_read(c, bkey_i_to_s_c(n)))
+	/*
+	 * The drop cost the key its last readable replica - the caller decided
+	 * to drop, only we can see what it cost. Counting as well as recording,
+	 * because nothing upstream counts this one: recording alone would name
+	 * files in the damage btree against an error the superblock counters
+	 * have never heard of.
+	 *
+	 * Every caller passes double_allocation; a new cause wants its own sb
+	 * error id, since that's what the user reads back out of the damage
+	 * btree.
+	 */
+	if (!bch2_bkey_can_read(c, bkey_i_to_s_c(n))) {
 		bch2_set_bkey_error(c, n, error);
+		try(bch2_damage_record_data_loss(trans, btree, n->k.p,
+						 BCH_FSCK_ERR_data_lost_double_allocation));
+	}
 
 	CLASS(btree_node_iter, iter)(trans, btree, n->k.p, 0, level, BTREE_ITER_intent);
 	return bch2_btree_iter_traverse(&iter) ?:
@@ -172,7 +188,10 @@ found:
 	prt_str(&buf, " ");
 	bch2_bkey_val_to_text(&buf, c, extent2);
 
-	if (fsck_err(trans, dup_backpointer_to_bad_csum_extent, "%s", buf.buf))
+	/* only an extents position names an inum; elsewhere report without recording */
+	struct bpos damage_pos = btree == BTREE_ID_extents ? extent.k->p : POS_MIN;
+
+	if (inode_fsck_err(trans, damage_pos, dup_backpointer_to_bad_csum_extent, "%s", buf.buf))
 		ret = bch2_bkey_drop_device_and_update(trans, btree, level, extent, dev,
 						       KEY_TYPE_ERROR_double_allocation) ?: 1;
 fsck_err:

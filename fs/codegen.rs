@@ -49,7 +49,7 @@ const ALLOWLIST_FUNCTION: &[&str] = &[
 const BLOCKLIST_FUNCTION: &[&str] = &["bch2_prt_vprintf", ".*bch2_snapshot_id_state"];
 const BLOCKLIST_TYPE: &[&str] = &["bch_ioctl_data_event", "bch_replicas_padded__bindgen_ty_.*"];
 const BLOCKLIST_ITEM: &[&str] = &["bch2_bkey_ops"];
-const ALLOWLIST_VAR: &[&str] = &["BCH_.*", "BTREE_MAX_DEPTH", "KEY_SPEC_.*", "Fix753_.*", "bch.*", "__bch2.*", "__BTREE_ITER.*", "BTREE_ITER.*"];
+const ALLOWLIST_VAR: &[&str] = &["BCH_.*", "BTREE_MAX_DEPTH", "KEY_SPEC_.*", "bch.*", "__bch2.*", "__BTREE_ITER.*", "BTREE_ITER.*"];
 const ALLOWLIST_TYPE: &[&str] = &["bch_.*", "bkey_i_.*", "bkey_s_c_.*", "bkey_s_.*", "btree_flags", "disk_accounting_type", "fsck_err_opts", "nonce", "sb_names",
     // genradix: kernel::bindings doesn't bind it, so we emit it ourselves from a
     // build-time copy of the kernel header (see run_bindgen + fs/Makefile).
@@ -231,8 +231,8 @@ fn regex_escape(s: &str) -> String {
 }
 
 /// Default blocklist dirs for the userspace build: types from the kernel-compat
-/// `include/` shim and from system headers are resolved through bcachefs-shim,
-/// not re-emitted. The kernel build passes its own header trees instead.
+/// `include/` shim are resolved through bcachefs-shim, not re-emitted. The
+/// kernel build passes its own header trees instead.
 ///
 /// Why path regexes and not something structural: bindgen has no notion of
 /// "system header" (nothing keyed off -isystem), only file-path patterns. And
@@ -241,23 +241,43 @@ fn regex_escape(s: &str) -> String {
 /// in the tree - which breaks on functions whose signatures use
 /// structs-defined-within-structs (bindgen's mangled names for those aren't
 /// real C types, so the generated extern.c doesn't compile). Curated
-/// allowlists pick the roots; these patterns prune dependencies back to the
+/// allowlists pick the roots; this pattern prunes dependencies back to the
 /// shim.
 ///
-/// The patterns keep a leading wildcard so sysroot'd cross builds stay
-/// covered (--sysroot puts system headers at $sysroot/usr/include), but
-/// require the /usr/include (etc.) path component: a bare `.*/usr/.*` also
-/// matched source trees under paths like /usr/src/RPM/BUILD (#801). On
-/// distros where system headers live elsewhere entirely (NixOS: /nix/store)
-/// these are inert and the shim include/ entry does all the pruning - do NOT
-/// "fix" that with a store-path pattern, nix builds put the source tree in
-/// the store too, which is #801 all over again.
+/// System headers are deliberately *not* blocklisted. They used to be
+/// (`.*/usr/include/.*` and friends), which meant the bindings differed by
+/// distro: on NixOS the patterns never matched anything, so `__u32`/`__le64`
+/// were emitted normally, while everywhere else they were pruned - and bindgen
+/// can't see across a blocklist that a pruned type is Copy, so it dropped
+/// Copy/Clone/Debug from every struct holding one and demoted their containing
+/// unions to the `__BindgenUnionField` fallback. Harmless until bindgen 0.73
+/// gave that fallback's storage a `#[repr(align)]`, which a `#[repr(packed)]`
+/// parent rejects outright (E0588 on bch_dirent, bch_ioctl_data).
+///
+/// Emitting them costs nothing: the allowlists bound what gets generated, so
+/// only the system types our own structs actually reference come through, and
+/// the primitives are type aliases, which are transparent - `__u32` here and
+/// `__u32` from the shim are the same type. Verified by generating on Arch and
+/// NixOS: identical type surfaces.
 pub fn default_blocklist(src: &str) -> Vec<String> {
-    let include_dir = format!("{}/include", parent(src));
-    vec![format!("{}/.*", regex_escape(&include_dir)),
-         ".*/usr/include/.*".to_string(),
-         ".*/usr/local/include/.*".to_string(),
-         ".*/usr/lib/.*".to_string()]
+    vec![blocklist_dir(&format!("{}/include", parent(src)))]
+}
+
+/// A `--blocklist-file` regex for everything under `dir` — except its `uapi/`
+/// subtree, which must stay visible for the reason above.
+///
+/// The kernel build can't simply drop its blocklist the way userspace did: the
+/// trees it names hold the kernel's own structs — `inode`, `super_block`, `bio`
+/// — and `kernel::bindings` already binds those, so a second copy would be a
+/// different type and nothing would link. But the only part of them bcachefs
+/// reaches is `uapi/`, and there it's scalar typedefs, which are transparent.
+/// So the tree stays blocklisted and the uapi half is carved out.
+///
+/// bindgen matches these with the `regex` crate, which has no lookahead, so
+/// "under `dir` but not under `dir/uapi/`" is spelled as an alternation over the
+/// prefixes of `uapi/` that can't be completed.
+fn blocklist_dir(dir: &str) -> String {
+    format!(r"{}/(?:[^u]|u(?:[^a]|a(?:[^p]|p(?:[^i]|i[^/])))).*", regex_escape(dir))
 }
 
 /// Generate the x-macro-derived *_gen.rs files from the *_format.h headers.
@@ -447,13 +467,6 @@ pub fn gen_xmacros(src: &str, out: &str) {
         generate_btree_ids_known(&btree_ids),
     )
     .expect("write btree_ids_gen.rs");
-
-    let ioctl_h = std::fs::read_to_string(format!("{src}/bcachefs_ioctl.h"))
-        .expect("reading bcachefs_ioctl.h");
-    let ioctls = parse_ioctls(&ioctl_h);
-    assert!(!ioctls.is_empty(), "failed to parse any _IO*() defines");
-    std::fs::write(format!("{out}/ioctls_gen.rs"), generate_ioctls(&ioctls))
-        .expect("write ioctls_gen.rs");
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,14 +1084,9 @@ fn snake_to_pascal(s: &str) -> String {
     out
 }
 
-/// Replaces the two bindgen-library callbacks (Fix753 item-name strip +
-/// blocklisted_type_implements_trait) plus packed_and_align_fix, as pure
-/// post-processing on the generated text.
+/// Replaces the blocklisted_type_implements_trait bindgen-library callback plus
+/// packed_and_align_fix, as pure post-processing on the generated text.
 fn post_process(src: String, ptr_width: &str) -> String {
-    // Fix753: the headers wrap bindgen-issue-753 items as `Fix753_X`; the
-    // library callback strips the prefix. Do it textually.
-    let src = src.replace("Fix753_", "");
-
     // The blocklisted_type_implements_trait callback's *entire* effect is keeping
     // derives on bpos/bbpos (every other primitive-bearing struct is generated
     // but never derive-used). Re-add exactly those, with the same sets the
@@ -1132,13 +1140,40 @@ fn readd_derives(src: String) -> String {
 fn packed_and_align_fix(bindings: String, ptr_width: &str) -> String {
     const PACKED_TO_ALIGN8: &[&str] =
         &["btree_node", "bch_extent_crc128", "jset", "btree_node_entry", "bch_sb"];
+    // bindgen emulates a union as a struct of PhantomData fields over a
+    // `[u64; N]`, so its alignment is the array's: 8 on x86_64, but 4 on i386,
+    // where the ABI aligns u64 to 4. Types whose C alignment is 8 there anyway
+    // - because they say __aligned(8) - therefore fail bindgen's own alignment
+    // assertion, and can only be fixed on the Rust side.
     const ALIGN8_32BIT: &[&str] =
         &["btree_node__bindgen_ty_1", "btree_node_entry__bindgen_ty_1",
-          "bch_ioctl_query_accounting"];
-
+          "bch_ioctl_query_accounting", "bch_extent_crc"];
     let mut lines: Vec<String> = bindings.lines().map(str::to_owned).collect();
 
     for i in 0..lines.len() {
+        /*
+         * bindgen >= 0.73 wraps padding in `__BindgenOpaqueArrayN<[u8; N]>`,
+         * declared `#[repr(C, align(N))]`. Padding is emitted to reproduce the
+         * C layout, so forcing alignment on it changes the layout it exists to
+         * preserve - bch_fs_allocator gains 128 bytes, bch_fs_btree 64, and
+         * bch_fs both. Unwrap to the bare array, which is what 0.72 emitted.
+         *
+         * Only padding: the same wrapper holds union storage and opaque blobs,
+         * where the alignment is the C type's and has to stay.
+         *
+         * Textual, and safe to be: bindgen emits a size *and* an alignment
+         * assertion per type, both computed from C, so a layout this gets wrong
+         * fails to compile and names the type.
+         */
+        if let Some((field, ty)) = lines[i].split_once(": __BindgenOpaqueArray") {
+            if field.trim_start().starts_with("pub __bindgen_padding_") {
+                if let Some(inner) = ty.split_once('<').and_then(|(_, r)| r.rsplit_once('>')) {
+                    lines[i] = format!("{field}: {}{}", inner.0, inner.1);
+                    continue;
+                }
+            }
+        }
+
         let Some(rest) = lines[i].strip_prefix("pub struct ") else { continue };
         let Some(name) = rest.split([' ', '{', '<']).next() else { continue };
 
@@ -1165,96 +1200,6 @@ fn packed_and_align_fix(bindings: String, ptr_width: &str) -> String {
 
     let mut out = lines.join("\n");
     out.push('\n');
-    out
-}
-
-/// One `#define BCH_IOCTL_* _IO*(0xbc, nr[, type])` from bcachefs_ioctl.h.
-struct IoctlDef {
-    name: String,
-    /// _IOC direction bits: 1 = kernel reads the argument (_IOW),
-    /// 2 = kernel writes it (_IOR), 3 = both (_IOWR), 0 = no argument.
-    dir:  u32,
-    nr:   u32,
-    /// Rust type of the argument; None for _IO().
-    arg:  Option<String>,
-}
-
-fn parse_ioctls(header: &str) -> Vec<IoctlDef> {
-    let mut out = Vec::new();
-    for line in header.lines() {
-        let Some(rest) = line.strip_prefix("#define ") else { continue };
-        let mut it = rest.splitn(2, char::is_whitespace);
-        let (Some(name), Some(body)) = (it.next(), it.next()) else { continue };
-        let Some((mac, args)) = body.trim().split_once('(') else { continue };
-        let dir = match mac.trim() {
-            "_IO"   => 0,
-            "_IOW"  => 1,
-            "_IOR"  => 2,
-            "_IOWR" => 3,
-            _ => continue,
-        };
-        let Some(args) = args.trim_end().strip_suffix(')') else { continue };
-        let args: Vec<&str> = args.splitn(3, ',').map(str::trim).collect();
-        assert_eq!(args[0], "0xbc", "{name}: unexpected ioctl magic {}", args[0]);
-        let nr: u32 = args[1].parse()
-            .unwrap_or_else(|_| panic!("{name}: bad ioctl nr {}", args[1]));
-        let arg = (args.len() > 2).then(|| ioctl_arg_to_rust(name, args[2]));
-        assert_eq!(arg.is_none(), dir == 0, "{name}: _IO() iff no argument");
-        out.push(IoctlDef { name: name.to_string(), dir, nr, arg });
-    }
-    out
-}
-
-fn ioctl_arg_to_rust(name: &str, ty: &str) -> String {
-    if let Some(s) = ty.strip_prefix("struct ") {
-        format!("c::{}", s.trim())
-    } else if ty == "const char __user *" {
-        "*const core::ffi::c_char".to_string()
-    } else {
-        panic!("{name}: unhandled ioctl argument type: {ty}");
-    }
-}
-
-fn generate_ioctls(defs: &[IoctlDef]) -> String {
-    let mut out = String::from("\
-// Auto-generated from bcachefs_ioctl.h — do not edit
-//
-// A zero-sized marker type per ioctl, named exactly as the C macro,
-// binding the opcode to its argument type so a call site can't pair the
-// wrong two: the opcode's size bits are computed from the very type the
-// call layer makes you pass. Opcodes use the generic asm-generic/ioctl.h
-// layout (dir at bit 30, size at 16, magic at 8, nr at 0); architectures
-// with a different _IOC layout (alpha, mips, ppc, sparc) would need
-// opcode() adjusted.
-
-use crate::c;
-
-/// An ioctl definition: the request opcode and its argument type.
-pub trait Ioctl {
-    const OPCODE: u32;
-    /// _IOC direction bits: 1 = kernel reads the argument (_IOW),
-    /// 2 = kernel writes it (_IOR), 3 = both (_IOWR), 0 = no argument.
-    const DIR: u32;
-    type Arg;
-}
-
-const fn opcode(dir: u32, nr: u32, size: usize) -> u32 {
-    (dir << 30) | ((size as u32) << 16) | (0xbc << 8) | nr
-}
-
-");
-    for d in defs {
-        let arg = d.arg.as_deref().unwrap_or("()");
-        out += &format!("\
-pub struct {name};
-impl Ioctl for {name} {{
-    const DIR: u32 = {dir};
-    const OPCODE: u32 = opcode({dir}, {nr}, core::mem::size_of::<{arg}>());
-    type Arg = {arg};
-}}
-
-", name = d.name, dir = d.dir, nr = d.nr, arg = arg);
-    }
     out
 }
 

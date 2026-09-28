@@ -65,6 +65,7 @@
 
 #include "fs/logged_ops.h"
 
+#include "init/damage.h"
 #include "init/error.h"
 
 /*
@@ -374,6 +375,43 @@ static int stripe_update_extent(struct btree_trans *trans,
 	return 0;
 }
 
+struct bp_range {
+	enum btree_id	btree;
+	struct bpos	start, end;
+};
+
+/*
+ * Where the backpointers for a stripe block live. A block is a whole bucket,
+ * so normally it's that bucket's range - but if the device is gone the
+ * extents' backpointers were re-keyed on (stripe idx, block) when it was
+ * removed, which is what BTREE_ID_stripe_backpointers holds.
+ */
+static struct bp_range stripe_block_bps(struct bch_fs *c,
+					struct bkey_s_c_stripe stripe,
+					unsigned blocknr)
+{
+	const struct bch_extent_ptr *ptr = &stripe.v->ptrs[blocknr];
+
+	CLASS(bch2_dev_bkey_tryget, ca)(c, stripe.s_c, ptr->dev);
+	if (ca) {
+		struct bpos bucket = PTR_BUCKET_POS(ca, ptr);
+
+		return (struct bp_range) {
+			.btree	= BTREE_ID_backpointers,
+			.start	= bucket_pos_to_bp_start(ca, bucket),
+			.end	= bucket_pos_to_bp_end(ca, bucket),
+		};
+	}
+
+	u64 dev = bp_dev_for_ec_removed_dev(stripe.k->p.offset, blocknr);
+
+	return (struct bp_range) {
+		.btree	= BTREE_ID_stripe_backpointers,
+		.start	= POS(dev, 0),
+		.end	= POS(dev, U64_MAX),
+	};
+}
+
 static int stripe_update_bucket(struct btree_trans *trans,
 				struct bkey_i_stripe *old_stripe,
 				struct bkey_i_stripe *new_stripe,
@@ -385,21 +423,8 @@ static int stripe_update_bucket(struct btree_trans *trans,
 	struct bch_extent_ptr old_block = old_stripe->v.ptrs[old_blocknr];
 	struct bch_extent_ptr new_block = new_stripe->v.ptrs[new_blocknr];
 
-	CLASS(bch2_dev_bkey_tryget, ca)(c, bkey_i_to_s_c(&old_stripe->k_i), old_block.dev);
-	enum btree_id btree;
-	struct bpos start, end;
-	if (ca) {
-		struct bpos bucket_pos = PTR_BUCKET_POS(ca, &old_block);
-
-		btree	= BTREE_ID_backpointers;
-		start	= bucket_pos_to_bp_start(ca, bucket_pos);
-		end	= bucket_pos_to_bp_end(ca, bucket_pos);
-	} else {
-		u64 idx = old_stripe->k.p.offset;
-		btree	= BTREE_ID_stripe_backpointers;
-		start	= POS((idx << 8) | old_blocknr, 0);
-		end	= POS((idx << 8) | old_blocknr, U64_MAX);
-	}
+	struct bp_range bps = stripe_block_bps(c,
+				bkey_i_to_s_c_stripe(&old_stripe->k_i), old_blocknr);
 
 	struct wb_maybe_flush last_flushed __cleanup(wb_maybe_flush_exit);
 	wb_maybe_flush_init(&last_flushed);
@@ -408,7 +433,7 @@ static int stripe_update_bucket(struct btree_trans *trans,
 
 	CLASS(disk_reservation, res)(c);
 
-	try(for_each_btree_key_max(trans, bp_iter, btree, start, end, 0, bp_k, ({
+	try(for_each_btree_key_max(trans, bp_iter, bps.btree, bps.start, bps.end, 0, bp_k, ({
 		if (bp_k.k->type != KEY_TYPE_backpointer)
 			continue;
 
@@ -561,6 +586,102 @@ static bool stripe_has_removing_dev(struct bch_fs *c, struct bch_stripe *v)
 	return false;
 }
 
+/*
+ * @count: whether to count the sb error here as well as recording it. The reuse
+ * path doesn't - bch2_ec_read_done() already counted the block that failed to
+ * reconstruct, and a damage record must name an error the counters have heard
+ * of, not raise the count a second time per extent.
+ */
+static int ec_record_lost_bp(struct btree_trans *trans,
+			     struct bkey_s_c_backpointer bp,
+			     enum bch_sb_error_id err, bool count,
+			     struct wb_maybe_flush *last_flushed)
+{
+	/* skip the resolve below for backpointers we couldn't attribute anyway */
+	if (bp.v->btree_id != BTREE_ID_extents)
+		return 0;
+
+	/*
+	 * Resolve, don't trust bp->pos: an unflushed write buffer entry can
+	 * name a position that now belongs to a different file, and damage on
+	 * the wrong file is worse than none.
+	 */
+	CLASS(btree_iter_uninit, iter)(trans);
+	struct bkey_s_c k = bkey_try(bch2_backpointer_get_key(trans, bp, &iter, 0, last_flushed));
+	if (!k.k)
+		return 0;
+
+	return count
+		? bch2_damage_record_data_loss(trans, bp.v->btree_id, k.k->p, err)
+		: bch2_damage_record_key(trans, bp.v->btree_id, k.k->p, err);
+}
+
+/*
+ * Record damage against every extent in @blocknr of @stripe.
+ *
+ * Updates go into @trans and are NOT committed: the caller's commit decides
+ * whether the records land atomically with whatever destroyed the block. A
+ * block is a bucket, so this can be a lot of updates - a caller that can't
+ * carry them all in one transaction wants its own committing loop instead
+ * (see ec_record_lost_blocks()).
+ */
+int bch2_ec_record_lost_block(struct btree_trans *trans,
+			      struct bkey_s_c_stripe stripe, unsigned blocknr,
+			      enum bch_sb_error_id err,
+			      struct wb_maybe_flush *last_flushed)
+{
+	struct bp_range bps = stripe_block_bps(trans->c, stripe, blocknr);
+
+	return for_each_btree_key_max(trans, bp_iter, bps.btree,
+				      bps.start, bps.end, 0, bp_k, ({
+		if (bp_k.k->type != KEY_TYPE_backpointer)
+			continue;
+
+		ec_record_lost_bp(trans, bkey_s_c_to_backpointer(bp_k),
+				  err, true, last_flushed);
+	}));
+}
+
+/*
+ * The reuse is abandoned, so the old stripe stays as it is and nothing else
+ * discovers the loss until someone reads one of those files.
+ *
+ * Commits per backpointer rather than sharing one transaction: there's nothing
+ * here to be atomic with - the stripe was left untouched - and a whole block's
+ * worth of extents in one transaction would overrun it.
+ */
+static void ec_record_lost_blocks(struct bch_fs *c, struct ec_stripe_new *s)
+{
+	CLASS(btree_trans, trans)(c);
+
+	struct wb_maybe_flush last_flushed __cleanup(wb_maybe_flush_exit);
+	wb_maybe_flush_init(&last_flushed);
+
+	for (u32 lost = s->old_stripe_lost_blocks; lost; lost &= lost - 1) {
+		unsigned block = __ffs(lost);
+		struct bp_range bps = stripe_block_bps(c,
+					bkey_i_to_s_c_stripe(&s->old_stripe.key.k_i),
+					block);
+
+		int ret = for_each_btree_key_max_commit(trans, bp_iter, bps.btree,
+					bps.start, bps.end, 0, bp_k,
+					NULL, NULL,
+					BCH_TRANS_COMMIT_no_enospc, ({
+			if (bp_k.k->type != KEY_TYPE_backpointer)
+				continue;
+
+			ec_record_lost_bp(trans, bkey_s_c_to_backpointer(bp_k),
+					  BCH_FSCK_ERR_stripe_reconstruct_failed,
+					  false, &last_flushed);
+		}));
+
+		/* a block we can't attribute doesn't stop the others */
+		if (ret)
+			bch_err(c, "error recording damage for stripe %llu block %u: %s",
+				s->old_stripe.key.k.p.offset, block, bch2_err_str(ret));
+	}
+}
+
 static int __ec_stripe_create(struct ec_stripe_new *s)
 {
 	struct bch_fs *c = s->c;
@@ -600,16 +721,13 @@ static int __ec_stripe_create(struct ec_stripe_new *s)
 			zero_out_rest_of_ec_bucket(c, s, i, ob);
 	}
 
-	if (s->old_stripe_read) {
-		/*
-		 * ec_old_stripe_fold() folded the carried-forward blocks in
-		 * when the read landed; this is only the barrier against it not
-		 * having run yet, which it normally has - the read was issued
-		 * before the stripe started filling.
-		 */
-		closure_sync(&s->cl);
-		closure_return(&s->cl);
-		try(s->old_stripe_err);
+	/*
+	 * The fold has already been waited for, by ec_stripe_create() before
+	 * it called us - so old_stripe_err is stable here.
+	 */
+	if (s->old_stripe_read && s->old_stripe_err) {
+		ec_record_lost_blocks(c, s);
+		return s->old_stripe_err;
 	}
 
 	BUG_ON(!s->allocated);
@@ -650,7 +768,7 @@ static int __ec_stripe_create(struct ec_stripe_new *s)
 
 	{
 		CLASS(btree_trans, trans)(c);
-		ret = bch2_logged_op_finish(trans, &op.k_i) ?: ret;
+		ret = bch2_logged_op_finish(trans, &op.k_i, ret) ?: ret;
 	}
 
 	return ret;
@@ -698,6 +816,21 @@ static void ec_stripe_create(struct ec_stripe_new *s)
 	struct bch_fs *c = s->c;
 	struct bch_stripe *v = &s->new_stripe.key.v;
 	unsigned nr_data = v->nr_blocks - v->nr_redundant;
+
+	/*
+	 * Barrier against ec_old_stripe_fold(): it swaps buffers into
+	 * s->new_stripe and sets s->old_stripe_err, and the teardown below
+	 * frees both stripe bufs and drops the last ref to s.
+	 *
+	 * It has to have completed on every path out of here, and three used
+	 * to skip it: stripe_get_iorefs() failing, so __ec_stripe_create()
+	 * never runs at all, and __ec_stripe_create()'s own early returns on
+	 * s->err and on stripe_has_removing_dev().
+	 */
+	if (s->old_stripe_read) {
+		closure_sync(&s->cl);
+		closure_return(&s->cl);
+	}
 
 	struct bch_dev *cas[BCH_BKEY_PTRS_MAX];
 	int ret = stripe_get_iorefs(c, v, cas);
@@ -850,45 +983,62 @@ unsigned bch2_disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
 }
 
 /*
+ * redundancy + 2, not + 1: a stripe of one data block plus parity is worse than
+ * replication. Domains count separately because the allocator won't put two
+ * blocks in one domain, so sharing domains can starve a stripe that has devices
+ * enough.
+ *
+ * @devs comes from bch2_disk_label_ec_devs(). @out, if given, gets the reason -
+ * callers park work on this answer.
+ */
+static bool ec_devs_sufficient(struct bch_fs *c, struct bch_devs_mask *devs,
+			       unsigned disk_label, unsigned redundancy,
+			       struct printbuf *out)
+{
+	unsigned nr_devs	= dev_mask_nr(devs);
+	unsigned nr_domains	= bch2_target_nr_domains(c, devs);
+	unsigned need		= redundancy + 2;
+
+	if (nr_devs >= need && nr_domains >= need)
+		return true;
+
+	if (out)
+		prt_printf(out,
+			   "disk_label %u: %u devs, %u domains, need %u of each\n"
+			   "(bch2_disk_label_ec_devs() drops durability 0, and every\n"
+			   "device whose bucket size isn't the most common one)",
+			   disk_label, nr_devs, nr_domains, need);
+	return false;
+}
+
+/*
  * Can a stripe with @redundancy parity blocks be formed in @target right now?
  *
- * This must model what ec_stripe_head_devs_update() computes as
- * insufficient_devs, because that is what actually refuses to allocate. Both
- * of its conditions apply:
- *
- *  - at least redundancy + 2 devices agreeing on bucket_size. Not + 1: a
- *    stripe of one data block plus parity is strictly worse than replication,
- *    so that case is rejected rather than formed.
- *  - at least redundancy + 2 distinct failure domains. One block per domain is
- *    a hard requirement for erasure coding, not a preference - the allocator
- *    excludes devices sharing an already-placed block's domain. With no
- *    failure domains configured every device is its own domain and this is
- *    the device count again, so it only bites where devices share one.
- *
- * bch2_disk_label_ec_devs already returns the filtered device mask (RW members
- * with durability > 0, narrowed to the picked best bucket_size).
- *
- * Used by reconcile to avoid queueing EC work that can't make progress —
- * otherwise reconcile spins re-queueing data_update_fail forever. Modelling
- * only the device count let configurations through that the allocator then
- * refused, costing one wasted rewrite of every affected extent.
+ * Used by reconcile to avoid queueing EC work that can't make progress -
+ * otherwise it spins re-queueing data_update_fail forever.
  */
-bool bch2_can_form_ec_stripe(struct bch_fs *c, unsigned target, unsigned redundancy)
+bool bch2_can_form_ec_stripe(struct bch_fs *c, unsigned target, unsigned redundancy,
+			     struct printbuf *trace)
 {
-	if (!redundancy)
+	if (!redundancy) {
+		if (trace)
+			prt_str(trace, "redundancy 0");
 		return false;
+	}
 
 	struct target t = target_decode(target);
 
 	/*
-	 * A group above U8_MAX cannot be a disk label, and __ec_stripe_head_get()
-	 * refuses it outright ("cannot create a stripe when disk_label > U8_MAX").
-	 * Folding it to disk_label 0 here would ask about every device in the
-	 * filesystem and answer yes to a target the allocator will not serve --
-	 * the same shape of mismatch this function is being fixed for.
+	 * A group above U8_MAX cannot be a disk label, and
+	 * bch2_ec_stripe_head_get() refuses it outright. Folding it to
+	 * disk_label 0 here would ask about every device in the filesystem and
+	 * answer yes to a target the allocator will not serve.
 	 */
-	if (t.type == TARGET_GROUP && t.group > U8_MAX)
+	if (t.type == TARGET_GROUP && t.group > U8_MAX) {
+		if (trace)
+			prt_printf(trace, "target group %u > U8_MAX", t.group);
 		return false;
+	}
 
 	unsigned disk_label = t.type == TARGET_GROUP
 		? t.group + 1
@@ -897,8 +1047,7 @@ bool bch2_can_form_ec_stripe(struct bch_fs *c, unsigned target, unsigned redunda
 	struct bch_devs_mask devs;
 	bch2_disk_label_ec_devs(c, disk_label, &devs, 0);
 
-	return dev_mask_nr(&devs) >= redundancy + 2 &&
-	       bch2_target_nr_domains(c, &devs) >= redundancy + 2;
+	return ec_devs_sufficient(c, &devs, disk_label, redundancy, trace);
 }
 
 /*
@@ -1303,7 +1452,7 @@ static bool copygc_can_run_on_devs(struct bch_fs *c,
 	guard(percpu_read_noio)(&c->capacity.mark_lock);
 	guard(rcu)();
 	for_each_member_device_rcu(c, ca, devs)
-		if (bch2_copygc_dev_wait_amount(ca) <= 0)
+		if (bch2_copygc_dev_wait_amount(ca, NULL) <= 0)
 			return true;
 	return false;
 }
@@ -1612,10 +1761,24 @@ static CLOSURE_CALLBACK(ec_old_stripe_fold)
 
 	s->old_stripe_err = bch2_stripe_buf_validate_msg(s->c, &s->old_stripe,
 							 true, required);
-	if (!s->old_stripe_err)
+	if (!s->old_stripe_err) {
 		for (unsigned i = 0; i < s->old_blocks_nr; i++)
 			swap(s->new_stripe.data[i],
 			     s->old_stripe.data[s->old_block_map[i]]);
+	} else {
+		/*
+		 * Which of the blocks we wanted are actually unreadable, for
+		 * create to record damage against: reconstruct either couldn't
+		 * run - too many failures, so everything that failed to read
+		 * is lost - or ran and left blocks that still don't check out.
+		 */
+		enum bch_stripe_buf_err e =
+			s->old_stripe_err == -BCH_ERR_stripe_reconstruct_insufficient_blocks
+			? STRIPE_BUF_PRE_RECOV
+			: STRIPE_BUF_POST_RECOV;
+
+		s->old_stripe_lost_blocks = ec_failed_mask(&s->old_stripe, e) & required;
+	}
 
 	closure_return(cl);
 }
@@ -1641,7 +1804,7 @@ static void ec_old_stripe_read(struct bch_fs *c, struct ec_stripe_new *s)
 	 * Not stripe_create_wq: create waits on the fold, so running them on
 	 * the same workqueue would make it depend on itself.
 	 */
-	continue_at(&s->old_stripe.io, ec_old_stripe_fold, system_unbound_wq);
+	continue_at(&s->old_stripe.io, ec_old_stripe_fold, system_dfl_wq);
 }
 
 static int stripe_reuse(struct btree_trans *trans, struct ec_stripe_new *s)
@@ -1705,19 +1868,59 @@ static int stripe_idx_alloc(struct btree_trans *trans, struct ec_stripe_new *s)
 	return ret;
 }
 
+/*
+ * A new stripe needs nr_blocks buckets on distinct devices out of s->devs. If
+ * we don't have that many with room to spare, a new stripe can only come out of
+ * space that is about to be scarce: pack into an existing stripe instead.
+ *
+ * Where every device is a member of every stripe (nr_blocks == nr_devices) one
+ * device short of room is enough.
+ *
+ * low_on_space, not wants_space: the latter is exactly copygc's own trigger, so
+ * gating on it would mean we only start packing once copygc already has work -
+ * work made of the half-empty stripes we would not have cut.
+ */
+static bool ec_should_reuse_stripe(struct bch_fs *c, struct ec_stripe_new *s)
+{
+	struct bch_devs_mask avail = s->devs;
+
+	bitmap_andnot(avail.d, avail.d, c->copygc.low_on_space.d, BCH_SB_MEMBERS_MAX);
+
+	return dev_mask_nr(&avail) < s->new_stripe.key.v.nr_blocks;
+}
+
+/*
+ * Reuse is an optimization: if we can't reuse a stripe we allocate a new one
+ * instead. Only abort stripe creation for errors that mean allocating can't
+ * work either - anything else, fall through and allocate.
+ */
+static bool stripe_reuse_err_fatal(int ret)
+{
+	return bch2_err_matches(ret, BCH_ERR_transaction_restart) ||
+	       bch2_err_matches(ret, EROFS);
+}
+
 static int __stripe_alloc_or_reuse(struct btree_trans *trans,
 				   struct alloc_request *req,
 				   struct ec_dev_stripe_state *dev_stripe,
 				   struct ec_stripe_new *s,
 				   bool *waiting)
 {
+	int ret;
+
+	if (!s->have_old_stripe && ec_should_reuse_stripe(trans->c, s)) {
+		ret = stripe_reuse(trans, s);
+		if (stripe_reuse_err_fatal(ret))
+			return ret;
+	}
+
 	/* First, try to allocate a full stripe: */
 	enum bch_watermark saved_watermark = BCH_WATERMARK_stripe;
 	unsigned saved_flags = req->flags | BCH_WRITE_alloc_nowait;
 	swap(req->watermark,	saved_watermark);
 	swap(req->flags,	saved_flags);
 
-	int ret = new_stripe_alloc_buckets(trans, req, dev_stripe, s, false);
+	ret = new_stripe_alloc_buckets(trans, req, dev_stripe, s, false);
 
 	swap(req->watermark,	saved_watermark);
 	swap(req->flags,	saved_flags);
@@ -1733,7 +1936,7 @@ static int __stripe_alloc_or_reuse(struct btree_trans *trans,
 		 * an old stripe:
 		 */
 		ret = stripe_reuse(trans, s);
-		if (ret && !bch2_err_matches(ret, -BCH_ERR_stripe_alloc_blocked))
+		if (stripe_reuse_err_fatal(ret))
 			return ret;
 	}
 
@@ -1866,16 +2069,59 @@ __cold void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
  * struct ec_stripe_new
  */
 
-static void ec_stripe_new_set_pending(struct bch_fs *c, struct ec_stripe_head *h)
+/*
+ * A stripe as wide as @h's devices allow: one block per failure domain is a
+ * hard requirement, so the width is capped by domains as well as devices. If a
+ * domain goes away the next stripe is narrower rather than doubling up.
+ */
+static struct ec_stripe_new *
+ec_stripe_new_alloc_for_head(struct bch_fs *c, struct ec_stripe_head *h,
+			     unsigned max_data_blocks)
 {
-	struct ec_stripe_new *s = h->s;
+	unsigned active = min_t(unsigned, h->nr_active_devs, BCH_BKEY_PTRS_MAX);
+	unsigned nr_data = min_t(unsigned, active - h->redundancy,
+				 max_data_blocks ?: ~0U);
 
+	/* insufficient_devs was checked - at least redundancy + 2 domains: */
+	unsigned nr_domains = bch2_target_nr_domains(c, &h->devs);
+	nr_data = min(nr_data, nr_domains - h->redundancy);
+
+	struct ec_stripe_new *s =
+		ec_new_stripe_alloc(c, h->devs, h->watermark, h->disk_label,
+				    h->algo, nr_data, h->redundancy, h->blocksize);
+	if (!s) {
+		bch_err(c, "failed to allocate new stripe");
+		return ERR_PTR(bch_err_throw(c, ENOMEM_ec_new_stripe_alloc));
+	}
+
+	h->nr_created++;
+	return s;
+}
+
+/* The head is done staging @s; it belongs to the create path now. */
+static void ec_stripe_head_detach(struct ec_stripe_head *h, struct ec_stripe_new *s)
+{
 	lockdep_assert_held(&h->lock);
+	BUG_ON(h->s != s);
 
+	h->s = NULL;
+}
+
+/* Every data block claimed - nothing more can go into it. */
+static bool ec_stripe_new_full(struct ec_stripe_new *s)
+{
+	unsigned nr_data = ec_stripe_new_nr_data(s);
+
+	return s->allocated &&
+		bitmap_weight(s->blocks_allocated, nr_data) == nr_data;
+}
+
+/* Caller has detached @s from its head. */
+static void ec_stripe_new_set_pending(struct bch_fs *c, struct ec_stripe_new *s)
+{
 	BUG_ON(!s->allocated && !s->err);
 
-	h->s		= NULL;
-	s->state	= EC_STRIPE_NEW_filling;
+	s->state = EC_STRIPE_NEW_filling;
 
 	scoped_guard(mutex, &c->ec.stripe_new_lock)
 		list_add(&s->list, &c->ec.stripe_new_list);
@@ -1884,10 +2130,12 @@ static void ec_stripe_new_set_pending(struct bch_fs *c, struct ec_stripe_head *h
 	ec_stripe_new_put(c, s, STRIPE_REF_io);
 }
 
-void bch2_ec_stripe_new_cancel(struct bch_fs *c, struct ec_stripe_head *h, int err)
+void bch2_ec_stripe_new_cancel(struct bch_fs *c, struct ec_stripe_head *h,
+			       struct ec_stripe_new *s, int err)
 {
-	h->s->err = err;
-	ec_stripe_new_set_pending(c, h);
+	s->err = err;
+	ec_stripe_head_detach(h, s);
+	ec_stripe_new_set_pending(c, s);
 }
 
 static void ec_stripe_head_devs_update(struct bch_fs *c, struct ec_stripe_head *h)
@@ -1896,28 +2144,14 @@ static void ec_stripe_head_devs_update(struct bch_fs *c, struct ec_stripe_head *
 
 	h->blocksize		= bch2_disk_label_ec_devs(c, h->disk_label, &h->devs, 0);
 	h->nr_active_devs	= dev_mask_nr(&h->devs);
-
-	/*
-	 * If we only have redundancy + 1 devices, we're better off with just
-	 * replication:
-	 */
-	h->insufficient_devs = h->nr_active_devs < h->redundancy + 2;
-
-	/*
-	 * One block per failure domain is a hard requirement (see
-	 * __new_stripe_alloc_buckets): too few domains for redundancy to mean
-	 * anything means no stripes at all. With no failure domains configured
-	 * each device is its own domain, so this only tightens the device-count
-	 * check above when devices share domains.
-	 */
-	unsigned nr_domains = bch2_target_nr_domains(c, &h->devs);
-	h->insufficient_devs |= nr_domains < h->redundancy + 2;
+	h->insufficient_devs	= !ec_devs_sufficient(c, &h->devs, h->disk_label,
+						      h->redundancy, NULL);
 
 	struct bch_devs_mask devs_leaving;
 	bitmap_andnot(devs_leaving.d, old_devs.d, h->devs.d, BCH_SB_MEMBERS_MAX);
 
 	if (h->s && !h->s->allocated && dev_mask_nr(&devs_leaving))
-		bch2_ec_stripe_new_cancel(c, h, -EINTR);
+		bch2_ec_stripe_new_cancel(c, h, h->s, -EINTR);
 }
 
 static struct ec_stripe_head *
@@ -1943,11 +2177,12 @@ ec_new_stripe_head_alloc(struct bch_fs *c, unsigned disk_label,
 
 void bch2_ec_stripe_head_put(struct bch_fs *c, struct ec_stripe_head *h)
 {
-	if (h->s &&
-	    h->s->allocated &&
-	    bitmap_weight(h->s->blocks_allocated,
-			  ec_stripe_new_nr_data(h->s)) == ec_stripe_new_nr_data(h->s))
-		ec_stripe_new_set_pending(c, h);
+	if (h->s && ec_stripe_new_full(h->s)) {
+		struct ec_stripe_new *s = h->s;
+
+		ec_stripe_head_detach(h, s);
+		ec_stripe_new_set_pending(c, s);
+	}
 
 	mutex_unlock(&h->lock);
 }
@@ -1963,7 +2198,7 @@ __bch2_ec_stripe_head_get(struct btree_trans *trans,
 	struct ec_stripe_head *h;
 
 	if (!redundancy)
-		return NULL;
+		return ERR_PTR(bch_err_throw(c, ec_alloc_failed_no_redundancy));
 
 	int ret = bch2_trans_mutex_lock(trans, &c->ec.stripe_head_lock);
 	if (ret)
@@ -2003,13 +2238,14 @@ found:
 
 	if (h->insufficient_devs) {
 		mutex_unlock(&h->lock);
-		h = NULL;
+		h = ERR_PTR(bch_err_throw(c, ec_alloc_failed_insufficient_devs));
 	}
 err:
 	mutex_unlock(&c->ec.stripe_head_lock);
 	return h;
 }
 
+/* Never returns NULL: failures are ec_alloc_failed subtypes naming the reason. */
 struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *trans,
 					       struct alloc_request *req,
 					       unsigned algo)
@@ -2021,50 +2257,26 @@ struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *trans,
 	int ret;
 
 	if (t.type == TARGET_GROUP) {
-		if (t.group > U8_MAX) {
-			bch_err(c, "cannot create a stripe when disk_label > U8_MAX");
-			return NULL;
-		}
+		if (t.group > U8_MAX)
+			return ERR_PTR(bch_err_throw(c, ec_alloc_failed_disk_label_too_big));
 		disk_label = t.group + 1; /* 0 == no label */
 	}
 
 	struct ec_stripe_head *h =
 		__bch2_ec_stripe_head_get(trans, disk_label, algo,
 					  redundancy, req->watermark);
-	if (IS_ERR_OR_NULL(h))
+	if (IS_ERR(h))
 		return h;
 
 	if (!h->s) {
-		unsigned active = min_t(unsigned, h->nr_active_devs, BCH_BKEY_PTRS_MAX);
-		unsigned nr_data = min_t(unsigned, active - h->redundancy,
-					 req->ec_max_data_blocks ?: ~0U);
-
-		/*
-		 * One block per failure domain: the stripe can't be wider than
-		 * the domains available. If a domain becomes unavailable, the
-		 * next stripe is allocated narrower rather than doubling up.
-		 * With no failure domains each device is its own domain, so this
-		 * is the usual device-count cap.
-		 */
-		unsigned nr_domains = bch2_target_nr_domains(c, &h->devs);
-		/* insufficient_devs was checked - at least redundancy + 2 domains: */
-		nr_data = min(nr_data, nr_domains - h->redundancy);
-
-		h->s = ec_new_stripe_alloc(c,
-					   h->devs,
-					   h->watermark,
-					   h->disk_label,
-					   h->algo,
-					   nr_data,
-					   h->redundancy,
-					   h->blocksize);
-		if (!h->s) {
-			ret = bch_err_throw(c, ENOMEM_ec_new_stripe_alloc);
-			bch_err(c, "failed to allocate new stripe");
+		struct ec_stripe_new *new =
+			ec_stripe_new_alloc_for_head(c, h, req->ec_max_data_blocks);
+		if (IS_ERR(new)) {
+			ret = PTR_ERR(new);
 			goto err;
 		}
 
-		h->nr_created++;
+		h->s = new;
 	}
 
 	struct ec_stripe_new *s = h->s;
@@ -2126,9 +2338,9 @@ struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *trans,
 err:
 	bch2_ec_stripe_head_put(c, h);
 
-	/* we want the allocator to fall back to replication */
+	/* Not fatal to the write - the allocator falls back to replication: */
 	if (bch2_err_matches(ret, BCH_ERR_stripe_insufficient_devices))
-		return NULL;
+		ret = bch_err_throw(c, ec_alloc_failed_stripe_alloc);
 	return ERR_PTR(ret);
 }
 

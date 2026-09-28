@@ -609,9 +609,32 @@
 					insufficient_devices_data_intact, 587)	\
 	x(BCH_ERR_insufficient_devices_to_start,				\
 					insufficient_devices_data_lost, 588)	\
-	x(0,				reconcile_interrupted, 589)		\
-	x(BCH_ERR_reconcile_interrupted, reconcile_admission_timeout, 590)	\
-	x(BCH_ERR_reconcile_interrupted, reconcile_stopped, 591)
+	x(EIO,				injected_logged_op_fail, 589)		\
+	x(EINVAL,			EINVAL_crypt_no_kdf_params, 590)	\
+	x(EIO,				crypt_kdf_failed, 591)			\
+	x(0,				reconcile_scan_stop, 592)		\
+	x(0,				str_hash_key_repaired, 593)		\
+	x(0,				delete_range_done, 594)			\
+	x(0,				extent_iters_max, 595)			\
+	x(0,				write_encoded_as_is, 596)		\
+	x(0,				path_not_accessible, 597)		\
+	x(0,				readdir_buf_full, 598)			\
+	x(0,				readdir_skip, 599)			\
+	x(0,				fc_continue, 600)			\
+	x(0,				fc_break, 601)			\
+	x(0,				cached_ptr_stale, 602)			\
+	x(BCH_ERR_no_btree_node,	no_btree_node_shallow, 603)		\
+	x(0,				bucket_not_allocatable, 604)		\
+	x(ENOSPC,			ec_alloc_failed_pending_race, 605)	\
+	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_redundancy, 606)	\
+	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_insufficient_devs, 607)	\
+	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_disk_label_too_big, 608)	\
+	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_stripe_alloc, 609)	\
+	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_usable_block, 610)	\
+	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_ec_bucket, 611)	\
+	x(0,				reconcile_interrupted, 612)		\
+	x(BCH_ERR_reconcile_interrupted, reconcile_admission_timeout, 613)	\
+	x(BCH_ERR_reconcile_interrupted, reconcile_stopped, 614)
 
 enum bch_errcode {
 	BCH_ERR_START		= 2048,

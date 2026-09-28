@@ -364,14 +364,6 @@ fn generate_bkey_types(entries: &[Vec<String>]) -> String {
     out
 }
 
-#[derive(Debug)]
-pub struct Fix753 {}
-impl bindgen::callbacks::ParseCallbacks for Fix753 {
-    fn item_name(&self, item: bindgen::callbacks::ItemInfo<'_>) -> Option<String> {
-        Some(item.name.trim_start_matches("Fix753_").to_owned())
-    }
-}
-
 fn watch_dir(dir: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -399,6 +391,85 @@ fn clang_target_for_rust_target(target: &str) -> &str {
         "riscv32gc-unknown-linux-gnu" => "riscv32-unknown-linux-gnu",
         _ => target,
     }
+}
+
+/// One `#define BCH_IOCTL_* _IO*(0xbc, nr[, type])` from bcachefs_ioctl.h.
+///
+/// The argument type is all we take from the define: it's the one part C can't
+/// hand us, since bindgen binds values and not types. The opcode comes from the
+/// constants BCH_IOCTL_BIND() emits - see the comment in c_src/rust_shims.h for
+/// why it has to.
+struct IoctlDef {
+    name: String,
+    /// Rust type of the argument; None for _IO().
+    arg:  Option<String>,
+}
+
+fn parse_ioctls(header: &str) -> Vec<IoctlDef> {
+    let mut out = Vec::new();
+    for line in header.lines() {
+        let Some(rest) = line.strip_prefix("#define ") else { continue };
+        let mut it = rest.splitn(2, char::is_whitespace);
+        let (Some(name), Some(body)) = (it.next(), it.next()) else { continue };
+        let Some((mac, args)) = body.trim().split_once('(') else { continue };
+        let takes_arg = match mac.trim() {
+            "_IO"                     => false,
+            "_IOW" | "_IOR" | "_IOWR" => true,
+            _ => continue,
+        };
+        let Some(args) = args.trim_end().strip_suffix(')') else { continue };
+        let args: Vec<&str> = args.splitn(3, ',').map(str::trim).collect();
+        assert_eq!(args[0], "0xbc", "{name}: unexpected ioctl magic {}", args[0]);
+        let arg = (args.len() > 2).then(|| ioctl_arg_to_rust(name, args[2]));
+        assert_eq!(arg.is_some(), takes_arg, "{name}: _IO() iff no argument");
+        out.push(IoctlDef { name: name.to_string(), arg });
+    }
+    out
+}
+
+fn ioctl_arg_to_rust(name: &str, ty: &str) -> String {
+    if let Some(s) = ty.strip_prefix("struct ") {
+        format!("c::{}", s.trim())
+    } else if ty == "const char __user *" {
+        "*const core::ffi::c_char".to_string()
+    } else {
+        panic!("{name}: unhandled ioctl argument type: {ty}");
+    }
+}
+
+fn generate_ioctls(defs: &[IoctlDef]) -> String {
+    let mut out = String::from("\
+// Auto-generated from bcachefs_ioctl.h — do not edit
+//
+// A zero-sized marker type per ioctl, named exactly as the C macro, binding the
+// opcode to its argument type so a call site can't pair the wrong two.
+//
+// The opcode is whatever BCH_IOCTL_BIND() had the C compiler get out of _IOR()
+// and friends, against the target's own <asm/ioctl.h>. Nothing here restates
+// that bit layout - it varies by architecture, and c_src/rust_shims.h is the
+// comment to read before changing any of this.
+
+use crate::c;
+
+/// An ioctl definition: the request opcode and its argument type.
+pub trait Ioctl {
+    const OPCODE: u32;
+    type Arg;
+}
+
+");
+    for d in defs {
+        let arg = d.arg.as_deref().unwrap_or("()");
+        out += &format!("\
+pub struct {name};
+impl Ioctl for {name} {{
+    const OPCODE: u32 = c::bch_ioctl_op_{name};
+    type Arg = {arg};
+}}
+
+", name = d.name, arg = arg);
+    }
+    out
 }
 
 fn main() {
@@ -458,9 +529,26 @@ fn main() {
         .bitfield_enum("btree_iter_update_trigger_flags")
         .bitfield_enum("bch_trans_commit_flags")
         .bitfield_enum("bch_write_flags")
-        // Block device ioctl numbers - see the note in c_src/rust_shims.h for
-        // why these are C constants and not macros for bindgen to evaluate.
+        // What c_src/rust_shims.h exports to Rust - see the note there for why
+        // these are C constants rather than macros for bindgen to evaluate.
+        //
+        // These have to be narrow, not a blanket BCH_.*: this crate's bindings
+        // and the fs bindings are both glob-imported into one module, and the
+        // headers here also reach bcachefs's own BCH_SB_*, BCH_BY_INDEX,
+        // BCH_FORCE_IF_* and friends. Allowing BCH_.* binds those a second time
+        // and every use site becomes an ambiguous_glob_imports error, which is
+        // deny-by-default. Measured: 5 symbols becomes 360, and the build fails
+        // with 102 errors.
+        //
+        // The cost is that bindgen drops anything not matched here and says
+        // nothing, so a new shim constant surfaces as "cannot find value in
+        // module c" at its use site rather than pointing at this line. If that
+        // keeps happening, give the shim exports a reserved prefix rather than
+        // widening these.
         .allowlist_var("BCH_BLK.*")
+        .allowlist_var("BCH_FS_IOC_.*")
+        .allowlist_var("BCH_SIZEOF_.*")
+        .allowlist_var("bch_ioctl_op_.*")
         .allowlist_function("raid_init")
         .allowlist_function("linux_shrinkers_init")
         .allowlist_function("sysfs_.*")
@@ -531,7 +619,6 @@ fn main() {
         .blocklist_type("bch_option")
         .blocklist_type("bch_opts.*")
         .allowlist_var("KEY_SPEC_.*")
-        .allowlist_var("Fix753_.*")
         .blocklist_item("bch2_bkey_ops")
         .allowlist_type("bch_.*")
         .allowlist_type("bkey_i_.*")
@@ -583,7 +670,6 @@ fn main() {
         // inlines, not static inlines in headers.
         .wrap_static_fns(true)
         .wrap_static_fns_path(out_dir.join("extern.c"))
-        .parse_callbacks(Box::new(Fix753 {}))
         .generate()
         .expect("BindGen Generation Failiure: [libbcachefs_wrapper]");
 
@@ -787,6 +873,13 @@ fn main() {
         generate_btree_ids_known(&btree_ids),
     )
     .expect("Writing btree_ids_gen.rs");
+
+    let ioctl_h = std::fs::read_to_string(top_dir.join("../fs/bcachefs_ioctl.h"))
+        .expect("reading bcachefs_ioctl.h");
+    let ioctls = parse_ioctls(&ioctl_h);
+    assert!(!ioctls.is_empty(), "failed to parse any _IO*() defines");
+    std::fs::write(out_dir.join("ioctls_gen.rs"), generate_ioctls(&ioctls))
+        .expect("Writing ioctls_gen.rs");
 
     let keyutils = pkg_config::probe_library("libkeyutils").expect("Failed to find keyutils lib");
     let bindings = bindgen::builder()

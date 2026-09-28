@@ -1430,6 +1430,9 @@ static int check_inode(struct btree_trans *trans,
 		do_update = true;
 	}
 
+	/* after the flag check above: it's what gates the walk */
+	try(bch2_check_inode_opts_propagated(trans, &u));
+
 	/*
 	 * has_access_acl/has_default_acl: only the set direction is verified
 	 * here, an xattr lookup per flagged inode - inodes with ACLs are
@@ -2463,10 +2466,10 @@ static int check_dirent(struct btree_trans *trans, struct btree_iter *iter,
 		return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 	}
 
-	if (ret < 0)
-		return ret;
-	if (ret)
+	if (bch2_err_matches(ret, BCH_ERR_str_hash_key_repaired))
 		return 0; /* dirent has been deleted */
+	if (ret)
+		return ret;
 	if (k.k->type != KEY_TYPE_dirent)
 		return 0;
 
@@ -2790,7 +2793,6 @@ static int check_xattr(struct btree_trans *trans, struct btree_iter *iter,
 		return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 	}
 
-	ret = min(ret, 0);
 fsck_err:
 	return ret;
 }
