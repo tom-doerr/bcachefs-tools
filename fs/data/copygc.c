@@ -410,7 +410,14 @@ static int bch2_copygc_get_stripe_buckets(struct moving_context *ctxt,
 		if (stripe_lru_pos(s) != lru_pos_time(lru_k.k->p))
 			continue;
 
-		unsigned nr_data = s->nr_blocks - s->nr_redundant;
+		unsigned nr_data = s->nr_blocks - s->nr_redundant, blocks_nonempty = 0;
+		for (unsigned i = 0; i < nr_data; i++)
+			blocks_nonempty += !!stripe_blockcount_get(s, i);
+
+		/* On this lru only because it can be widened: nothing stranded */
+		if (blocks_nonempty == nr_data)
+			continue;
+
 		for (unsigned i = 0; i < nr_data; i++) {
 			if (!stripe_blockcount_get(s, i))
 				continue;
@@ -467,8 +474,8 @@ static bool should_do_ec_copygc(struct btree_trans *trans, darray_copygc_dev *de
 		for (unsigned i = 0; i < nr_data; i++)
 			blocks_nonempty += !!stripe_blockcount_get(s, i);
 
-		/* stripe is pending delete */
-		if (!blocks_nonempty)
+		/* stripe is pending delete, or has nothing stranded (widenable) */
+		if (!blocks_nonempty || blocks_nonempty == nr_data)
 			continue;
 
 		/* This matches the calculation in alloc_lru_idx_fragmentation, so we can
@@ -504,8 +511,9 @@ err:
 		}
 	}
 
-	/* Prefer normal bucket copygc */
-	return stripe_frag_ratio && stripe_frag_ratio * 2 < bucket_frag_ratio;
+	/* Prefer normal bucket copygc, when there is a bucket to evacuate */
+	return stripe_frag_ratio &&
+		(!bucket_frag_ratio || stripe_frag_ratio * 2 < bucket_frag_ratio);
 }
 
 noinline
