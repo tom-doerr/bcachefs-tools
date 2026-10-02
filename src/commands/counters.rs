@@ -44,6 +44,7 @@ fn cmd_reset_counters(cli: Cli) -> Result<()> {
     // open fs in nostart mode
     let mut fs_opts = c::bch_opts::default();
     opt_set!(fs_opts, nostart, 1);
+    opt_set!(fs_opts, will_not_start, 1);
     opt_set!(fs_opts, degraded, bch_degraded_actions::BCH_DEGRADED_very as u8);
 
     let fs = Fs::open(&devs, fs_opts)
@@ -62,7 +63,8 @@ fn cmd_reset_counters(cli: Cli) -> Result<()> {
 
         // persist to superblock
         let _lock = crate::wrappers::sb_lock(fs.raw);
-        fs.write_super();
+        fs.write_super_ret()
+            .map_err(|e| anyhow!("error writing superblock: {}", e))?;
     }
 
     Ok(())

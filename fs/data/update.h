@@ -25,6 +25,24 @@ enum bch_data_update_types {
 #undef x
 };
 
+/* Both scrub types read to check, and must never rewrite what they're checking */
+static inline bool data_update_is_scrub(enum bch_data_update_types type)
+{
+	return type == BCH_DATA_UPDATE_scrub ||
+	       type == BCH_DATA_UPDATE_scrub_no_repair;
+}
+
+/*
+ * @target: where the new copy goes. Movers rewriting existing data want the
+ * extent's background_target here: unset doesn't mean "no preference", it means
+ * "anywhere", which drags data off its tier.
+ *
+ * It also decides the disk label of any erasure coded stripe the write creates
+ * (bch2_ec_stripe_head_get()), and that label is stamped into the stripe on
+ * disk permanently, where 0 means every device in the filesystem - so a mover
+ * that leaves this unset doesn't just misplace one extent, it creates a stripe
+ * that will keep widening onto devices the data was never supposed to touch.
+ */
 struct data_update_opts {
 	enum bch_data_update_types	type;
 	u8				ptrs_io_error;

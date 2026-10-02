@@ -97,7 +97,9 @@ fn set_data_allowed_for_image_update(fs: &Fs) {
             | data_type::btree.bit(),
     );
 
-    fs.write_super();
+    // Not started yet: the start persists this. It needs the in-memory
+    // member info updated now, for the allocator.
+    fs.sb_update();
     drop(_lock);
 
     fs.dev_allocator_set_rw(0, true);
@@ -710,7 +712,7 @@ fn image_create_usage() {
     );
     let dev_opts = opts_usage_str(
         c::opt_flags::OPT_DEVICE as u32,
-        c::opt_flags::OPT_FS as u32,
+        0,
     );
 
     print!("\

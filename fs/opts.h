@@ -14,6 +14,7 @@ struct bch_fs;
 
 extern const char * const bch2_error_actions[];
 extern const char * const bch2_degraded_actions[];
+extern const char * const bch2_write_degraded_actions[];
 extern const char * const bch2_fsck_fix_opts[];
 extern const char * const bch2_version_upgrade_opts[];
 extern const char * const bch2_sb_features[];
@@ -342,6 +343,13 @@ enum fsck_err_opts {
 	  OPT_STR(bch2_degraded_actions),				\
 	  BCH_SB_DEGRADED_ACTION,	BCH_DEGRADED_ask,		\
 	  NULL,		"Allow mounting in degraded mode")		\
+	x(write_degraded,		u8,				\
+	  OPT_FS|OPT_MOUNT|OPT_FORMAT|OPT_RUNTIME,			\
+	  OPT_STR(bch2_write_degraded_actions),				\
+	  BCH_SB_WRITE_DEGRADED_ACTION,	BCH_WRITE_DEGRADED_degraded,	\
+	  NULL,		"Write fewer copies than asked for rather than "	\
+			"returning ENOSPC; the default does so only while "\
+			"a device is missing or not read-write")	\
 	x(missing_dev_timeout,		u32,				\
 	  OPT_FS|OPT_MOUNT|OPT_FORMAT|OPT_RUNTIME,			\
 	  OPT_UINT(0, 3600),						\
@@ -540,6 +548,11 @@ enum fsck_err_opts {
 	  OPT_BOOL(),							\
 	  BCH2_NO_SB_OPT,		false,				\
 	  NULL,		"Don\'t start filesystem, only open devices")	\
+	x(will_not_start,		u8,				\
+	  OPT_HIDDEN,							\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		NULL)						\
 	x(dangerously_reconstruct_alloc,u8,				\
 	  OPT_FS|OPT_MOUNT,						\
 	  OPT_BOOL(),							\

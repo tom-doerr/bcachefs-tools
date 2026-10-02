@@ -293,6 +293,18 @@ static inline bool bch2_trans_has_updates(struct btree_trans *trans)
 		trans->accounting.u64s;
 }
 
+/*
+ * The sectors and the count they're charged at have to move together, or the
+ * reservation can't say what slot it's in - so always go through here.
+ */
+static inline void bch2_trans_extra_disk_res_add(struct btree_trans *trans,
+						 u64 sectors, unsigned nr_replicas)
+{
+	trans->extra_disk_res		+= sectors;
+	trans->extra_disk_res_replicas	= max_t(u8, trans->extra_disk_res_replicas,
+						nr_replicas);
+}
+
 static inline void bch2_trans_reset_updates(struct btree_trans *trans)
 {
 	trans_for_each_update(trans, i)
@@ -305,6 +317,7 @@ static inline void bch2_trans_reset_updates(struct btree_trans *trans)
 	trans->accounting.size		= 0;
 	trans->hooks			= NULL;
 	trans->extra_disk_res		= 0;
+	trans->extra_disk_res_replicas	= 0;
 	trans->extra_journal_u64s	= 0;
 	trans->has_interior_updates	= 0;
 }
@@ -383,13 +396,31 @@ static inline int bch2_trans_commit_lazy_if_full(struct btree_trans *trans,
 		: bch2_trans_commit_lazy(trans, disk_res, journal_seq, flags);
 }
 
+/*
+ * If _do fails, bch2_trans_commit() never runs, and never resets what _do had
+ * queued. An error that isn't a restart abandons the attempt: drop them, as
+ * the commit would have, so the next bch2_trans_begin() doesn't take them for
+ * updates someone forgot to commit. (A restart's are dropped by the restart.)
+ */
+#define __commit_do(_trans, _disk_res, _journal_seq, _flags, _do)	\
+({									\
+	int _ret3 = (_do);						\
+									\
+	if (unlikely(_ret3) &&						\
+	    !bch2_err_matches(_ret3, BCH_ERR_transaction_restart))	\
+		bch2_trans_reset_updates(_trans);			\
+									\
+	_ret3 ?: bch2_trans_commit(_trans, (_disk_res),			\
+				   (_journal_seq), (_flags));		\
+})
+
 #define commit_do(_trans, _disk_res, _journal_seq, _flags, _do)	\
-	lockrestart_do(_trans, _do ?: bch2_trans_commit(_trans, (_disk_res),\
-					(_journal_seq), (_flags)))
+	lockrestart_do(_trans,						\
+		__commit_do(_trans, _disk_res, _journal_seq, _flags, _do))
 
 #define nested_commit_do(_trans, _disk_res, _journal_seq, _flags, _do)	\
-	nested_lockrestart_do(_trans, _do ?: bch2_trans_commit(_trans, (_disk_res),\
-					(_journal_seq), (_flags)))
+	nested_lockrestart_do(_trans,					\
+		__commit_do(_trans, _disk_res, _journal_seq, _flags, _do))
 
 /* deprecated, prefer CLASS(btree_trans) */
 #define bch2_trans_commit_do(_c, _disk_res, _journal_seq, _flags, _do)		\

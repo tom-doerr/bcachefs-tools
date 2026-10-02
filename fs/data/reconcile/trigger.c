@@ -498,7 +498,9 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 		incompressible	|= p.crc.compression_type == BCH_COMPRESSION_TYPE_incompressible;
 		unwritten	|= p.ptr.unwritten;
 
-		bool evacuating = bch2_dev_bad_or_evacuating(c, p.ptr.dev) && !p.has_ec;
+		bool evacuating = k.k->type == KEY_TYPE_stripe
+			? bch2_stripe_block_dev_bad(c, p.ptr.dev)
+			: bch2_dev_bad_or_evacuating(c, p.ptr.dev) && !p.has_ec;
 
 		if (!poisoned &&
 		    !btree &&
@@ -539,8 +541,12 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 	if (k.k->type == KEY_TYPE_stripe) {
 		*ret = r;
 
-		return (r.need_rb & BIT(BCH_RECONCILE_data_replicas)) &&
-			!bkey_s_c_to_stripe(k).v->needs_reconcile;
+		/*
+		 * Both directions: a device that stops evacuating leaves the
+		 * bit set on stripes that no longer need anything (#929).
+		 */
+		return !!(r.need_rb & BIT(BCH_RECONCILE_data_replicas)) !=
+			bkey_s_c_to_stripe(k).v->needs_reconcile;
 	}
 
 	if (unwritten || incompressible)
@@ -863,8 +869,10 @@ int bch2_bkey_set_needs_reconcile(struct btree_trans *trans,
 
 			BUG_ON(k.k->u64s + need_update_invalid_devs > buf_u64s);
 
-			trans->extra_disk_res += (u64) need_update_invalid_devs *
-				(bkey_is_btree_ptr(k.k) ? btree_sectors(c) : k.k->size);
+			bch2_trans_extra_disk_res_add(trans,
+				(u64) need_update_invalid_devs *
+				(bkey_is_btree_ptr(k.k) ? btree_sectors(c) : k.k->size),
+				need_update_invalid_devs);
 
 			while (need_update_invalid_devs--) {
 				union bch_extent_entry *end = bkey_val_end(k);

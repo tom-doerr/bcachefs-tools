@@ -18,6 +18,9 @@
 #include "data/compress.h"
 #include "data/keylist.h"
 #include "data/extents.h"
+#include "data/ec/init.h"
+#include "data/ec/io.h"
+#include "data/ec/trigger.h"
 #include "data/move.h"
 #include "data/update.h"
 #include "data/read.h"
@@ -27,7 +30,9 @@
 
 #include "fs/inode.h"
 
+#include "init/damage.h"
 #include "init/error.h"
+#include "init/recovery.h"
 
 #include "journal/reclaim.h"
 
@@ -113,8 +118,13 @@ static void move_write_done(struct bch_write_op *op)
 	 * EC allocation failed — the write never happened but the extent
 	 * still needs erasure coding. Mark it pending so reconcile retries
 	 * from the pending list instead of the main scan.
+	 *
+	 * Not the transient ones: nothing takes work off the pending list on
+	 * its own, so parking something a retry would have satisfied abandons
+	 * it.
 	 */
-	if (bch2_err_matches(op->error, BCH_ERR_ec_alloc_failed))
+	if (bch2_err_matches(op->error, BCH_ERR_ec_alloc_failed) &&
+	    !bch2_err_matches(op->error, BCH_ERR_ec_alloc_failed_transient))
 		bch2_data_update_ec_alloc_failed(u);
 
 	if (u->budget_charged)
@@ -193,7 +203,12 @@ void bch2_move_ctxt_wait_for_io(struct moving_context *ctxt)
 
 void bch2_moving_ctxt_flush_all(struct moving_context *ctxt)
 {
-	move_ctxt_wait_event(ctxt, list_empty(&ctxt->reads));
+	/*
+	 * Wait freezably for the IO itself; the closure_sync() after only
+	 * covers the closure_put() that follows each completion's wakeup.
+	 */
+	move_ctxt_wait_event(ctxt, list_empty(&ctxt->reads) &&
+			     !atomic_read(&ctxt->write_ios));
 	bch2_trans_unlock_long(ctxt->trans);
 	closure_sync(&ctxt->cl);
 }
@@ -693,13 +708,13 @@ int bch2_move_extent(struct moving_context *ctxt,
 	struct bch_fs *c = trans->c;
 	int ret = 0;
 
-	if (data_opts->type == BCH_DATA_UPDATE_scrub &&
+	if (data_update_is_scrub(data_opts->type) &&
 	    !bch2_dev_idx_is_online(c, data_opts->read_dev))
 		return bch_err_throw(c, device_offline);
 
 	if (!bkey_is_btree_ptr(k.k))
 		ret = __bch2_move_extent(ctxt, bucket_in_flight, iter, k, opts, data_opts);
-	else if (data_opts->type != BCH_DATA_UPDATE_scrub) {
+	else if (!data_update_is_scrub(data_opts->type)) {
 		if (data_opts->type != BCH_DATA_UPDATE_copygc) {
 			ret = bch2_can_do_data_update(trans, opts, data_opts, k, NULL);
 			if (ret) {
@@ -728,7 +743,7 @@ int bch2_move_extent(struct moving_context *ctxt,
 		ret = bch2_btree_node_rewrite_pos(trans, iter->btree_id, level,
 						  node_key.k->k.p,
 						  data_opts->target,
-						  data_opts->commit_flags,
+						  commit_flags,
 						  data_opts->write_flags);
 
 		if (ctxt->budget)
@@ -739,8 +754,17 @@ int bch2_move_extent(struct moving_context *ctxt,
 		    !bch2_err_matches(ret, ENOMEM))
 			move_btree_node_trace(c, opts, data_opts,
 					      bkey_i_to_s_c(node_key.k), ret);
-	} else
+	} else if (data_opts->type == BCH_DATA_UPDATE_scrub) {
 		ret = bch2_btree_node_scrub(trans, iter->btree_id, level, k, data_opts->read_dev);
+	} else {
+		/*
+		 * scrub_no_repair: bch2_btree_node_scrub() repairs, and the
+		 * journal scrub checks nodes itself with a report callback -
+		 * scrub_journal_node() - so nothing should send one here:
+		 */
+		WARN_ON_ONCE(1);
+		ret = bch_err_throw(c, invalid);
+	}
 
 	if (bch2_err_matches(ret, ENOMEM)) {
 		/* memory allocation failure, wait for some IO to finish */
@@ -858,7 +882,7 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 					delay);
 
 		if (unlikely(freezing(current))) {
-			bch2_moving_ctxt_flush_all(ctxt);
+			bch2_trans_unlock_long(ctxt->trans);
 			try_to_freeze();
 		}
 	} while (delay);
@@ -991,7 +1015,127 @@ struct bp_walk {
 	};
 	u64	sector_start;
 	u64	sector_end;
+	/* scrub: check the device's stripe blocks against their checksums */
+	bool	verify_stripes;
 };
+
+/*
+ * The block of @k on the device and bucket @bp points into; the stripe is
+ * still locked, so @k is current.
+ */
+static int stripe_block_at_bp(struct bch_dev *ca, struct bkey_s_c_stripe s,
+			      struct bkey_s_c_backpointer bp)
+{
+	u64 bucket = bp_pos_to_bucket(ca, bp.k->p).offset;
+
+	for (unsigned i = 0; i < s.v->nr_blocks; i++)
+		if (s.v->ptrs[i].dev == ca->dev_idx &&
+		    sector_to_bucket(ca, s.v->ptrs[i].offset) == bucket)
+			return i;
+	return -1;
+}
+
+/*
+ * A bad stripe block: point the stripe's pointer to it at
+ * BCH_SB_MEMBER_INVALID, as removing its device would. The stripe is then
+ * degraded, and reconcile rebuilds it. Refused if the stripe couldn't be
+ * rebuilt without it, or is open - being rewritten already.
+ */
+static int scrub_invalidate_stripe_block(struct btree_trans *trans,
+					 struct ec_stripe_buf *buf, unsigned block,
+					 bool *gone, bool *invalidated,
+					 struct printbuf *err)
+{
+	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, buf->key.k.p, BTREE_ITER_intent);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
+
+	/* deleted, or rewritten without that block, since we read it: */
+	if (k.k->type != KEY_TYPE_stripe ||
+	    block >= bkey_s_c_to_stripe(k).v->nr_blocks ||
+	    !bch2_extent_ptr_eq(bkey_s_c_to_stripe(k).v->ptrs[block],
+				buf->key.v.ptrs[block])) {
+		*gone = true;
+		return 0;
+	}
+
+	bool had_open = false;
+	u64 recorded = 0;
+	try(bch2_invalidate_stripe_to_dev(trans, &iter, k, buf->key.v.ptrs[block].dev,
+					  BCH_FORCE_IF_DATA_DEGRADED, err,
+					  &had_open, &recorded));
+	*invalidated = !had_open;
+	return 0;
+}
+
+static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
+			      struct bkey_s_c_backpointer bp, struct bkey_s_c k)
+{
+	struct btree_trans *trans = ctxt->trans;
+	struct bch_fs *c = trans->c;
+
+	if (k.k->type != KEY_TYPE_stripe)
+		return 0;
+
+	struct bkey_s_c_stripe s = bkey_s_c_to_stripe(k);
+	int block = stripe_block_at_bp(ca, s, bp);
+
+	/* An open stripe's blocks are being written: its checksums aren't final */
+	if (block < 0 || bch2_stripe_is_open(c, k.k->p.offset))
+		return 0;
+
+	struct ec_stripe_buf *buf __free(ec_stripe_buf_free) = kzalloc(sizeof(*buf), GFP_KERNEL);
+	if (!buf)
+		return bch_err_throw(c, ENOMEM_stripe_buf);
+
+	bkey_reassemble(&buf->key.k_i, k);
+
+	/* Don't hold btree locks for IO */
+	bch2_trans_unlock(trans);
+
+	s64 bad = bch2_ec_scrub_block(c, buf, block);
+	if (bad <= 0) {
+		/*
+		 * Couldn't read it: an IO error is counted by the device, and a
+		 * stale pointer means the stripe went away under us.
+		 */
+		return bad == -BCH_ERR_ENOMEM_stripe_buf ? bad : 0;
+	}
+
+	bool gone = false, invalidated = false;
+	CLASS(printbuf, err)();
+	int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+			    scrub_invalidate_stripe_block(trans, buf, block, &gone,
+							  &invalidated, &err));
+	if (gone)
+		return 0;
+
+	if (ctxt->stats)
+		atomic64_add(bad, invalidated
+			     ? &ctxt->stats->sectors_error_corrected
+			     : &ctxt->stats->sectors_error_uncorrected);
+
+	CLASS(bch_log_msg_ratelimited, msg)(c);
+	prt_printf(&msg.m, "scrub: stripe block %u on %s: %lli sectors don't match the stripe's checksums, expected ",
+		   block, ca->name, bad);
+	bch2_csum_to_text(&msg.m, buf->key.v.csum_type, buf->csum_good[block]);
+	prt_str(&msg.m, " got ");
+	bch2_csum_to_text(&msg.m, buf->key.v.csum_type, buf->csum_bad[block]);
+	prt_newline(&msg.m);
+	bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&buf->key.k_i));
+	prt_newline(&msg.m);
+
+	if (invalidated)
+		prt_str(&msg.m, "block invalidated, reconcile will rebuild the stripe");
+	else if (ret)
+		prt_printf(&msg.m, "error invalidating block: %s", bch2_err_str(ret));
+	else
+		prt_str(&msg.m, "not repaired: stripe is open");
+	prt_newline(&msg.m);
+	if (err.pos)
+		prt_str(&msg.m, err.buf);
+
+	return bch2_err_matches(ret, BCH_ERR_remove_would_lose_data) ? 0 : ret;
+}
 
 static int __bch2_move_data_phys(struct moving_context *ctxt,
 			struct move_bucket *bucket_in_flight,
@@ -1108,9 +1252,23 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 			continue;
 		}
 
+		/* Stripes aren't moved; scrub checks their blocks: */
+		if (!bp.v->level && bp.v->btree_id == BTREE_ID_stripes) {
+			if (w->verify_stripes && ca &&
+			    (data_types & BIT(bp.v->data_type))) {
+				ret = scrub_stripe_block(ctxt, ca, bp, k);
+				if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+					continue;
+				if (ret)
+					break;
+			}
+
+			bch2_btree_iter_advance(&bp_iter);
+			continue;
+		}
+
 		/* Not moving these; resolving them above still verified them: */
-		if (!(data_types & BIT(bp.v->data_type)) ||
-		    (!bp.v->level && bp.v->btree_id == BTREE_ID_stripes)) {
+		if (!(data_types & BIT(bp.v->data_type))) {
 			bch2_btree_iter_advance(&bp_iter);
 			continue;
 		}
@@ -1158,6 +1316,7 @@ int bch2_move_data_phys(struct bch_fs *c,
 			struct bch_move_stats *stats,
 			struct write_point_specifier wp,
 			bool wait_on_copygc,
+			bool verify_stripes,
 			move_pred_fn pred, void *arg)
 {
 	struct moving_context ctxt __cleanup(bch2_moving_ctxt_exit);
@@ -1175,6 +1334,7 @@ int bch2_move_data_phys(struct bch_fs *c,
 		.dev		= { .dev = dev },
 		.sector_start	= start,
 		.sector_end	= end,
+		.verify_stripes	= verify_stripes,
 	};
 
 	return __bch2_move_data_phys(&ctxt, NULL, &w, data_types, false, pred, arg);
@@ -1192,7 +1352,8 @@ static int evacuate_pred(struct btree_trans *trans, void *_arg,
 	struct bch_fs *c = trans->c;
 	struct evacuate_arg *arg = _arg;
 
-	data_opts->read_dev = -1;
+	data_opts->read_dev	= -1;
+	data_opts->target	= io_opts->background_target;
 
 	unsigned ptr_bit = 1;
 	bkey_for_each_ptr(bch2_bkey_ptrs_c(k), ptr) {
@@ -1245,7 +1406,8 @@ static int evacuate_ec_orphan_pred(struct btree_trans *trans, void *_arg,
 	struct extent_ptr_decoded p = {};
 	unsigned ptr_bit = 1;
 
-	data_opts->read_dev = -1;
+	data_opts->read_dev	= -1;
+	data_opts->target	= io_opts->background_target;
 
 	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
 		if (p.ptr.dev == BCH_SB_MEMBER_INVALID &&
@@ -1288,7 +1450,8 @@ static int evacuate_bucket_pred(struct btree_trans *trans, void *_arg,
 	struct evacuate_bucket_arg *arg = _arg;
 
 	*data_opts = arg->data_opts;
-	data_opts->read_dev = -1;
+	data_opts->read_dev	= -1;
+	data_opts->target	= io_opts->background_target;
 
 	const union bch_extent_entry *entry;
 	struct extent_ptr_decoded p = {};
@@ -1368,6 +1531,142 @@ static int scrub_pred(struct btree_trans *trans, void *_arg,
 #include "journal/read.h"
 #include "btree/journal_overlay.h"
 
+/*
+ * Devices with a replica the scrub found bad in what it queued from @start on.
+ * A replica that fails its read is retried off another one: the move stats
+ * only see the reads that failed on every replica.
+ */
+static void scrub_journal_bad_replica_devs(struct bch_fs *c, size_t start,
+					   struct bch_devs_mask *devs)
+{
+	guard(mutex)(&c->scrub_journal_repairs_lock);
+
+	for (size_t i = start; i < c->scrub_journal_repairs.nr; i++) {
+		scrub_journal_repair *r = &c->scrub_journal_repairs.data[i];
+		unsigned ptr_bit = 1;
+
+		bkey_for_each_ptr(bch2_bkey_ptrs_c(bkey_i_to_s_c(&r->k)), ptr) {
+			if (r->bad_devs & ptr_bit)
+				__set_bit(ptr->dev, devs->d);
+			ptr_bit <<= 1;
+		}
+	}
+}
+
+/*
+ * A btree node the journal scrub found a pointer to in the window.
+ *
+ * Extents get their verdict from the read path: a replica that fails is
+ * retried off the others, so "uncorrected" already means no replica was good.
+ * Node scrub has no retry - each replica is checked on its own - so every
+ * replica is checked here, and the verdict made once they've all reported.
+ * Some good: the node is rewritten from one once we're rw. None good: a rewind
+ * won't help - it only rolls back leaf keys, interior pointers stay (see
+ * bch2_journal_keys_sort()), so the node would still be reached. The btree is
+ * flagged as having lost data instead, which gets topology repair run before
+ * journal replay: found by replay, it would be too late - we're rw by then.
+ */
+struct scrub_journal_lost_nodes {
+	atomic_t		nr;
+	DECLARE_BITMAP(btrees, BTREE_ID_NR);
+};
+
+struct scrub_journal_node {
+	struct closure		cl;
+	struct moving_context	*ctxt;
+	struct scrub_journal_lost_nodes *lost;
+	struct bch_fs		*c;
+	enum btree_id		btree;
+	unsigned		level;
+	unsigned		checked;	/* pointers whose replicas were read */
+	atomic_t		bad;		/* ... and found bad */
+	struct bkey_buf		key;
+};
+
+static void scrub_journal_node_report(void *priv, unsigned dev, bool good)
+{
+	struct scrub_journal_node *n = priv;
+
+	if (!good)
+		atomic_or(bch2_bkey_dev_ptr_bit(n->c, bkey_i_to_s_c(n->key.k), dev), &n->bad);
+	closure_put(&n->cl);
+}
+
+static CLOSURE_CALLBACK(scrub_journal_node_free)
+{
+	closure_type(n, struct scrub_journal_node, cl);
+
+	bch2_bkey_buf_exit(&n->key);
+	kfree(n);
+}
+
+static CLOSURE_CALLBACK(scrub_journal_node_done)
+{
+	closure_type(n, struct scrub_journal_node, cl);
+	struct bch_fs *c = n->c;
+	struct bch_move_stats *stats = n->ctxt->stats;
+	unsigned bad = atomic_read(&n->bad);
+
+	if (bad && bad == n->checked) {
+		atomic_inc(&n->lost->nr);
+		set_bit(n->btree, n->lost->btrees);
+
+		/* just the devices, for reporting: uncorrected sectors mean a rewind */
+		unsigned ptr_bit = 1;
+		bkey_for_each_ptr(bch2_bkey_ptrs_c(bkey_i_to_s_c(n->key.k)), ptr) {
+			if (bad & ptr_bit)
+				set_bit(ptr->dev, stats->devs_error_uncorrected.d);
+			ptr_bit <<= 1;
+		}
+	} else if (bad) {
+		bch2_scrub_journal_queue(c, n->btree, n->level, n->key.k, bad, 0);
+	}
+
+	closure_return_with_destructor(cl, scrub_journal_node_free);
+}
+
+static int scrub_journal_node(struct moving_context *ctxt,
+			      struct scrub_journal_lost_nodes *lost,
+			      enum btree_id btree, unsigned level, struct bkey_s_c k)
+{
+	struct btree_trans *trans = ctxt->trans;
+	struct bch_fs *c = trans->c;
+
+	struct scrub_journal_node *n = kzalloc(sizeof(*n), GFP_KERNEL);
+	if (!n)
+		return bch_err_throw(c, ENOMEM_scrub_journal_node);
+
+	n->ctxt		= ctxt;
+	n->lost		= lost;
+	n->c		= c;
+	n->btree	= btree;
+	n->level	= level;
+	bch2_bkey_buf_init(&n->key);
+	bch2_bkey_buf_reassemble(&n->key, k);
+	closure_init(&n->cl, &ctxt->cl);
+
+	int ret = 0;
+	unsigned ptr_bit = 1;
+	bkey_for_each_ptr(bch2_bkey_ptrs_c(k), ptr) {
+		/* same as extents: an absent device tells us nothing */
+		if (bch2_dev_idx_is_online(c, ptr->dev)) {
+			closure_get(&n->cl);
+			int ret2 = bch2_btree_node_scrub_report(trans, btree, level, k, ptr->dev,
+								scrub_journal_node_report, n);
+			if (!ret2)
+				n->checked |= ptr_bit;
+			else {
+				closure_put(&n->cl);
+				ret = ret ?: ret2;
+			}
+		}
+		ptr_bit <<= 1;
+	}
+
+	continue_at(&n->cl, scrub_journal_node_done, NULL);
+	return ret;
+}
+
 int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 {
 	CLASS(darray_u64, flushes)();
@@ -1398,8 +1697,9 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 		return 0;
 	}
 
+	/* a range is the entries between two flushes */
 	bch_info(c, "journal scrub: checking %zu flush ranges",
-		 flushes.nr);
+		 flushes.nr - 1);
 
 	struct bch_move_stats stats;
 	bch2_move_stats_init(&stats, "journal_scrub");
@@ -1413,12 +1713,15 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 	/*
 	 * Scrub one flush range at a time, newest first. Within each range,
 	 * fire off all reads asynchronously, then flush once to check for
-	 * errors. Walk backwards until we find a good range — everything
-	 * newer is tainted.
+	 * errors. Walk backwards until two ranges in a row read clean; rewind
+	 * to the start of the oldest range with data no replica could be read
+	 * back for - everything newer is tainted. A bad replica read back from
+	 * a good one is repaired from it instead, once we're rw.
 	 *
 	 * Stop if we've gone further back than scrub_journal_max_rewind_secs seconds.
 	 */
 	unsigned nr_good = 0;
+	struct scrub_journal_lost_nodes lost_nodes = {};
 
 	for (int f = flushes.nr - 1; f > 0; f--) {
 		u64 range_start = flushes.data[f - 1];
@@ -1426,6 +1729,11 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 		u64 errors_before = atomic64_read(&stats.sectors_error_uncorrected);
 		memset(&stats.devs_error_uncorrected, 0, sizeof(stats.devs_error_uncorrected));
 		int move_ret = 0;
+
+		size_t queued_before;
+		scoped_guard(mutex, &c->scrub_journal_repairs_lock)
+			queued_before = c->scrub_journal_repairs.nr;
+		unsigned nodes_lost_before = atomic_read(&lost_nodes.nr);
 
 		darray_for_each(*keys, jk) {
 			u64 seq = c->journal_entries_base_seq + jk->journal_seq_offset;
@@ -1439,8 +1747,23 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 			if (!ptrs.start)
 				continue;
 
+			/*
+			 * A pointer to a node checks the whole node, bsets
+			 * appended since included. New roots are btree_root
+			 * entries, not keys, so they're not seen here - they
+			 * don't need to be only because read_btree_roots() reads
+			 * every root before we run. If that ever changes, they
+			 * need checking here too.
+			 */
+			if (bkey_is_btree_ptr(k.k)) {
+				ret = scrub_journal_node(&ctxt, &lost_nodes, jk->btree_id, jk->level, k);
+				if (ret)
+					move_ret = ret;
+				continue;
+			}
+
 			struct bch_inode_opts io_opts;
-			bch2_inode_opts_get(c, &io_opts, bkey_is_btree_ptr(k.k));
+			bch2_inode_opts_get(c, &io_opts, false);
 
 			bkey_for_each_ptr(ptrs, ptr) {
 				/*
@@ -1494,17 +1817,41 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 				bch2_err_str(move_ret),
 				range_start + 1, range_end == U64_MAX ? range_start : range_end);
 
-		bool checksum_err = atomic64_read(&stats.sectors_error_uncorrected) != errors_before;
+		/* uncorrected: every replica failed, so only a rewind fixes it */
+		bool lost = atomic64_read(&stats.sectors_error_uncorrected) != errors_before;
+		bool repair;
+		scoped_guard(mutex, &c->scrub_journal_repairs_lock)
+			repair = c->scrub_journal_repairs.nr != queued_before;
+		/* no rewind for these: see struct scrub_journal_node */
+		bool range_lost_nodes = atomic_read(&lost_nodes.nr) != nodes_lost_before;
 
-		if (checksum_err) {
-			bch2_sb_error_count(c, BCH_FSCK_ERR_device_bad_flush);
+		if (lost || repair || range_lost_nodes) {
+			struct bch_devs_mask devs = stats.devs_error_uncorrected;
+			scrub_journal_bad_replica_devs(c, queued_before, &devs);
+
+			/* a lost node is counted when recovery reads it */
+			if (lost)
+				bch2_sb_error_count(c, BCH_FSCK_ERR_device_bad_flush_forced_rewind);
+			else if (repair)
+				bch2_sb_error_count(c, BCH_FSCK_ERR_device_bad_flush_repaired_from_replica);
+
+			CLASS(printbuf, what)();
+			if (lost)
+				prt_str(&what, "data with no good replica");
+			else if (repair)
+				prt_str(&what, "bad replicas, to repair from good ones");
+			if (range_lost_nodes)
+				prt_printf(&what, "%sbtree nodes with no good replica",
+					   what.pos ? ", " : "");
+
 			CLASS(bch_log_msg, msg)(c);
-			prt_printf(&msg.m, "journal scrub: checksum errors in flush range seq %llu-%llu, "
+			prt_printf(&msg.m, "journal scrub: %s in flush range seq %llu-%llu, "
 				"device(s) not honoring flush/FUA:",
+				what.buf,
 				range_start + 1, range_end == U64_MAX ? range_start : range_end);
 
 			unsigned i;
-			for_each_set_bit(i, stats.devs_error_uncorrected.d, BCH_SB_MEMBERS_MAX) {
+			for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
 				CLASS(bch2_dev_tryget_noerror, ca)(c, i);
 				if (ca)
 					prt_printf(&msg.m, " %s", ca->name);
@@ -1513,14 +1860,16 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 			}
 
 			guard(mutex_noio)(&c->sb_lock);
-			for_each_set_bit(i, stats.devs_error_uncorrected.d, BCH_SB_MEMBERS_MAX) {
+			for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
 				struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, i);
 				if (m)
 					le64_add_cpu(&m->flush_errors, 1);
 			}
 			bch2_write_super(c);
 
-			*rewind_seq = range_start;
+			if (lost)
+				*rewind_seq = range_start;
+			/* Not a good range: keep looking further back for lost data */
 			nr_good = 0;
 		} else if (++nr_good >= 2) {
 			/* Two consecutive good ranges — safe to stop */
@@ -1528,22 +1877,92 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 		}
 	}
 
+	if (!bitmap_empty(lost_nodes.btrees, BTREE_ID_NR)) {
+		CLASS(bch_log_msg, msg)(c);
+		prt_printf(&msg.m, "journal scrub: %u btree nodes with no good replica, "
+			   "repairing topology before journal replay\n",
+			   atomic_read(&lost_nodes.nr));
+
+		unsigned btree;
+		for_each_set_bit(btree, lost_nodes.btrees, BTREE_ID_NR)
+			try(bch2_btree_lost_data(c, &msg.m, btree));
+	}
+
 	return 0;
 }
 
+/*
+ * The journal scrub runs during recovery with journal keys frozen - nothing may
+ * commit - so what it finds is queued here, for bch2_scrub_journal_do_repairs()
+ * once we're rw and any rewind has happened.
+ */
+void bch2_scrub_journal_queue(struct bch_fs *c, enum btree_id btree, unsigned level,
+			      struct bkey_i *k, unsigned bad_devs, int read_err)
+{
+	static_assert(BKEY_BTREE_PTR_VAL_U64s_MAX <= BKEY_EXTENT_VAL_U64s_MAX);
+
+	scrub_journal_repair r = {
+		.btree_id	= btree,
+		.level		= level,
+		.bad_devs	= bad_devs,
+		.read_err	= read_err,
+	};
+	bkey_copy(&r.k, k);
+
+	guard(mutex)(&c->scrub_journal_repairs_lock);
+	darray_push(&c->scrub_journal_repairs, r);
+}
+
+enum scrub_journal_outcome {
+	SCRUB_JOURNAL_unchanged,
+	SCRUB_JOURNAL_repaired,
+	SCRUB_JOURNAL_rewound,
+	SCRUB_JOURNAL_lost,
+	SCRUB_JOURNAL_NR,
+};
+
 static int scrub_journal_repair_one(struct moving_context *ctxt,
-				    scrub_journal_repair *r)
+				    scrub_journal_repair *r,
+				    enum scrub_journal_outcome *outcome)
 {
 	struct btree_trans *trans = ctxt->trans;
 	struct bch_fs *c = trans->c;
 	struct bkey_s_c stashed = bkey_i_to_s_c(&r->k);
 
+	/*
+	 * A btree node with a bad replica: rewrite it from a good one - if the
+	 * pointer we found is still the node's. If not, it's been replaced
+	 * since, and there's nothing left to repair.
+	 */
+	if (r->level) {
+		*outcome = SCRUB_JOURNAL_repaired;
+		int ret = bch2_btree_node_rewrite_key(trans, r->btree_id, r->level - 1, &r->k, 0);
+		if (bch2_err_matches(ret, ENOENT)) {
+			*outcome = SCRUB_JOURNAL_unchanged;
+			ret = 0;
+		}
+		return ret;
+	}
+
 	CLASS(btree_iter, iter)(trans, r->btree_id, bkey_start_pos(stashed.k),
 				BTREE_ITER_intent);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 
-	if (!bch2_extents_match(c, k, stashed))
-		return 0;
+	*outcome = SCRUB_JOURNAL_unchanged;
+
+	/*
+	 * Gone: the rewind took it, along with the write it came from. If that
+	 * write was one we couldn't read back, the file lost it - say so.
+	 */
+	if (!bch2_extents_match(c, k, stashed)) {
+		if (!r->read_err)
+			return 0;
+
+		*outcome = SCRUB_JOURNAL_rewound;
+		try(bch2_damage_record_key_if_inode(trans, r->btree_id, stashed.k->p,
+						    BCH_FSCK_ERR_device_bad_flush_forced_rewind));
+		return bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc);
+	}
 
 	/*
 	 * Trim both keys to the overlapping range before remapping,
@@ -1558,6 +1977,21 @@ static int scrub_journal_repair_one(struct moving_context *ctxt,
 	if (!bad_devs)
 		return 0;
 
+	/* No good replica, and no rewind took it: that's plain data loss */
+	unsigned all_ptrs = 0, ptr_bit = 1;
+	bkey_for_each_ptr(bch2_bkey_ptrs(bkey_i_to_s(trimmed)), ptr) {
+		all_ptrs |= ptr_bit;
+		ptr_bit <<= 1;
+	}
+
+	if (r->read_err && bad_devs == all_ptrs) {
+		*outcome = SCRUB_JOURNAL_lost;
+		try(bch2_damage_record_key(trans, r->btree_id, stashed.k->p,
+					   bch2_data_read_sb_err(r->read_err)));
+		return bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc);
+	}
+
+	/* Repair it from whatever replica is good */
 	struct bch_inode_opts io_opts;
 	bch2_inode_opts_get(c, &io_opts, bkey_is_btree_ptr(k.k));
 
@@ -1567,6 +2001,7 @@ static int scrub_journal_repair_one(struct moving_context *ctxt,
 		.ptrs_kill	= bad_devs,
 	};
 
+	*outcome = SCRUB_JOURNAL_repaired;
 	return bch2_move_extent(ctxt, NULL, &io_opts, &data_opts, &iter, 0, k);
 }
 
@@ -1574,14 +2009,11 @@ int bch2_scrub_journal_do_repairs(struct bch_fs *c)
 {
 	CLASS(darray_scrub_journal_repair, repairs)();
 
-	mutex_lock(&c->scrub_journal_repairs_lock);
-	swap(repairs, c->scrub_journal_repairs);
-	mutex_unlock(&c->scrub_journal_repairs_lock);
+	scoped_guard(mutex, &c->scrub_journal_repairs_lock)
+		swap(repairs, c->scrub_journal_repairs);
 
 	if (!repairs.nr)
 		return 0;
-
-	bch_info(c, "journal scrub: repairing %zu extents with bad replicas", repairs.nr);
 
 	struct bch_move_stats stats;
 	bch2_move_stats_init(&stats, "journal_scrub_repair");
@@ -1591,11 +2023,19 @@ int bch2_scrub_journal_do_repairs(struct bch_fs *c)
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
 
+	unsigned nr[SCRUB_JOURNAL_NR] = {};
+
 	darray_for_each(repairs, r) {
+		enum scrub_journal_outcome outcome = SCRUB_JOURNAL_unchanged;
+
 		/* Ignore errors - don't want them blocking mount */
-		lockrestart_do(ctxt.trans, scrub_journal_repair_one(&ctxt, r));
+		lockrestart_do(ctxt.trans, scrub_journal_repair_one(&ctxt, r, &outcome));
+		nr[outcome]++;
 	}
 
+	bch_info(c, "journal scrub: repairing %u extents/btree nodes from good replicas; "
+		 "%u lost to the rewind, %u with no good replica",
+		 nr[SCRUB_JOURNAL_repaired], nr[SCRUB_JOURNAL_rewound], nr[SCRUB_JOURNAL_lost]);
 	return 0;
 }
 
@@ -1624,6 +2064,7 @@ int bch2_data_job(struct bch_fs *c,
 					  stats,
 					  writepoint_hashed((unsigned long) current),
 					  false,
+					  true,
 					  scrub_pred, op) ?: ret;
 		break;
 

@@ -392,6 +392,7 @@ static void bch2_btree_node_free_inmem(struct btree_trans *trans,
 	__btree_node_free(trans, b);
 
 	bch2_btree_node_transition_state(&c->btree.cache, b, BTREE_NODE_CACHE_FREEABLE);
+	bch2_trans_node_forget(trans, b);
 }
 
 /*
@@ -1458,14 +1459,35 @@ bch2_btree_update_start(struct btree_trans *trans, btree_path_idx_t path_idx,
 		commit_flags |= watermark;
 	}
 
+	/*
+	 * Going read-only, every interior update is part of the final journal
+	 * flush, which can't finish until it does - and discards, the only
+	 * thing that would free buckets, stopped with writes. Below the
+	 * reclaim watermark a node allocation can wait on the btree reserve
+	 * forever (unmount hanging in __bch2_wait_on_allocator()):
+	 */
+	if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)) &&
+	    watermark < BCH_WATERMARK_reclaim) {
+		watermark = BCH_WATERMARK_reclaim;
+		commit_flags &= ~BCH_WATERMARK_MASK;
+		commit_flags |= watermark;
+	}
+
 	if (watermark < BCH_WATERMARK_reclaim &&
 	    journal_low_on_space(&c->journal)) {
 		if (commit_flags & BCH_TRANS_COMMIT_journal_reclaim)
 			return ERR_PTR(-BCH_ERR_journal_reclaim_would_deadlock);
 
+		/*
+		 * Or until the journal errors out: a halted journal stays low on
+		 * space for good, and the bch2_journal_error() check below
+		 * returns the error (tools#971 - rewrite workers queued after a
+		 * failed mount waited here forever, holding up bch2_fs_stop()):
+		 */
 		ret = drop_locks_do(trans,
 			({ trans_wait_event(trans, &c->journal.async_wait,
-					    !journal_low_on_space(&c->journal)); 0; }));
+					    !journal_low_on_space(&c->journal) ||
+					    bch2_journal_error(&c->journal)); 0; }));
 		if (ret)
 			return ERR_PTR(ret);
 	}
@@ -1547,7 +1569,7 @@ bch2_btree_update_start(struct btree_trans *trans, btree_path_idx_t path_idx,
 	if (ret)
 		goto err;
 
-	ret = bch2_disk_reservation_get(c, &as->disk_res,
+	ret = bch2_disk_reservation_add(c, &as->disk_res,
 			(nr_nodes[0] + nr_nodes[1]) * btree_sectors(c),
 			READ_ONCE(c->opts.metadata_replicas),
 			disk_res_flags);
@@ -1591,8 +1613,8 @@ bch2_btree_update_start(struct btree_trans *trans, btree_path_idx_t path_idx,
 			ret = bch2_btree_reserve_get(trans, as, nr_nodes, req);
 			if (!bch2_err_matches(ret, BCH_ERR_operation_blocked))
 				break;
-			bch2_wait_on_allocator(trans, req, ret, &cl);
-		} while (1);
+			ret = bch2_wait_on_allocator(trans, req, ret, &cl);
+		} while (!ret);
 
 		/*
 		 * Don't block with btree locks held
@@ -3716,6 +3738,16 @@ static int __bch2_btree_node_update_key(struct btree_trans *trans,
 
 		struct btree_update *as = (void *) (READ_ONCE(b->will_make_reachable) & ~1UL);
 		struct btree_update_node *n = darray_find_p(as->new_nodes, i, i->b == b);
+
+		/*
+		 * Reconcile state on a new node's key is computed, with
+		 * triggers, by btree_update_nodes_written_trans() - which
+		 * strips it again if the node is freed before it becomes
+		 * reachable. The update that frees it runs trigger_old on
+		 * b->key, so b->key mustn't carry reconcile state that
+		 * trigger_new never saw:
+		 */
+		bkey_strip_reconcile(c, bkey_i_to_s(new_key));
 
 		bch2_btree_node_lock_write_nofail(trans, btree_iter_path(trans, iter), &b->c);
 		bkey_copy(&b->key, new_key);

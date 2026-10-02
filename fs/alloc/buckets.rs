@@ -26,35 +26,22 @@ impl<'f> DiskReservation<'f> {
         }
     }
 
-    pub fn init(fs: &'f Fs, nr_replicas: u32) -> Self {
-        DiskReservation {
-            fs,
-            raw: UnsafeCell::new(unsafe { c::bch2_disk_reservation_init(fs.raw, nr_replicas) }),
-        }
-    }
-
-    pub fn get(
-        fs:          &'f Fs,
+    /// Reserve `sectors` of data at `nr_replicas` copies, on top of whatever
+    /// this reservation already holds.
+    pub fn add(
+        &self,
         sectors:     u64,
         nr_replicas: u32,
         flags:       c::bch_reservation_flags,
-    ) -> Result<Self, BchError> {
-        let ret = Self::new(fs);
+    ) -> Result<(), BchError> {
         ret_to_result(unsafe {
-            c::bch2_disk_reservation_get(
-                fs.raw,
-                ret.raw.get(),
+            c::bch2_disk_reservation_add(
+                self.fs.raw,
+                self.raw.get(),
                 sectors,
                 nr_replicas,
                 flags.0 as i32,
             )
-        })?;
-        Ok(ret)
-    }
-
-    pub fn add(&self, sectors: u64, flags: c::bch_reservation_flags) -> Result<(), BchError> {
-        ret_to_result(unsafe {
-            c::bch2_disk_reservation_add(self.fs.raw, self.raw.get(), sectors, flags)
         })
     }
 

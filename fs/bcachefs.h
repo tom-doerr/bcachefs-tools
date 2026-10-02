@@ -533,6 +533,19 @@ struct bucket_bitmap {
 	struct mutex		lock;
 };
 
+/*
+ * unflushed_writes: a write completed that the device may still hold in its
+ * volatile cache; journal_write_preflush() clears it when it flushes the device.
+ */
+#define BCH_DEV_FLAGS()			\
+	x(unflushed_writes)
+
+enum bch_dev_flags {
+#define x(n)		BCH_DEV_##n,
+	BCH_DEV_FLAGS()
+#undef x
+};
+
 struct bch_dev {
 	struct kobject		kobj;
 #ifdef CONFIG_BCACHEFS_DEBUG
@@ -577,6 +590,7 @@ struct bch_dev {
 	u64			btree_allocated_bitmap_gc;
 	atomic64_t		errors[BCH_MEMBER_ERROR_NR];
 	unsigned long		write_errors_start;
+	unsigned long		flags;
 
 	__uuid_t		uuid;
 	char			name[BDEVNAME_SIZE];
@@ -624,6 +638,9 @@ struct bch_dev {
 	unsigned		nr_open_buckets;
 	unsigned		nr_partial_buckets;
 	unsigned		nr_btree_reserve;
+
+	/* this device's share of c->capacity.reserved, which is their sum */
+	u64			reserved_sectors;
 
 	struct work_struct	invalidate_work;
 
@@ -678,6 +695,7 @@ struct bch_dev {
 
 #define BCH_FS_FLAGS()			\
 	x(new_fs)			\
+	x(start_begun)			\
 	x(started)			\
 	x(clean_recovery)		\
 	x(btree_running)		\
@@ -705,6 +723,7 @@ struct bch_dev {
 	x(no_invalid_checks)		\
 	x(discard_mount_opt_set)	\
 	x(sb_dirty)			\
+	x(all_devs_rw)			\
 
 enum bch_fs_flags {
 #define x(n)		BCH_FS_##n,
@@ -856,6 +875,11 @@ struct bch_fs {
 
 	struct journal				journal;
 	u64					journal_replay_seq_start;
+	/*
+	 * Journal scrub: where its first flush range starts - the newest flush
+	 * before journal_replay_seq_start - while it runs; 0 otherwise.
+	 */
+	u64					journal_scrub_seq;
 	u64					journal_replay_seq_end;
 	GENRADIX(struct journal_replay *)	journal_entries;
 	u64					journal_entries_base_seq;

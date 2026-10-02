@@ -970,79 +970,15 @@ static bool check_version_upgrade(struct bch_fs *c, struct printbuf *out)
 	return ret;
 }
 
-noinline_for_stack
-static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
+/*
+ * Prepare the superblock for a start: last_mount, required recovery passes,
+ * version upgrade/downgrade, and what those imply. An open that will never
+ * start - offline superblock edits - skips this, so its in-memory superblock
+ * stays what's on disk plus the caller's edit, and writing it persists only
+ * that. See __bch2_write_super().
+ */
+static void bch2_fs_sb_prep_for_start(struct bch_fs *c, struct printbuf *out)
 {
-	if (c->opts.norecovery) {
-		c->opts.recovery_pass_last = c->opts.recovery_pass_last
-			? min(c->opts.recovery_pass_last, BCH_RECOVERY_PASS_snapshots_read)
-			: BCH_RECOVERY_PASS_snapshots_read;
-		c->opts.nochanges = true;
-	}
-
-	if (c->opts.nochanges)
-		c->opts.read_only = true;
-
-	if (c->opts.journal_rewind)
-		c->opts.fsck = true;
-
-	if (!(c->sb.features & (BIT_ULL(BCH_FEATURE_small_image)|
-			        BIT_ULL(BCH_FEATURE_no_default_sb))) ||
-	    bch2_fs_will_resize_on_mount(c))
-		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
-
-	prt_str(out, "starting version ");
-	bch2_version_to_text(out, c->sb.version);
-	prt_newline(out);
-
-	bool first = true;
-	for (enum bch_opt_id i = 0; i < bch2_opts_nr; i++) {
-		const struct bch_option *opt = &bch2_opt_table[i];
-		u64 v = bch2_opt_get_by_id(&c->opts, i);
-
-		if (!(opt->flags & OPT_MOUNT))
-			continue;
-
-		if (v == bch2_opt_get_by_id(&bch2_opts_default, i))
-			continue;
-
-		prt_str(out, first ? "with options: " : ",");
-		first = false;
-		bch2_opt_to_text(out, c, c->disk_sb.sb, opt, v, OPT_SHOW_MOUNT_STYLE);
-	}
-
-	if (!first)
-		prt_newline(out);
-
-	if (c->sb.version_incompat_allowed != c->sb.version) {
-		prt_printf(out, "allowing incompatible features up to ");
-		bch2_version_to_text(out, c->sb.version_incompat_allowed);
-		prt_newline(out);
-	}
-
-	if (c->opts.verbose) {
-		prt_printf(out, "features: ");
-		prt_bitflags(out, bch2_sb_features, c->sb.features);
-		prt_newline(out);
-	}
-
-	if (c->sb.multi_device) {
-		first = true;
-		prt_printf(out, "with devices: ");
-		for_each_online_member(c, ca, BCH_DEV_READ_REF_bch2_online_devs) {
-			if (!first)
-				prt_char(out, ',');
-			first = false;
-			prt_str(out, ca->name);
-		}
-		prt_newline(out);
-	}
-
-	/* cf_encoding log message should be here, but it breaks xfstests - sigh */
-
-	if (c->opts.journal_rewind)
-		prt_printf(out, "rewinding journal, fsck required\n");
-
 	scoped_guard(mutex_noio, &c->sb_lock) {
 		struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
 
@@ -1108,6 +1044,86 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 
 		set_bit(BCH_FS_sb_dirty, &c->flags);
 	}
+}
+
+noinline_for_stack
+static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
+{
+	if (c->opts.norecovery) {
+		c->opts.recovery_pass_last = c->opts.recovery_pass_last
+			? min(c->opts.recovery_pass_last, BCH_RECOVERY_PASS_snapshots_read)
+			: BCH_RECOVERY_PASS_snapshots_read;
+		c->opts.nochanges = true;
+	}
+
+	if (c->opts.nochanges)
+		c->opts.read_only = true;
+
+	if (c->opts.will_not_start)
+		c->opts.nostart = true;
+
+	if (c->opts.journal_rewind)
+		c->opts.fsck = true;
+
+	if (!(c->sb.features & (BIT_ULL(BCH_FEATURE_small_image)|
+			        BIT_ULL(BCH_FEATURE_no_default_sb))) ||
+	    bch2_fs_will_resize_on_mount(c))
+		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
+
+	prt_str(out, "starting version ");
+	bch2_version_to_text(out, c->sb.version);
+	prt_newline(out);
+
+	bool first = true;
+	for (enum bch_opt_id i = 0; i < bch2_opts_nr; i++) {
+		const struct bch_option *opt = &bch2_opt_table[i];
+		u64 v = bch2_opt_get_by_id(&c->opts, i);
+
+		if (!(opt->flags & OPT_MOUNT))
+			continue;
+
+		if (v == bch2_opt_get_by_id(&bch2_opts_default, i))
+			continue;
+
+		prt_str(out, first ? "with options: " : ",");
+		first = false;
+		bch2_opt_to_text(out, c, c->disk_sb.sb, opt, v, OPT_SHOW_MOUNT_STYLE);
+	}
+
+	if (!first)
+		prt_newline(out);
+
+	if (c->sb.version_incompat_allowed != c->sb.version) {
+		prt_printf(out, "allowing incompatible features up to ");
+		bch2_version_to_text(out, c->sb.version_incompat_allowed);
+		prt_newline(out);
+	}
+
+	if (c->opts.verbose) {
+		prt_printf(out, "features: ");
+		prt_bitflags(out, bch2_sb_features, c->sb.features);
+		prt_newline(out);
+	}
+
+	if (c->sb.multi_device) {
+		first = true;
+		prt_printf(out, "with devices: ");
+		for_each_online_member(c, ca, BCH_DEV_READ_REF_bch2_online_devs) {
+			if (!first)
+				prt_char(out, ',');
+			first = false;
+			prt_str(out, ca->name);
+		}
+		prt_newline(out);
+	}
+
+	/* cf_encoding log message should be here, but it breaks xfstests - sigh */
+
+	if (c->opts.journal_rewind)
+		prt_printf(out, "rewinding journal, fsck required\n");
+
+	if (!c->opts.will_not_start)
+		bch2_fs_sb_prep_for_start(c, out);
 
 	if (c->sb.clean)
 		set_bit(BCH_FS_clean_recovery, &c->flags);
@@ -1495,7 +1511,8 @@ static int bch2_fs_may_start(struct bch_fs *c, struct printbuf *err)
 
 	if (!bch2_can_read_fs_with_devs(c, &c->devs_online, flags, err) ||
 	    (!c->opts.read_only &&
-	     !bch2_can_write_fs_with_devs(c, c->allocator.rw_devs[0], flags, err))) {
+	     !bch2_can_write_fs_with_devs(c, c->allocator.rw_devs[0], BCH_WRITE_CHECK_start,
+					  flags, err))) {
 		bch2_missing_devs_to_text(err, c);
 		return bch_err_throw(c, insufficient_devices_to_start);
 	}
@@ -1506,6 +1523,13 @@ static int bch2_fs_may_start(struct bch_fs *c, struct printbuf *err)
 static int __bch2_fs_start(struct bch_fs *c, struct printbuf *err)
 {
 	BUG_ON(test_bit(BCH_FS_started, &c->flags));
+
+	/* the open skipped what a start needs - see bch2_fs_opt_version_init() */
+	if (c->opts.will_not_start)
+		return bch_err_throw(c, EINVAL_will_not_start);
+
+	/* superblock writes from here on are part of bringing it up: */
+	set_bit(BCH_FS_start_begun, &c->flags);
 
 	scoped_guard(rwsem_write, &c->state_lock) {
 		scoped_guard(rcu)

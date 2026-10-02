@@ -284,6 +284,20 @@ static inline bool bch2_dev_is_rw(struct bch_dev *ca)
 	return test_bit(ca->dev_idx, ca->fs->allocator.rw_devs[BCH_DATA_free].d);
 }
 
+/*
+ * Everything that divides c->capacity.capacity up per device has to agree with
+ * bch2_recalc_capacity() about which devices are in the sum.
+ */
+static inline bool dev_has_capacity(struct bch_dev *ca)
+{
+	return bch2_dev_is_rw(ca) && ca->mi.durability;
+}
+
+static inline u64 dev_capacity_sectors(struct bch_dev *ca)
+{
+	return bucket_to_sector(ca, ca->mi.nbuckets - ca->mi.first_bucket);
+}
+
 static inline u64 __dev_buckets_free(struct bch_dev *ca,
 				     struct bch_dev_usage usage,
 				     enum bch_watermark watermark)
@@ -300,15 +314,21 @@ static inline u64 dev_buckets_free(struct bch_dev *ca,
 	return __dev_buckets_free(ca, bch2_dev_usage_read(ca), watermark);
 }
 
+/* Buckets that are free, or become free without moving anything */
+static inline u64 __dev_buckets_reclaimable(struct bch_dev_usage usage)
+{
+	return usage.buckets[BCH_DATA_free] +
+	       usage.buckets[BCH_DATA_cached] +
+	       usage.buckets[BCH_DATA_need_gc_gens] +
+	       usage.buckets[BCH_DATA_need_discard];
+}
+
 static inline u64 __dev_buckets_available(struct bch_dev *ca,
 					  struct bch_dev_usage usage,
 					  enum bch_watermark watermark)
 {
 	return max_t(s64, 0,
-		       usage.buckets[BCH_DATA_free]
-		     + usage.buckets[BCH_DATA_cached]
-		     + usage.buckets[BCH_DATA_need_gc_gens]
-		     + usage.buckets[BCH_DATA_need_discard]
+		       __dev_buckets_reclaimable(usage)
 		     - ca->nr_open_buckets
 		     - bch2_dev_buckets_reserved(ca, watermark));
 }
@@ -323,6 +343,25 @@ static inline u64 dev_buckets_available(struct bch_dev *ca,
 
 struct bch_fs_usage_short
 bch2_fs_usage_read_short(struct bch_fs *);
+
+/* raw sectors: they land somewhere whatever count they were taken at */
+static inline u64 bch2_online_reserved(struct bch_fs *c)
+{
+	u64 ret = 0;
+
+	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++)
+		ret += percpu_u64_get(&c->capacity.pcpu->online_reserved[i]);
+	return ret;
+}
+
+/*
+ * What we'd grant at each replica count: @out[n - 1] is placeable at n or more,
+ * @out_now (optional) the same without waiting for copygc.
+ */
+void bch2_fs_sectors_placeable(struct bch_fs *, u64 *, u64 *);
+void bch2_disk_reservation_caches_invalidate(struct bch_fs *);
+void bch2_disk_reservation_degraded(struct bch_fs *, unsigned, unsigned,
+				    u64, unsigned long);
 
 int __bch2_bucket_ref_update(struct btree_trans *, struct bch_dev *,
 			     struct bkey_s_c, const struct bch_extent_ptr *,
@@ -384,11 +423,27 @@ static inline const char *bch2_data_type_str(enum bch_data_type type)
 
 /* Disk reservations: */
 
+/*
+ * Counts above BCH_REPLICAS_MAX are real - durability is per device - and share
+ * the last slot, which is the conservative direction. 0 is a bug; the clamp
+ * only keeps it in bounds.
+ */
+static inline unsigned disk_res_slot(unsigned nr_replicas)
+{
+	EBUG_ON(!nr_replicas);
+
+	return clamp_t(unsigned, nr_replicas, 1, BCH_REPLICAS_MAX) - 1;
+}
+
 static inline void bch2_disk_reservation_put(struct bch_fs *c,
 					     struct disk_reservation *res)
 {
 	if (res->sectors) {
-		this_cpu_sub(c->capacity.pcpu->online_reserved, res->sectors);
+		/* a lost count clamps to slot 0: these were charged elsewhere */
+		WARN_ON(!res->nr_replicas);
+
+		this_cpu_sub(c->capacity.pcpu->online_reserved[disk_res_slot(res->nr_replicas)],
+			     res->sectors);
 		res->sectors = 0;
 	}
 }
@@ -398,52 +453,129 @@ enum bch_reservation_flags {
 	BCH_DISK_RESERVATION_PARTIAL	= 1 << 1,
 };
 
-int __bch2_disk_reservation_add(struct bch_fs *, struct disk_reservation *,
-				u64, enum bch_reservation_flags);
+int bch2_disk_reservation_add_slowpath(struct bch_fs *, struct disk_reservation *,
+				       u64, enum bch_reservation_flags);
 
-static inline int bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
-					    u64 sectors, enum bch_reservation_flags flags)
+/*
+ * A reservation lives entirely in one slot, so changing its count moves what it
+ * holds. The counters are summed across cpus, so the two ops mustn't be split.
+ */
+static inline void disk_res_move_slot(struct bch_fs *c,
+				      struct disk_reservation *res,
+				      unsigned nr_replicas)
 {
+	if (res->sectors) {
+		unsigned old = disk_res_slot(res->nr_replicas);
+		unsigned new = disk_res_slot(nr_replicas);
+
+		scoped_guard(preempt)
+			if (old != new) {
+				this_cpu_sub(c->capacity.pcpu->online_reserved[old],
+					     res->sectors);
+				this_cpu_add(c->capacity.pcpu->online_reserved[new],
+					     res->sectors);
+			}
+	}
+
+	res->nr_replicas = nr_replicas;
+}
+
+/*
+ * Charging only ever raises the count: erring high reserves more than we need,
+ * erring low reserves space we can't place. Only write_degraded lowers it.
+ */
+static inline void bch2_disk_reservation_set_nr_replicas(struct bch_fs *c,
+							 struct disk_reservation *res,
+							 unsigned nr_replicas)
+{
+	if (nr_replicas > res->nr_replicas)
+		disk_res_move_slot(c, res, nr_replicas);
+}
+
+/*
+ * May we write fewer copies than were asked for, rather than returning -ENOSPC?
+ * See enum bch_write_degraded_actions for why the default is what it is.
+ */
+static inline bool bch2_write_degraded_ok(struct bch_fs *c)
+{
+	switch (c->opts.write_degraded) {
+	case BCH_WRITE_DEGRADED_yes:
+		return true;
+	case BCH_WRITE_DEGRADED_no:
+		return false;
+	default:
+		return !test_bit(BCH_FS_all_devs_rw, &c->flags);
+	}
+}
+
+/*
+ * In physical sectors, for the three callers whose number isn't sectors *
+ * nr_replicas: overwrites, which credit back the old key's copies. A smell -
+ * that arithmetic probably belongs elsewhere, and when it goes, so does this.
+ */
+static inline int __bch2_disk_reservation_add(struct bch_fs *c,
+					      struct disk_reservation *res,
+					      u64 sectors, unsigned nr_replicas,
+					      int flags)
+{
+	bch2_disk_reservation_set_nr_replicas(c, res, nr_replicas);
+
+	/*
+	 * Not a hard BUG_ON: bi_data_replicas isn't validated, so a damaged
+	 * inode can reach here with a zero count.
+	 */
+	EBUG_ON(sectors && !res->nr_replicas);
+
+	/* nothing to reserve: e.g. fallocate over a range that has enough copies */
+	if (!sectors)
+		return 0;
+
 #ifdef __KERNEL__
+	unsigned slot = disk_res_slot(res->nr_replicas);
 	u64 old, new;
 
-	old = this_cpu_read(c->capacity.pcpu->sectors_available);
+	old = this_cpu_read(c->capacity.pcpu->sectors_available[slot]);
 	do {
 		if (sectors > old)
-			return __bch2_disk_reservation_add(c, res, sectors, flags);
+			return bch2_disk_reservation_add_slowpath(c, res, sectors, flags);
 
 		new = old - sectors;
-	} while (!this_cpu_try_cmpxchg(c->capacity.pcpu->sectors_available, &old, new));
+	} while (!this_cpu_try_cmpxchg(c->capacity.pcpu->sectors_available[slot], &old, new));
 
-	this_cpu_add(c->capacity.pcpu->online_reserved, sectors);
+	this_cpu_add(c->capacity.pcpu->online_reserved[slot], sectors);
 	res->sectors			+= sectors;
 	return 0;
 #else
-	return __bch2_disk_reservation_add(c, res, sectors, flags);
+	return bch2_disk_reservation_add_slowpath(c, res, sectors, flags);
 #endif
 }
 
-static inline struct disk_reservation
-bch2_disk_reservation_init(struct bch_fs *c, unsigned nr_replicas)
-{
-	return (struct disk_reservation) {
-		.sectors	= 0,
-#if 0
-		/* not used yet: */
-		.generation		= c->capacity_gen,
-#endif
-		.nr_replicas	= nr_replicas,
-	};
-}
-
-static inline int bch2_disk_reservation_get(struct bch_fs *c,
+/*
+ * On ENOSPC, fall back to fewer replicas if write_degraded allows it:
+ * @res->nr_replicas is then the count the caller has to write at.
+ */
+static inline int bch2_disk_reservation_add(struct bch_fs *c,
 					    struct disk_reservation *res,
 					    u64 sectors, unsigned nr_replicas,
 					    int flags)
 {
-	*res = bch2_disk_reservation_init(c, nr_replicas);
+	unsigned wanted = nr_replicas;
 
-	return bch2_disk_reservation_add(c, res, sectors * nr_replicas, flags);
+	while (1) {
+		int ret = __bch2_disk_reservation_add(c, res, sectors * nr_replicas,
+						      nr_replicas, flags);
+		if (unlikely(!ret && nr_replicas < wanted))
+			bch2_disk_reservation_degraded(c, wanted, nr_replicas,
+						       sectors, _THIS_IP_);
+
+		if (!bch2_err_matches(ret, ENOSPC) ||
+		    nr_replicas <= 1 ||
+		    !bch2_write_degraded_ok(c))
+			return ret;
+
+		/* the failed attempt set the count; retry one lower */
+		disk_res_move_slot(c, res, --nr_replicas);
+	}
 }
 
 struct disk_reservation_destructable {

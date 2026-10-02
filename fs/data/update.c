@@ -453,14 +453,17 @@ static int data_update_index_update_key(struct btree_trans *trans,
 
 	bool should_check_enospc = false;
 	s64 i_sectors_delta = 0, disk_sectors_delta = 0;
+	unsigned new_nr_replicas = 0;
 	try(bch2_sum_sector_overwrites(trans, iter, insert,
 				       &should_check_enospc,
 				       &i_sectors_delta,
-				       &disk_sectors_delta));
+				       &disk_sectors_delta,
+				       &new_nr_replicas));
 
 	if (disk_sectors_delta > (s64) u->op.res.sectors)
-		try(bch2_disk_reservation_add(c, &u->op.res,
+		try(__bch2_disk_reservation_add(c, &u->op.res,
 					disk_sectors_delta - u->op.res.sectors,
+					new_nr_replicas,
 					!should_check_enospc
 					? BCH_DISK_RESERVATION_NOFAIL : 0));
 
@@ -729,11 +732,19 @@ void bch2_data_update_read_done(struct data_update *u)
 	 * position - u->btree_id is what makes the narrowing exact.
 	 */
 	if (unlikely(rbio->ret)) {
-		CLASS(btree_trans, trans)(c);
-		int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
-			bch2_damage_record_key(trans, u->btree_id, u->k.k->k.p,
-					       bch2_data_read_sb_err(rbio->ret)));
-		bch_err_fn_ratelimited(c, ret);
+		if (u->opts.type == BCH_DATA_UPDATE_scrub_no_repair) {
+			/* the journal scrub can't commit: see bch2_scrub_journal_queue() */
+			bch2_scrub_journal_queue(c, u->btree_id, 0, u->k.k,
+				bch2_bkey_dev_ptr_bit(c, bkey_i_to_s_c(u->k.k),
+						      rbio->pick.ptr.dev),
+				rbio->ret);
+		} else {
+			CLASS(btree_trans, trans)(c);
+			int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+				bch2_damage_record_key(trans, u->btree_id, u->k.k->k.p,
+						       bch2_data_read_sb_err(rbio->ret)));
+			bch_err_fn_ratelimited(c, ret);
+		}
 	}
 
 	/*
@@ -756,16 +767,9 @@ void bch2_data_update_read_done(struct data_update *u)
 	}
 
 	if (u->opts.type == BCH_DATA_UPDATE_scrub_no_repair) {
-		if (u->opts.ptrs_io_error) {
-			scrub_journal_repair r = {
-				.btree_id	= u->btree_id,
-				.bad_devs	= u->opts.ptrs_io_error,
-			};
-			bkey_copy(&r.k, u->k.k);
-			mutex_lock(&c->scrub_journal_repairs_lock);
-			darray_push(&c->scrub_journal_repairs, r);
-			mutex_unlock(&c->scrub_journal_repairs_lock);
-		}
+		if (u->opts.ptrs_io_error)
+			bch2_scrub_journal_queue(c, u->btree_id, 0, u->k.k,
+						 u->opts.ptrs_io_error, 0);
 		u->op.end_io(&u->op);
 		return;
 	}
@@ -825,7 +829,7 @@ void bch2_data_update_read_done(struct data_update *u)
  * ec_alloc_failed parks too, via bch2_data_update_ec_alloc_failed(). When it
  * can't - the extent moved under us - that path swaps in
  * ec_alloc_failed_pending_race, which is a sibling rather than a child so it
- * still traces here.
+ * still traces here. So do the transient subtypes, which don't park either.
  */
 bool bch2_data_update_fail_should_trace(enum bch_data_update_types type, int ret)
 {
@@ -833,7 +837,8 @@ bool bch2_data_update_fail_should_trace(enum bch_data_update_types type, int ret
 	    bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc) ||
 	    bch2_err_matches(ret, BCH_ERR_data_update_fail_would_block) ||
 	    bch2_err_matches(ret, BCH_ERR_operation_blocked) ||
-	    bch2_err_matches(ret, BCH_ERR_ec_alloc_failed) ||
+	    (bch2_err_matches(ret, BCH_ERR_ec_alloc_failed) &&
+	     !bch2_err_matches(ret, BCH_ERR_ec_alloc_failed_transient)) ||
 	    ((type == BCH_DATA_UPDATE_reconcile ||
 	      type == BCH_DATA_UPDATE_promote) &&
 	     bch2_err_matches(ret, BCH_ERR_data_update_fail_no_rw_devs)))
@@ -1401,7 +1406,7 @@ int bch2_can_do_data_update(struct btree_trans *trans,
 		 * retrying.
 		 */
 		struct ec_stripe_head *h =
-			errptr_try(bch2_ec_stripe_head_get(trans, req, 0));
+			errptr_try(bch2_ec_stripe_head_get(trans, req, 0, NULL));
 		bch2_ec_stripe_head_put(c, h);
 	}
 
@@ -1508,7 +1513,9 @@ int bch2_data_update_init(struct btree_trans *trans,
 	}
 
 	if (m->opts.extra_replicas) {
-		ret = bch2_disk_reservation_add(c, &m->op.res, k.k->size * m->opts.extra_replicas, 0);
+		/* First charge on this reservation - it's zeroed by write_op_init() */
+		ret = bch2_disk_reservation_add(c, &m->op.res, k.k->size,
+						m->opts.extra_replicas, 0);
 		if (ret)
 			goto out;
 	}
@@ -1564,8 +1571,20 @@ int bch2_data_update_init(struct btree_trans *trans,
 		ptr_bit <<= 1;
 	}
 
-	if (m->opts.type != BCH_DATA_UPDATE_scrub &&
-	    m->opts.type != BCH_DATA_UPDATE_scrub_no_repair) {
+	if (!data_update_is_scrub(m->opts.type)) {
+		/*
+		 * A move that only relocates data keeps its old pointers if it
+		 * comes up short, so that isn't a degraded write; one restoring
+		 * lost durability needs every copy it asks for:
+		 */
+		struct bkey_durability d;
+		ret = bch2_bkey_durability(trans, k, &d);
+		if (ret)
+			goto out;
+
+		if (d.online >= io_opts->data_replicas)
+			m->op.flags |= BCH_WRITE_replicas_best_effort;
+
 		/*
 		 * If current extent durability is less than io_opts.data_replicas,
 		 * we're not trying to rereplicate the extent up to data_alloc/replicas.here -
@@ -1575,7 +1594,7 @@ int bch2_data_update_init(struct btree_trans *trans,
 		 * rereplicate, currently, so that users don't get an unexpected -ENOSPC
 		 */
 		m->op.nr_replicas = max(0, (int) (io_opts->data_replicas - durability_keeping)) +
-			m->opts.extra_replicas;
+			m->op.res.nr_replicas;
 
 		if (!durability_keeping) {
 			m->op.nr_replicas = max_t(unsigned, m->op.nr_replicas, 1);

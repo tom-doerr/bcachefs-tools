@@ -232,6 +232,15 @@ endif	# PKGCONFIG_SERVICEDIR
 
 built_scripts+=udev/64-bcachefs.rules
 
+# dracut has no bcachefs support of its own; without this module a dracut
+# initramfs has no mount helper, no udev rules and no generator.
+built_scripts+=dracut/90bcachefs/module-setup.sh
+PKGCONFIG_DRACUTMODULESDIR:=$(shell $(PKG_CONFIG) --variable=dracutmodulesdir dracut 2>/dev/null)
+ifneq (,$(PKGCONFIG_DRACUTMODULESDIR))
+optional_build+=dracut/90bcachefs/module-setup.sh
+optional_install+=install_dracut
+endif	# PKGCONFIG_DRACUTMODULESDIR
+
 .PHONY: all
 all: bcachefs initramfs/hook dkms/dkms.conf udev/64-bcachefs.rules $(optional_build)
 
@@ -338,6 +347,11 @@ initramfs/hook: initramfs/hook.in
 		-e "s|@GENERATORDIR@|$(PKGCONFIG_GENERATORDIR)|g" \
 		initramfs/hook.in > initramfs/hook
 
+.PHONY: dracut/90bcachefs/module-setup.sh
+dracut/90bcachefs/module-setup.sh: dracut/90bcachefs/module-setup.sh.in
+	@echo "    [SED]    $@"
+	$(Q)sed -e "s|@ROOT_SBINDIR@|$(ROOT_SBINDIR)|g" $< > $@
+
 # The hot-add rule runs the binary by absolute path: udev looks in
 # /usr/lib/udev for anything else, so this can't be left to $$PATH.
 .PHONY: udev/64-bcachefs.rules
@@ -380,6 +394,9 @@ endif
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuse.bcachefs
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuse.bcachefs
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mount.fuse.bcachefs
+	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuseblk.bcachefs
+	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuseblk.bcachefs
+	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mount.fuseblk.bcachefs
 
 .PHONY: uninstall
 uninstall:
@@ -390,6 +407,9 @@ uninstall:
 	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuse.bcachefs
 	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuse.bcachefs
 	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mount.fuse.bcachefs
+	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuseblk.bcachefs
+	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuseblk.bcachefs
+	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mount.fuseblk.bcachefs
 	$(RM) $(DESTDIR)$(PREFIX)/share/man/man8/bcachefs.8
 	$(RM) $(DESTDIR)$(BASH_COMPLETION_DIR)/bcachefs
 	$(RM) -r $(DESTDIR)$(DKMSDIR)
@@ -407,6 +427,10 @@ install_systemd_generator:
 	$(INSTALL) -d $(DESTDIR)$(PKGCONFIG_GENERATORDIR)
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs \
 		$(DESTDIR)$(PKGCONFIG_GENERATORDIR)/bcachefs-mount-generator
+
+.PHONY: install_dracut
+install_dracut: dracut/90bcachefs/module-setup.sh
+	$(INSTALL) -m0755 -D $< -t $(DESTDIR)$(PKGCONFIG_DRACUTMODULESDIR)/90bcachefs
 
 .PHONY: install_dkms
 install_dkms: dkms/dkms.conf dkms/module-version.c

@@ -16,12 +16,14 @@
 
 struct bch_logged_op_fn {
 	u8		type;
+	bool		early;
 	int		(*resume)(struct btree_trans *, struct bkey_i *);
 };
 
 static const struct bch_logged_op_fn logged_op_fns[] = {
-#define x(n)		{					\
+#define x(n, _early)	{					\
 	.type		= KEY_TYPE_logged_op_##n,		\
+	.early		= _early,				\
 	.resume		= bch2_resume_logged_op_##n,		\
 },
 	BCH_LOGGED_OPS()
@@ -29,7 +31,7 @@ static const struct bch_logged_op_fn logged_op_fns[] = {
 };
 
 const char * const bch2_logged_ops[] = {
-#define x(n)	#n,
+#define x(n, ...)	#n,
 	BCH_LOGGED_OPS()
 #undef x
 	NULL
@@ -77,23 +79,32 @@ static const struct bch_logged_op_fn *logged_op_fn(enum bch_bkey_type type)
 }
 
 static int resume_logged_op(struct btree_trans *trans, struct btree_iter *iter,
-			    struct bkey_s_c k)
+			    struct bkey_s_c k, bool early)
 {
 	struct bch_fs *c = trans->c;
 	u32 restart_count = trans->restart_count;
 	CLASS(printbuf, buf)();
 	int ret = 0;
 
+	/* Unknown types go with the late pass, which deletes them: */
+	const struct bch_logged_op_fn *fn = logged_op_fn(k.k->type);
+	if (fn ? fn->early != early : early)
+		return 0;
+
 	struct bkey_buf sk __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&sk);
 	bch2_bkey_buf_reassemble(&sk, k);
 
-	fsck_err_on(test_bit(BCH_FS_clean_recovery, &c->flags),
-		    trans, logged_op_but_clean,
-		    "filesystem marked as clean but have logged op\n%s",
-		    (bch2_bkey_val_to_text(&buf, c, k), buf.buf));
+	/*
+	 * Fixing logs the error to the journal via @trans: commit that before
+	 * the resume, which runs transactions of its own:
+	 */
+	if (fsck_err_on(test_bit(BCH_FS_clean_recovery, &c->flags),
+			trans, logged_op_but_clean,
+			"filesystem marked as clean but have logged op\n%s",
+			(bch2_bkey_val_to_text(&buf, c, k), buf.buf)))
+		try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
 
-	const struct bch_logged_op_fn *fn = logged_op_fn(sk.k->k.type);
 	if (fn)
 		fn->resume(trans, sk.k);
 
@@ -102,12 +113,12 @@ static int resume_logged_op(struct btree_trans *trans, struct btree_iter *iter,
 	 * Recovery finishes the op either way, so that an op that can't
 	 * complete doesn't wedge every subsequent mount.
 	 */
-	ret = bch2_logged_op_finish(trans, sk.k, 0);
+	ret = bch2_logged_op_finish(trans, sk.k, 0, 0);
 fsck_err:
 	return ret ?: trans_was_restarted(trans, restart_count);
 }
 
-int bch2_resume_logged_ops(struct bch_fs *c)
+static int resume_logged_ops(struct bch_fs *c, bool early)
 {
 	CLASS(btree_trans, trans)(c);
 	return for_each_btree_key_max(trans, iter,
@@ -115,11 +126,32 @@ int bch2_resume_logged_ops(struct bch_fs *c)
 				   POS(LOGGED_OPS_INUM_logged_ops, 0),
 				   POS(LOGGED_OPS_INUM_logged_ops, U64_MAX),
 				   BTREE_ITER_prefetch, k,
-			resume_logged_op(trans, &iter, k));
+			resume_logged_op(trans, &iter, k, early));
+}
+
+int bch2_resume_logged_ops_early(struct bch_fs *c)
+{
+	return resume_logged_ops(c, true);
+}
+
+int bch2_resume_logged_ops(struct bch_fs *c)
+{
+	return resume_logged_ops(c, false);
 }
 
 int __bch2_logged_op_start(struct btree_trans *trans, struct bkey_i *k)
 {
+	const struct bch_logged_op_fn *fn = logged_op_fn(k->k.type);
+
+	/*
+	 * Early ops are resumed before anything that can start them may run;
+	 * one started sooner would be resumed underneath whoever started it:
+	 */
+	WARN_ONCE(fn && fn->early &&
+		  READ_ONCE(trans->c->recovery.pass_done) < BCH_RECOVERY_PASS_resume_logged_ops_early,
+		  "logged op %s started before resume_logged_ops_early",
+		  bch2_bkey_types[k->k.type]);
+
 	CLASS(btree_iter_uninit, iter)(trans);
 	try(bch2_bkey_get_empty_slot(trans, &iter, BTREE_ID_logged_ops,
 				     POS_MIN, POS(LOGGED_OPS_INUM_logged_ops, U64_MAX)));
@@ -153,12 +185,14 @@ int bch2_logged_op_start(struct btree_trans *trans, struct bkey_i *k)
  * From @op_ret and not the knob: the knob is one-shot and global, so by now it
  * may have been re-armed or claimed by another op.
  */
-int bch2_logged_op_finish(struct btree_trans *trans, struct bkey_i *k, int op_ret)
+int bch2_logged_op_finish(struct btree_trans *trans, struct bkey_i *k, int op_ret,
+			  unsigned commit_flags)
 {
 	if (bch2_err_matches(op_ret, BCH_ERR_injected_logged_op_fail))
 		return op_ret;
 
 	int ret = commit_do(trans, NULL, NULL,
+			    commit_flags|
 			    BCH_TRANS_COMMIT_no_check_rw|
 			    BCH_TRANS_COMMIT_no_enospc,
 			    bch2_btree_delete(trans, BTREE_ID_logged_ops, k->k.p, 0));

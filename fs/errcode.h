@@ -452,6 +452,7 @@
 	x(EROFS,			erofs_recovery_cancelled, 406)		\
 	x(EROFS,			emergency_ro, 407)			\
 	x(ESHUTDOWN,			btree_not_started, 408)			\
+	x(ESHUTDOWN,			ioctl_fs_stopping, 622)			\
 	x(0,				operation_blocked, 409)			\
 	x(BCH_ERR_operation_blocked,	btree_cache_cannibalize_lock_blocked, 410) \
 	x(BCH_ERR_operation_blocked,	journal_res_blocked, 411)		\
@@ -629,12 +630,22 @@
 	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_redundancy, 606)	\
 	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_insufficient_devs, 607)	\
 	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_disk_label_too_big, 608)	\
-	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_stripe_alloc, 609)	\
-	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_usable_block, 610)	\
-	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_ec_bucket, 611)	\
-	x(0,				reconcile_interrupted, 612)		\
-	x(BCH_ERR_reconcile_interrupted, reconcile_admission_timeout, 613)	\
-	x(BCH_ERR_reconcile_interrupted, reconcile_stopped, 614)
+	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_transient, 612)		\
+	x(BCH_ERR_ec_alloc_failed_transient, ec_alloc_failed_stripe_alloc, 609)	\
+	x(BCH_ERR_ec_alloc_failed_transient, ec_alloc_failed_no_usable_block, 610) \
+	x(BCH_ERR_ec_alloc_failed_transient, ec_alloc_failed_no_ec_bucket, 611) \
+	x(EIO,				mmap_emergency_ro, 613)			\
+	x(EINVAL,			EINVAL_test_stripe_already_open, 614)	\
+	x(EINVAL,			EINVAL_test_stripe_open_relock_not_invalidated, 615) \
+	x(EAGAIN,			test_no_quiet_window, 616)		\
+	x(ENOMEM,			ENOMEM_perf_test_job, 617)		\
+	x(ENOMEM,			ENOMEM_scrub_journal_node, 618)		\
+	x(EROFS,			erofs_sb_write_before_start, 619)	\
+	x(EINVAL,			EINVAL_will_not_start, 620)		\
+	x(EROFS,			erofs_sb_never_started, 621)		\
+	x(0,				reconcile_interrupted, 623)		\
+	x(BCH_ERR_reconcile_interrupted, reconcile_admission_timeout, 624)	\
+	x(BCH_ERR_reconcile_interrupted, reconcile_stopped, 625)
 
 enum bch_errcode {
 	BCH_ERR_START		= 2048,

@@ -580,6 +580,7 @@ void bch2_trans_downgrade(struct btree_trans *);
 
 void bch2_trans_revalidate_updates_in_node(struct btree_trans *, struct btree *);
 void bch2_trans_node_add(struct btree_trans *trans, struct btree *);
+void bch2_trans_node_forget(struct btree_trans *, struct btree *);
 void bch2_trans_node_verify_not_in_iters(struct btree_trans *trans, struct btree *);
 void bch2_trans_node_reinit_iter(struct btree_trans *, struct btree *);
 
@@ -681,6 +682,15 @@ bch2_btree_iter_flags(struct btree_trans *trans,
 	if (!(flags & BTREE_ITER_snapshot_field) &&
 	    !btree_type_has_snapshot_field(btree_id))
 		flags &= ~BTREE_ITER_all_snapshots;
+
+	/*
+	 * Without snapshot semantics a snapshot field is just part of the key:
+	 * advancing past a key at (inode, offset, snapshot) must not skip the
+	 * others at (inode, offset).
+	 */
+	if (btree_type_has_snapshot_field(btree_id) &&
+	    !btree_type_has_snapshots(btree_id))
+		flags |= BTREE_ITER_all_snapshots;
 
 	if (!(flags & BTREE_ITER_all_snapshots) &&
 	    btree_type_has_snapshots(btree_id))

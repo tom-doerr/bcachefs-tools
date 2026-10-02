@@ -858,7 +858,8 @@ bool bch2_dev_state_allowed(struct bch_fs *c, struct bch_dev *ca,
 		struct bch_devs_mask new_rw_devs = c->allocator.rw_devs[0];
 		__clear_bit(ca->dev_idx, new_rw_devs.d);
 
-		return bch2_can_write_fs_with_devs(c, new_rw_devs, flags, err);
+		return bch2_can_write_fs_with_devs(c, new_rw_devs, BCH_WRITE_CHECK_dev_leaving_rw,
+						   flags, err);
 	}
 
 	return true;
@@ -930,6 +931,25 @@ int bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 		       enum bch_member_state new_state, int flags,
 		       struct printbuf *err)
 {
+	/*
+	 * Taking a device out of the allocator shrinks capacity under the
+	 * reservations dirty pagecache already holds, and the allocator
+	 * waits for space that isn't coming back: write it out first, while
+	 * the space is still there.
+	 *
+	 * Before state_lock, which writeback may need; trylock because
+	 * umount holds s_umount while it waits for sysfs writers - us, from
+	 * the state option - to drain.
+	 */
+	struct super_block *sb = c->vfs_sb;
+	if (sb &&
+	    ca->mi.state == BCH_MEMBER_STATE_rw &&
+	    new_state != BCH_MEMBER_STATE_rw &&
+	    down_read_trylock(&sb->s_umount)) {
+		sync_filesystem(sb);
+		up_read(&sb->s_umount);
+	}
+
 	guard(rwsem_write)(&c->state_lock);
 
 	if (READ_ONCE(ca->removing))
@@ -1276,7 +1296,10 @@ int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 			c->sb.nr_devices = c->disk_sb.sb->nr_devices;
 
 			/* We just added a device: the write isn't optional, and
-			 * we need its error. */
+			 * we need its error. On a filesystem not yet started
+			 * (bcachefs device add, offline) it's part of bringing
+			 * it up. */
+			w.flags |= BCH_SB_WRITE_bringup;
 			sb_dirty(&w);
 			ret = sb_write_flush(&w);
 			if (ret)
@@ -1442,7 +1465,8 @@ static int bch2_dev_may_offline(struct bch_fs *c, struct bch_dev *ca, int flags,
 
 	if (!bch2_can_read_fs_with_devs(c, &new_devs, flags, err) ||
 	    (!c->opts.read_only &&
-	     !bch2_can_write_fs_with_devs(c, new_rw_devs, flags, err))) {
+	     !bch2_can_write_fs_with_devs(c, new_rw_devs, BCH_WRITE_CHECK_dev_leaving_rw,
+					  flags, err))) {
 		prt_printf(err, "Cannot offline required disk\n");
 		return bch_err_throw(c, device_state_not_allowed);
 	}

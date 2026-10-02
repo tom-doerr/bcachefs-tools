@@ -13,6 +13,7 @@
 
 #include "data/compress.h"
 #include "data/copygc.h"
+#include "data/reconcile/check.h"
 #include "data/reconcile/work.h"
 
 #include "init/dev.h"
@@ -46,6 +47,11 @@ const char * const bch2_error_actions[] = {
 
 const char * const bch2_degraded_actions[] = {
 	BCH_DEGRADED_ACTIONS()
+	NULL
+};
+
+const char * const bch2_write_degraded_actions[] = {
+	BCH_WRITE_DEGRADED_ACTIONS()
 	NULL
 };
 
@@ -640,7 +646,7 @@ static int opt_hook_io(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum bch_
 				(struct reconcile_scan) { .type = RECONCILE_SCAN_pending}, false));
 
 		try(reconcile_scan_bracket(c,
-			(struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = inum }, post, scope));
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = ca->dev_idx }, post, scope));
 		break;
 	case Opt_ec_max_data_blocks:
 		/*
@@ -695,6 +701,12 @@ int bch2_opt_hook_pre_set(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum b
 	case Opt_erasure_code:
 		if (v)
 			bch2_check_set_feature(c, BCH_FEATURE_ec);
+		break;
+	case Opt_rotational:
+		/* Offline: there's no post hook, and nothing to race with */
+		if (ca && change && v != ca->mi.rotational &&
+		    !test_bit(BCH_FS_started, &c->flags))
+			bch2_reconcile_rotational_changed(c, ca);
 		break;
 	case Opt_casefold_disabled:
 		if (v && (c->sb.features & BIT_ULL(BCH_FEATURE_casefolding))) {
@@ -761,14 +773,15 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 		}
 		break;
 	case Opt_durability:
-		if (test_bit(BCH_FS_rw, &c->flags) &&
-		    ca &&
-		    bch2_dev_is_online(ca) &&
-		    ca->mi.state == BCH_MEMBER_STATE_rw) {
-			scoped_guard(rcu)
-				bch2_dev_allocator_set_rw(c, ca, true);
-			bch2_recalc_capacity(c);
-		}
+		scoped_guard(rwsem_read, &c->state_lock)
+			if (test_bit(BCH_FS_rw, &c->flags) &&
+			    ca &&
+			    bch2_dev_is_online(ca) &&
+			    ca->mi.state == BCH_MEMBER_STATE_rw) {
+				scoped_guard(rcu)
+					bch2_dev_allocator_set_rw(c, ca, true);
+				bch2_recalc_capacity(c);
+			}
 		break;
 	case Opt_version_upgrade:
 		/*
@@ -781,6 +794,11 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 		break;
 	case Opt_read_only:
 		bch2_reconcile_wakeup(c, RECONCILE_KICK_read_only);
+		break;
+	case Opt_rotational:
+		/* Online: the new value has to be live before the pass runs */
+		if (ca && test_bit(BCH_FS_started, &c->flags))
+			bch2_reconcile_rotational_changed(c, ca);
 		break;
 	case Opt_btree_cache_shrinker_seeks: {
 		struct bch_fs_btree_cache *bc = &c->btree.cache;
@@ -987,6 +1005,11 @@ bool __bch2_opt_set_sb(struct bch_sb *sb, int dev_idx,
 		struct bch_member *m = bch2_members_v2_get_mut(sb, dev_idx);
 		changed = v != opt->get_member(m);
 		opt->set_member(m, v);
+
+		if (opt == &bch2_opt_table[Opt_rotational]) {
+			changed |= !BCH_MEMBER_ROTATIONAL_SET(m);
+			SET_BCH_MEMBER_ROTATIONAL_SET(m, true);
+		}
 	}
 
 	if (opt->type == BCH_OPT_STR_MEMBER &&

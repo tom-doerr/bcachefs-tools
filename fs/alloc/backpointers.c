@@ -14,6 +14,7 @@
 #include "btree/write_buffer.h"
 
 #include "data/checksum.h"
+#include "data/reconcile/work.h"
 #include "data/reflink.h"
 
 #include "sb/io.h"
@@ -88,7 +89,11 @@ __cold void bch2_backpointer_to_text(struct printbuf *out, struct bch_fs *c, str
 	bch2_bpos_to_text(out, bp.v->pos);
 
 	if (BACKPOINTER_RECONCILE_PHYS(bp.v))
-		prt_str(out, " phys");
+		prt_printf(out, " reconcile_phys=%s",
+			   bch2_reconcile_work_ids[BACKPOINTER_RECONCILE_PHYS(bp.v)]);
+
+	if (BACKPOINTER_ERASURE_CODED(bp.v))
+		prt_str(out, " ec");
 
 	if (BACKPOINTER_STRIPE_PTR(bp.v))
 		prt_str(out, " stripe");
@@ -1204,7 +1209,8 @@ err:
 static int check_bucket_backpointer_pos_mismatch(struct btree_trans *trans,
 						 struct bpos bucket,
 						 bool *had_mismatch,
-						 struct wb_maybe_flush *last_flushed)
+						 struct wb_maybe_flush *last_flushed,
+						 struct bpos *checked_bad)
 {
 	/*
 	 * Not BTREE_ITER_cached: scrub calls this once per bucket for a whole
@@ -1217,9 +1223,8 @@ static int check_bucket_backpointer_pos_mismatch(struct btree_trans *trans,
 	CLASS(btree_iter, alloc_iter)(trans, BTREE_ID_alloc, bucket, 0);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&alloc_iter));
 
-	struct bpos checked_bad = POS_MAX;
 	return check_bucket_backpointer_mismatch(trans, k, had_mismatch,
-						 last_flushed, &checked_bad);
+						 last_flushed, checked_bad);
 }
 
 int bch2_check_bucket_backpointer_mismatch(struct btree_trans *trans,
@@ -1229,9 +1234,16 @@ int bch2_check_bucket_backpointer_mismatch(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	bool had_mismatch;
+	/*
+	 * Outside the restart loop: after checking a bucket with too many
+	 * backpointers against their extents, check_bucket_backpointer_mismatch()
+	 * restarts - reset this and it does that forever.
+	 */
+	struct bpos checked_bad = POS_MAX;
 	int ret = lockrestart_do(trans,
 		check_bucket_backpointer_pos_mismatch(trans, POS(ca->dev_idx, bucket),
-						      &had_mismatch, last_flushed));
+						      &had_mismatch, last_flushed,
+						      &checked_bad));
 	if (ret || !had_mismatch)
 		return ret;
 

@@ -58,7 +58,7 @@ const char * const bch2_reconcile_opts[] = {
 	NULL
 };
 
-static const char * const bch2_reconcile_work_ids[] = {
+const char * const bch2_reconcile_work_ids[] = {
 	RECONCILE_WORK_IDS()
 	NULL
 };
@@ -617,7 +617,7 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 			 * fall through to do the other work.
 			 */
 			if (!bch2_can_form_ec_stripe(c, r->background_target,
-						     r->data_replicas, NULL)) {
+						     r->data_replicas - 1, NULL)) {
 				if (r->need_rb == BIT(BCH_RECONCILE_erasure_code)) {
 					event_add_trace(c, reconcile_set_pending,
 							reconcile_pending_sectors(c, k), buf, ({
@@ -625,7 +625,7 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 						bch2_bkey_val_to_text(&buf, c, k);
 						prt_newline(&buf);
 						bch2_can_form_ec_stripe(c, r->background_target,
-									r->data_replicas, &buf);
+									r->data_replicas - 1, &buf);
 					}));
 					return bch2_extent_reconcile_pending_mod(trans, iter, level, k, true);
 				}
@@ -767,6 +767,14 @@ static int check_reconcile_pending_err(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 
+	 /*
+	  * Ahead of the ENOSPC test below, which these would otherwise match:
+	  * they're ENOSPC-class because they're EC allocation failures, but
+	  * they say "not right now", and nothing retries the pending list.
+	  */
+	 if (bch2_err_matches(err, BCH_ERR_ec_alloc_failed_transient))
+		 return err;
+
 	 if (!bch2_err_matches(err, BCH_ERR_data_update_fail_no_rw_devs) &&
 	     !bch2_err_matches(err, BCH_ERR_insufficient_devices) &&
 	     !bch2_err_matches(err, ENOSPC))
@@ -834,6 +842,24 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 			prt_printf(&msg.m, "error retrying stripe: %s\n", bch2_err_str(ret));
 			bch2_bkey_val_to_text(&msg.m, c, s.s_c);
 		}
+		ret = 0;
+	} else if (ret &&
+		   !bch2_err_matches(ret, BCH_ERR_transaction_restart) &&
+		   !bch2_err_matches(ret, BCH_ERR_reconcile_interrupted)) {
+		/*
+		 * One stripe we can't repair right now - out of space, say -
+		 * must not end the reconcile thread, and with it all
+		 * background data movement until the next start. Skip it, as
+		 * do_reconcile_extent() skips an extent it can't move: the
+		 * stripe keeps needs_reconcile, so a later pass retries it.
+		 *
+		 * An interrupted wait for the move budget is not a failed
+		 * repair: it goes up, and the phase resumes at this stripe.
+		 */
+		CLASS(bch_log_msg_ratelimited, msg)(c);
+		prt_printf(&msg.m, "error repairing stripe, leaving it for a later pass: %s\n",
+			   bch2_err_str(ret));
+		bch2_bkey_val_to_text(&msg.m, c, s.s_c);
 		ret = 0;
 	}
 
@@ -1207,8 +1233,8 @@ static int do_reconcile_extent(struct moving_context *ctxt,
 	struct bbpos data_pos = rb_work_to_data_pos(work.pos);
 
 	/* We require holding an intent lock when calling
-	 * bch2_stripe_handle_tryget_existing(), to avoid racing with the stripe trigger
-	 * deleting the stripe */
+	 * bch2_stripe_handle_tryget_existing(), to avoid racing with the
+	 * stripe trigger deleting the stripe */
 	enum btree_iter_update_trigger_flags flags = data_pos.btree == BTREE_ID_stripes
 		? BTREE_ITER_intent : 0;
 
@@ -1364,8 +1390,8 @@ static int do_reconcile_extent_phys(struct moving_context *ctxt,
 		return 0;
 
 	/* We require holding an intent lock when calling
-	 * bch2_stripe_handle_tryget_existing(), to avoid racing with the stripe trigger
-	 * deleting the stripe */
+	 * bch2_stripe_handle_tryget_existing(), to avoid racing with the
+	 * stripe trigger deleting the stripe */
 	enum btree_iter_update_trigger_flags flags = bp.v->btree_id == BTREE_ID_stripes
 		? BTREE_ITER_intent : 0;
 
@@ -1940,7 +1966,7 @@ typedef struct {
 	unsigned		dev;
 	unsigned		reconcile_phase;
 	u64			phase_start;
-	struct closure		cl;
+	struct completion	done;
 
 	struct bch_move_stats	stats;
 
@@ -1957,24 +1983,11 @@ static struct reconcile_lap *reconcile_phys_lap(struct bch_fs *c, unsigned dev,
 
 DEFINE_DARRAY(reconcile_phys_thr);
 
-/*
- * Destructor ordering: closure_return() must be the last thing before the
- * function returns, but __cleanup destructors run after closure_return()
- * signals the parent — which can then free the thrs darray containing the
- * reconcile_phys_thr (and its embedded bch_move_stats) that
- * moving_context.stats still points to. So we manage moving_context
- * lifetime manually here.
- *
- * This is a general hazard with __cleanup + closure_return: the parent
- * can wake and free resources before the child's destructors run. In Rust
- * this will be enforced by Drop ordering.
- */
-static CLOSURE_CALLBACK(do_reconcile_phys_thread)
+static void reconcile_phys_dev(reconcile_phys_thr *thr)
 {
-	closure_type(thr, reconcile_phys_thr, cl);
 	struct bch_fs *c = thr->c;
 
-	struct moving_context ctxt;
+	struct moving_context ctxt __cleanup(bch2_moving_ctxt_exit);
 	bch2_moving_ctxt_init(&ctxt, c, NULL, &thr->stats,
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
@@ -1988,8 +2001,6 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	if (!work.size) {
 		bch_err(c, "%s: unable to allocate memory", __func__);
 		thr->exit = RECONCILE_PHASE_EXIT_error;
-		bch2_moving_ctxt_exit(&ctxt);
-		closure_return(cl);
 		return;
 	}
 
@@ -2051,8 +2062,7 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 			 * As in do_reconcile_phase_iter(): flush our moves
 			 * before waiting (they hold nocow locks copygc needs),
 			 * then step past the entry instead of retrying it.
-			 * Bounded: this is a workqueue worker, and every
-			 * device's worker holds up the pass.
+			 * Bounded: every device's thread holds up the pass.
 			 */
 			bch2_moving_ctxt_flush_all(&ctxt);
 			bch2_copygc_wakeup(c);
@@ -2094,9 +2104,25 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 
 	if (lap->active)
 		lap->cursor = resume;
+}
 
-	bch2_moving_ctxt_exit(&ctxt);
-	closure_return(cl);
+/*
+ * A freezable kthread, not a work item: the freezer can only stop a work item
+ * between items, and this one runs for a whole pass - waiting on move
+ * completions that the freezer has already stopped. A kthread is frozen in
+ * place in its move waits (MOVE_CTXT_WAIT_STATE), like the other movers.
+ *
+ * The pass runs in its own function so that its destructors have run before
+ * we signal the parent, which then frees @thr.
+ */
+static int reconcile_phys_thread(void *arg)
+{
+	reconcile_phys_thr *thr = arg;
+
+	set_freezable();
+	reconcile_phys_dev(thr);
+	complete(&thr->done);
+	return 0;
 }
 
 /*
@@ -2125,7 +2151,6 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase,
 			     u64 phase_start, enum reconcile_phase_exit *exit)
 {
 	CLASS(darray_reconcile_phys_thr, thrs)();
-	CLASS(closure_stack, cl)();
 
 	for_each_member_device(c, ca)
 		if (ca->mi.rotational &&
@@ -2137,15 +2162,30 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase,
 						.phase_start		= phase_start,
 						})));
 
-	darray_for_each(thrs, i)
-		closure_call(&i->cl, do_reconcile_phys_thread, system_dfl_wq, &cl);
+	int ret = 0;
+	unsigned nr_started = 0;
 
-	closure_sync_unbounded(&cl);
+	darray_for_each(thrs, i) {
+		init_completion(&i->done);
+
+		struct task_struct *t = kthread_run(reconcile_phys_thread, i,
+					"bch-reconcile/%s:%u", c->name, i->dev);
+		ret = PTR_ERR_OR_ZERO(t);
+		if (ret)
+			break;
+		nr_started++;
+	}
+
+	/* The threads freeze in place, so our wait for them must be freezable too: */
+	for (unsigned i = 0; i < nr_started; i++)
+		wait_for_completion_state(&thrs.data[i].done,
+					  TASK_UNINTERRUPTIBLE|TASK_FREEZABLE);
 
 	darray_for_each(thrs, i)
 		c->reconcile.deferred += i->deferred;
-	*exit = reconcile_phys_exit(&thrs);
-	return 0;
+	/* A device whose thread never started has no exit of its own: */
+	*exit = ret ? RECONCILE_PHASE_EXIT_error : reconcile_phys_exit(&thrs);
+	return ret;
 }
 
 /*
@@ -2728,9 +2768,11 @@ static int bch2_reconcile_thread(void *arg)
 
 	/*
 	 * Data move operations can't run until after check_snapshots has
-	 * completed, and bch2_snapshot_is_ancestor() is available.
+	 * completed, and bch2_snapshot_is_ancestor() is available - and until
+	 * the logged ops we could start ourselves (stripe creation) have been
+	 * resumed, or recovery would resume ours while we're running them.
 	 */
-	kthread_wait_freezable(c->recovery.pass_done > BCH_RECOVERY_PASS_check_snapshots ||
+	kthread_wait_freezable(c->recovery.pass_done > BCH_RECOVERY_PASS_resume_logged_ops_early ||
 			       kthread_should_stop());
 	if (kthread_should_stop())
 		return 0;

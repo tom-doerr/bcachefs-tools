@@ -46,6 +46,7 @@ fn cmd_recovery_pass(cli: RecoveryPassCli) -> Result<()> {
 
     let mut fs_opts = c::bch_opts::default();
     opt_set!(fs_opts, nostart, 1);
+    opt_set!(fs_opts, will_not_start, 1);
 
     let fs = crate::device_scan::open_scan(&devs, fs_opts)?;
 
@@ -64,7 +65,8 @@ fn cmd_recovery_pass(cli: RecoveryPassCli) -> Result<()> {
             ext.recovery_passes_required[0] &= !passes_to_unset.to_le();
             ext.recovery_passes_required[0] |= passes_to_set.to_le();
             scheduled = u64::from_le(ext.recovery_passes_required[0]);
-            fs.write_super();
+            fs.write_super_ret()
+                .map_err(|e| anyhow::anyhow!("error writing superblock: {e}"))?;
         }
 
         drop(_sb_lock);

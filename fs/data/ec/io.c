@@ -279,6 +279,99 @@ static void bch2_ec_validate_checksums(struct bch_fs *c, struct ec_stripe_buf *b
 	}
 }
 
+/*
+ * Scrub: check one block of a stripe against the stripe's checksums for it,
+ * reading only that block, a checksum granule at a time. Parity and data no
+ * extent references any more are still inputs to reconstruct, and nothing
+ * else ever reads them.
+ *
+ * @buf->key is the stripe; nothing else in @buf is set up. Returns the number
+ * of sectors in granules that don't match, or the error if the block couldn't
+ * be read - including its pointer going stale, i.e. the stripe was deleted or
+ * reused under us.
+ */
+s64 bch2_ec_scrub_block(struct bch_fs *c, struct ec_stripe_buf *buf, unsigned block)
+{
+	struct bch_stripe *v = &buf->key.v;
+	unsigned granularity = 1U << v->csum_granularity_bits;
+	unsigned sectors = le16_to_cpu(v->sectors);
+	s64 bad = 0;
+
+	closure_init(&buf->io, NULL);
+
+	if (!v->csum_type)
+		return 0;
+
+	buf->data[block] = kvmalloc(min(granularity, sectors) << 9, GFP_KERNEL);
+	if (!buf->data[block])
+		return bch_err_throw(c, ENOMEM_stripe_buf);
+
+	for (unsigned offset = 0; offset < sectors; offset += granularity) {
+		buf->offset	= offset;
+		buf->size	= min(granularity, sectors - offset);
+		buf->err[STRIPE_BUF_PRE_RECOV][block] = 0;
+
+		bch2_ec_block_io_range(c, buf, REQ_OP_READ, block, buf->offset, buf->size);
+		closure_sync(&buf->io);
+
+		int err = buf->err[STRIPE_BUF_PRE_RECOV][block];
+		if (err)
+			return err;
+
+		struct bch_csum want = stripe_csum_get(v, block, offset >> v->csum_granularity_bits);
+		struct bch_csum got = ec_block_checksum(buf, block, offset);
+
+		if (bch2_crc_cmp(want, got)) {
+			if (!bad) {
+				buf->csum_good[block]	= want;
+				buf->csum_bad[block]	= got;
+			}
+			bad += buf->size;
+		}
+	}
+
+	if (bad) {
+		CLASS(bch2_dev_tryget_noerror, ca)(c, v->ptrs[block].dev);
+		if (ca)
+			bch2_io_error(ca, BCH_MEMBER_ERROR_checksum);
+	}
+
+	return bad;
+}
+
+/*
+ * Were the blocks in @mask read without error, and do they match the stripe's
+ * checksums? Doesn't record anything: a failure here is followed by a full
+ * read and bch2_stripe_buf_validate_msg(), which does.
+ */
+bool bch2_stripe_buf_blocks_good(struct ec_stripe_buf *buf, u32 mask)
+{
+	unsigned csum_granularity = 1U << buf->key.v.csum_granularity_bits;
+
+	for (unsigned i = 0; i < buf->key.v.nr_blocks; i++) {
+		if (!(mask & BIT(i)))
+			continue;
+
+		if (buf->err[STRIPE_BUF_PRE_RECOV][i])
+			return false;
+
+		if (!buf->key.v.csum_type)
+			continue;
+
+		for (unsigned offset = buf->offset;
+		     offset < buf->offset + buf->size;
+		     offset += csum_granularity) {
+			unsigned j = offset >> buf->key.v.csum_granularity_bits;
+
+			if (bch2_crc_cmp(stripe_csum_get(&buf->key.v, i, j),
+					 ec_block_checksum(buf, i, offset)))
+				return false;
+		}
+	}
+
+	return true;
+}
+
 void bch2_ec_generate_ec(struct ec_stripe_buf *buf)
 {
 	unsigned nr_data = buf->key.v.nr_blocks - buf->key.v.nr_redundant;
@@ -533,6 +626,8 @@ static void ec_block_endio(struct bio *bio)
 
 	bch2_account_io_completion(ca, bio_data_dir(bio),
 				   ec_bio->submit_time, !bio->bi_status);
+	if (rw == WRITE)
+		bch2_dev_write_unflushed(ca);
 
 	if (bio->bi_status)
 		buf->err[STRIPE_BUF_PRE_RECOV][ec_bio->idx] = -blk_status_to_bch_err(bio->bi_status);

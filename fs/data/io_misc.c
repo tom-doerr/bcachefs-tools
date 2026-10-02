@@ -53,22 +53,26 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(iter));
 
 	sectors = min_t(u64, sectors, k.k->p.offset - iter->pos.offset);
-	new_replicas = max(0, (int) opts.data_replicas -
-			   (int) bch2_bkey_durability_safe(c, k).nr_overwritable);
+	unsigned nr_overwritable = bch2_bkey_durability_safe(c, k).nr_overwritable;
+
+	new_replicas = max(0, (int) opts.data_replicas - (int) nr_overwritable);
 
 	/*
 	 * Get a disk reservation before (in the nocow case) calling
 	 * into the allocator:
 	 */
-	ret = bch2_disk_reservation_get(c, &res.r, sectors, new_replicas,
+	ret = bch2_disk_reservation_add(c, &res.r, sectors, new_replicas,
 				       BCH_DISK_RESERVATION_PARTIAL);
 	if (unlikely(!res.r.sectors && new_replicas)) {
 		ret = bch_err_throw(c, ENOSPC_disk_reservation);
 		goto err_noprint;
 	}
 
+	/* data_replicas, less however many the reservation couldn't give us: */
+	unsigned nr_replicas = opts.data_replicas - (new_replicas - res.r.nr_replicas);
+
 	if (new_replicas)
-		sectors = div_u64(res.r.sectors, new_replicas);
+		sectors = div_u64(res.r.sectors, res.r.nr_replicas);
 
 	bch2_bkey_buf_reassemble(&old, k);
 
@@ -81,7 +85,7 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 		reservation = bkey_reservation_init(new.k);
 		reservation->k.p = iter->pos;
 		bch2_key_resize(&reservation->k, sectors);
-		reservation->v.nr_replicas = opts.data_replicas;
+		reservation->v.nr_replicas = nr_replicas;
 	} else {
 		struct bkey_i_extent *e;
 		struct bch_devs_list devs_have;
@@ -100,15 +104,14 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 						opts.foreground_target,
 						false,
 						&devs_have,
-						opts.data_replicas,
-						opts.data_replicas,
+						nr_replicas,
+						nr_replicas,
 						BCH_WATERMARK_normal,
 						0, &cl)) ?:
 			bch2_alloc_sectors_req(trans, req, write_point, &wp);
-		if (bch2_err_matches(ret, BCH_ERR_operation_blocked)) {
-			bch2_wait_on_allocator(trans, req, ret, &cl);
-			ret = btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
-		}
+		if (bch2_err_matches(ret, BCH_ERR_operation_blocked))
+			ret = bch2_wait_on_allocator(trans, req, ret, &cl) ?:
+				btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 		if (ret)
 			goto err;
 
@@ -319,7 +322,7 @@ int bch2_truncate(struct bch_fs *c, subvol_inum inum, u64 new_i_size, u64 *i_sec
 	CLASS(btree_trans, trans)(c);
 	try(bch2_logged_op_start(trans, &op.k_i));
 	int ret = __bch2_resume_logged_op_truncate(trans, &op.k_i, i_sectors_delta);
-	ret = bch2_logged_op_finish(trans, &op.k_i, ret) ?: ret;
+	ret = bch2_logged_op_finish(trans, &op.k_i, ret, 0) ?: ret;
 	return ret;
 }
 
@@ -410,8 +413,7 @@ case LOGGED_OP_FINSERT_start:
 	fallthrough;
 case LOGGED_OP_FINSERT_shift_extents:
 	while (1) {
-		struct disk_reservation disk_res =
-			bch2_disk_reservation_init(c, 0);
+		struct disk_reservation disk_res = {};
 		struct bkey_i delete, *copy;
 		struct bkey_s_c k;
 		struct bpos src_pos = POS(inum.inum, src_offset);
@@ -441,11 +443,17 @@ case LOGGED_OP_FINSERT_shift_extents:
 		if ((ret = PTR_ERR_OR_ZERO(copy)))
 			goto btree_err;
 
+		unsigned nr_replicas =
+			bch2_bkey_durability_safe(c, bkey_i_to_s_c(copy)).total;
+
+		/*
+		 * Only one of these fires: either the key lives in an ancestor
+		 * snapshot and we're adding a reference to it here, or it's
+		 * already ours and only a split adds anything.
+		 */
 		if (snapshot != k.k->p.snapshot) {
 			ret = bch2_disk_reservation_add(c, &disk_res,
-					copy->k.size *
-					bch2_bkey_durability_safe(c, bkey_i_to_s_c(copy)).total,
-					0);
+					copy->k.size, nr_replicas, 0);
 			if (ret)
 				goto btree_err;
 		}
@@ -456,8 +464,7 @@ case LOGGED_OP_FINSERT_shift_extents:
 			/* Splitting compressed extent? */
 			if (snapshot == k.k->p.snapshot)
 				bch2_disk_reservation_add(c, &disk_res,
-							  copy->k.size *
-							  bch2_bkey_durability_safe(c, bkey_i_to_s_c(copy)).total,
+							  copy->k.size, nr_replicas,
 							  BCH_DISK_RESERVATION_NOFAIL);
 		}
 
@@ -537,6 +544,6 @@ int bch2_fcollapse_finsert(struct bch_fs *c, subvol_inum inum,
 	CLASS(btree_trans, trans)(c);
 	try(bch2_logged_op_start(trans, &op.k_i));
 	int ret = __bch2_resume_logged_op_finsert(trans, &op.k_i, i_sectors_delta);
-	ret = bch2_logged_op_finish(trans, &op.k_i, ret) ?: ret;
+	ret = bch2_logged_op_finish(trans, &op.k_i, ret, 0) ?: ret;
 	return ret;
 }

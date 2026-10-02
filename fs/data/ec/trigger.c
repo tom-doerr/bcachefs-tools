@@ -681,9 +681,14 @@ static struct ec_stripe_handle *bch2_open_stripe_find(struct bch_fs *c, u64 idx)
 	unsigned hash = hash_64(idx, ilog2(ARRAY_SIZE(c->ec.stripes_new)));
 	struct ec_stripe_handle *s;
 
-	hlist_for_each_entry(s, &c->ec.stripes_new[hash], hash)
+	hlist_for_each_entry(s, &c->ec.stripes_new[hash], hash) {
+		/* every handle on the list is claimed, and hashed by its idx: */
+		EBUG_ON(!s->idx);
+		EBUG_ON(hash_64(s->idx, ilog2(ARRAY_SIZE(c->ec.stripes_new))) != hash);
+
 		if (s->idx == idx)
 			return s;
+	}
 	return NULL;
 }
 
@@ -715,46 +720,41 @@ int bch2_stripe_handle_tryget_existing(struct btree_iter *iter,
 				       struct ec_stripe_handle *s)
 {
 	struct btree_trans *trans = iter->trans;
-	struct btree_path *path = btree_iter_path(trans, iter);
 	u64 idx = iter->pos.offset;
 
-	/* A noncached iterator can have obtained the key from the key cache: */
-	if (iter->key_cache_path) {
-		struct btree_path *cached = trans->paths + iter->key_cache_path;
-
-		if (bpos_eq(cached->pos, iter->pos) &&
-		    btree_node_intent_locked(cached, 0))
-			path = cached;
-	}
-
 	EBUG_ON(iter->btree_id != BTREE_ID_stripes);
-	EBUG_ON(!bpos_eq(path->pos, iter->pos));
-	/* write locking without holding intent would corrupt the six lock: */
-	BUG_ON(!btree_node_intent_locked(path, 0));
+	BUG_ON(!btree_node_intent_locked(btree_iter_path(trans, iter), 0));
+	BUG_ON(s->idx);
 
 	if (bch2_stripe_is_open(trans->c, idx))
 		return 0;
 
 	/*
-	 * bch2_trigger_stripe() and device invalidation delete or invalidate a
-	 * stripe after checking that it isn't open. Their commit can then drop
-	 * its locks (e.g. waiting on a journal reservation), relock and commit
-	 * without re-running the triggers. Taking and dropping an intent lock
-	 * doesn't invalidate that relock; a write lock does, because write
-	 * unlock advances the six sequence.
+	 * The stripe trigger and device invalidation act on stripes that
+	 * aren't open, and their decision can outlive a lock drop: commit
+	 * relocks and retries without re-running triggers. Cycling a write
+	 * lock advances the lock sequence, so that relock fails.
 	 *
-	 * Those transactions update the stripe key, so they hold its key cache
-	 * entry as well as a leaf path. If we read the key through the leaf,
-	 * there was no cache entry at the time, and a cache entry they held was
-	 * evicted, which already invalidated their cache path. So bumping
-	 * whichever of the two supplied our key is enough. The key cache fill
-	 * write-locks the leaf around its insert for the same reason.
-	 *
-	 * Take the lock before publishing, so a restart can't leak a handle.
+	 * The lock to cycle is the key cache entry: anything updating this key
+	 * holds it, and an entry is only freed under its write lock - so if
+	 * there's no entry, they're already invalidated. Our leaf intent lock
+	 * keeps one from being created meanwhile (the fill write locks the
+	 * leaf).
 	 */
-	try(bch2_btree_node_lock_write(trans, path, &path->l[0].b->c));
+	CLASS(btree_iter, ck_iter)(trans, BTREE_ID_stripes, iter->pos,
+				   BTREE_ITER_intent|
+				   BTREE_ITER_cached|
+				   BTREE_ITER_cached_nofill);
+	try(bch2_btree_iter_traverse(&ck_iter));
+
+	struct btree_path *ck_path = btree_iter_path(trans, &ck_iter);
+	if (!ck_path->l[0].b)
+		return bch2_stripe_handle_tryget(trans->c, s, idx);
+
+	/* Take the lock before publishing, so a restart can't leak a handle: */
+	try(bch2_btree_node_lock_write(trans, ck_path, &ck_path->l[0].b->c));
 	int ret = bch2_stripe_handle_tryget(trans->c, s, idx);
-	bch2_btree_node_unlock_write(trans, path, path->l[0].b);
+	bch2_btree_node_unlock_write(trans, ck_path, ck_path->l[0].b);
 	return ret;
 }
 

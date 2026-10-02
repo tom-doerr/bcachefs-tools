@@ -1002,8 +1002,12 @@ noinline __cold
 static int bch2_trans_commit_extra_disk_res(struct btree_trans *trans,
 					    enum bch_trans_commit_flags flags)
 {
-	return bch2_disk_reservation_add(trans->c, trans->disk_res,
+	/* Every site that charges extra_disk_res records what it charged at */
+	EBUG_ON(!trans->extra_disk_res_replicas);
+
+	return __bch2_disk_reservation_add(trans->c, trans->disk_res,
 				trans->extra_disk_res,
+				trans->extra_disk_res_replicas,
 				(flags & BCH_TRANS_COMMIT_no_enospc)
 				? BCH_DISK_RESERVATION_NOFAIL : 0);
 }

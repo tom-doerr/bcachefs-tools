@@ -688,7 +688,7 @@ static void le_bitvector_to_cpu(unsigned long *dst, unsigned long *src, unsigned
 		dst[i] = le_ulong_to_cpu(src[i]);
 }
 
-static void bch2_sb_update(struct bch_fs *c)
+void bch2_sb_update(struct bch_fs *c)
 {
 	struct bch_sb *src = c->disk_sb.sb;
 
@@ -965,6 +965,27 @@ static int read_backup_supers(struct bch_sb_handle *sb,
 	return 0;
 }
 
+/*
+ * The primary was unreadable, failed validation, or was older than a backup. Put the good copy back in slot 0 now,
+ * rather than leaving it for the next superblock write - that write reads back
+ * slot 0 first and would take a torn primary for another writer.
+ */
+static int rewrite_primary_super(struct bch_sb_handle *sb)
+{
+	struct bch_sb *s = sb->sb;
+
+	s->offset = s->layout.sb_offset[0];
+	s->csum = csum_vstruct(NULL, BCH_SB_CSUM_TYPE(s), null_nonce(), s);
+
+	bio_reset(sb->bio, sb->bdev, REQ_OP_WRITE|REQ_SYNC|REQ_META|REQ_FUA);
+	sb->bio->bi_iter.bi_sector = le64_to_cpu(s->offset);
+	bch2_bio_map(sb->bio, s,
+		     roundup((size_t) vstruct_bytes(s),
+			     bdev_logical_block_size(sb->bdev)));
+
+	return submit_bio_wait(sb->bio);
+}
+
 static int read_super_and_backups(struct bch_sb_handle *sb,
 			     const char *path,
 			     struct bch_opts *opts,
@@ -1038,6 +1059,7 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 		return -EFAULT;
 
 	u64 sb_offset;
+	bool primary_bad = false;
 
 	/*
 	 * If the user requested a specific superblock offset (recovery /
@@ -1057,13 +1079,17 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 		CLASS(printbuf, primary_err)();
 		int ret = read_one_super(sb, BCH_SB_SECTOR, &primary_err);
 		if (!ret) {
+			u64 primary_seq = le64_to_cpu(sb->sb->seq);
+
 			memcpy(&layout, &sb->sb->layout, sizeof(layout));
 			try(validate_sb_layout(&layout, err));
 			try(read_backup_supers(sb, &layout, true, &sb_offset, err));
+			primary_bad = primary_seq < le64_to_cpu(sb->sb->seq);
 		} else {
 			prt_printf(err, "primary superblock unreadable: %s\n", primary_err.buf);
 			try(read_layout_sector(sb, &layout, err));
 			try(read_backup_supers(sb, &layout, false, &sb_offset, err));
+			primary_bad = true;
 		}
 	}
 
@@ -1082,6 +1108,16 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 
 	sb->have_layout = true;
 	try(bch2_sb_validate(sb->sb, opts, sb_offset, 0, err));
+
+	if (primary_bad && (sb->mode & BLK_OPEN_WRITE)) {
+		int ret = rewrite_primary_super(sb);
+		if (ret)
+			prt_printf(err, "error rewriting primary superblock from backup at %llu: %s\n",
+				   sb_offset, bch2_err_str(ret));
+		else
+			prt_printf(err, "rewrote primary superblock from backup at %llu\n",
+				   sb_offset);
+	}
 
 	return 0;
 }
@@ -1233,7 +1269,8 @@ DEFINE_DARRAY_FREE_ITEM(write_sb_dev, write_sb_dev_put);
  * loop, the error report - so filtering here is the only place the restriction
  * has to be applied.
  */
-static int __bch2_write_super(struct bch_fs *c, const struct bch_devs_mask *devs)
+static int __bch2_write_super(struct bch_fs *c, const struct bch_devs_mask *devs,
+			      enum bch_sb_write_flags flags)
 {
 	struct closure *cl = &c->sb_write;
 	unsigned degraded_flags = BCH_FORCE_IF_DEGRADED;
@@ -1241,6 +1278,19 @@ static int __bch2_write_super(struct bch_fs *c, const struct bch_devs_mask *devs
 
 	if (!test_bit(BCH_FS_may_upgrade_downgrade, &c->flags))
 		return 0;
+
+	/*
+	 * Before a start has begun, the in-memory superblock holds what the open
+	 * decided - version upgrade/downgrade, last_mount - for a start to act
+	 * on; an open that never starts mustn't persist that. So a write before
+	 * start is either part of bringing the filesystem up (as recovery's own
+	 * are), or from an open that said it will never start, which skips
+	 * those decisions:
+	 */
+	if (!test_bit(BCH_FS_start_begun, &c->flags) &&
+	    !c->opts.will_not_start &&
+	    !(flags & BCH_SB_WRITE_bringup))
+		return bch_err_throw(c, erofs_sb_write_before_start);
 
 	event_inc_trace(c, write_super, buf);
 
@@ -1319,10 +1369,19 @@ static int __bch2_write_super(struct bch_fs *c, const struct bch_devs_mask *devs
 
 	/*
 	 * Defer writing the superblock until filesystem initialization is
-	 * complete - don't write out a partly initialized superblock:
+	 * complete - don't write out a partly initialized superblock.
+	 *
+	 * An offline edit (will_not_start) on a filesystem that has never been
+	 * started has nothing to defer to: say so, rather than let it report
+	 * success having written nothing.
 	 */
-	if (!BCH_SB_INITIALIZED(c->disk_sb.sb))
-		return 0;
+	if (!BCH_SB_INITIALIZED(c->disk_sb.sb)) {
+		if (!c->opts.will_not_start)
+			return 0;
+
+		bch_err(c, "filesystem has never been started, not writing superblock: mount it once first");
+		return bch_err_throw(c, erofs_sb_never_started);
+	}
 
 	if (le16_to_cpu(c->disk_sb.sb->version) > bcachefs_metadata_version_current) {
 		CLASS(printbuf, buf)();
@@ -1494,11 +1553,12 @@ static int __bch2_write_super(struct bch_fs *c, const struct bch_devs_mask *devs
 	return 0;
 }
 
-static int bch2_write_super_devs(struct bch_fs *c, const struct bch_devs_mask *devs)
+static int bch2_write_super_devs(struct bch_fs *c, const struct bch_devs_mask *devs,
+				 enum bch_sb_write_flags flags)
 {
 	u64 start_time = local_clock();
 
-	int ret = __bch2_write_super(c, devs);
+	int ret = __bch2_write_super(c, devs, flags);
 	/* Make new options visible after they're persistent: */
 	bch2_sb_update(c);
 
@@ -1506,9 +1566,14 @@ static int bch2_write_super_devs(struct bch_fs *c, const struct bch_devs_mask *d
 	return ret;
 }
 
+int bch2_write_super_flags(struct bch_fs *c, enum bch_sb_write_flags flags)
+{
+	return bch2_write_super_devs(c, NULL, flags);
+}
+
 int bch2_write_super(struct bch_fs *c)
 {
-	return bch2_write_super_devs(c, NULL);
+	return bch2_write_super_flags(c, 0);
 }
 
 /*
@@ -1621,7 +1686,7 @@ int bch2_write_super_replicas(struct bch_fs *c)
 	}
 
 	return nr_skipped
-		? bch2_write_super_devs(c, &devs)
+		? bch2_write_super_devs(c, &devs, 0)
 		: bch2_write_super(c);
 }
 

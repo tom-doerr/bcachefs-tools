@@ -72,9 +72,23 @@ struct move_bucket {
 	atomic_t		count;
 };
 
+/*
+ * What the journal scrub found wrong with an extent, for
+ * bch2_scrub_journal_do_repairs() once we're rw: the scrub runs with journal
+ * keys frozen, so it can neither repair nor record damage itself.
+ *
+ * @bad_devs is a mask of pointers by their position in @k, like ptrs_io_error,
+ * not of device indices. @read_err is set when reading them failed outright,
+ * rather than a replica being found bad on a read that succeeded.
+ *
+ * @level is 0 for an extent; for a btree node pointer it's the level @k lives
+ * at, one above the node's.
+ */
 typedef struct {
 	enum btree_id		btree_id;
+	unsigned		level;
 	unsigned		bad_devs;
+	int			read_err;
 	__BKEY_PADDED(k, BKEY_EXTENT_VAL_U64s_MAX);
 } scrub_journal_repair;
 

@@ -85,7 +85,10 @@ struct bch_fs_usage_short {
 };
 
 /*
- * A reservation for space on disk:
+ * A reservation for space on disk. @sectors is physical - total disk space, not
+ * the size of the data - and is charged to the online_reserved[] slot named by
+ * @nr_replicas: charged sectors always have one, and changing it means moving
+ * them, with disk_res_move_slot().
  */
 struct disk_reservation {
 	u64			sectors;

@@ -142,15 +142,13 @@ static int bch2_write_inode_trans(struct btree_trans *trans,
 				  struct bch_inode_info *inode,
 				  inode_set_fn set,
 				  void *p, unsigned fields,
-				  bool *reconcile_changed,
-				  struct bkey_i_logged_op_inode_opt_propagate *propagate)
+				  struct inode_opt_change *opt_change)
 {
 	struct bch_fs *c = trans->c;
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bch_inode_unpacked inode_u;
 
-	/* First thing: a restart discards the update, so it can't stay armed */
-	bkey_init(&propagate->k);
+	bch2_inode_opt_change_init(opt_change);
 
 	try(bch2_inode_peek(trans, &iter, &inode_u, inode_inum(inode), BTREE_ITER_intent));
 
@@ -161,23 +159,11 @@ static int bch2_write_inode_trans(struct btree_trans *trans,
 	if (set)
 	       try(set(trans, inode, &inode_u, p));
 
-	struct bch_extent_reconcile new_r = bch2_inode_reconcile_opts_get(c, &inode_u);
-	*reconcile_changed = memcmp(&old_r, &new_r, sizeof(new_r));
-	if (*reconcile_changed) {
-		try(bch2_set_reconcile_needs_scan_trans(trans,
-				(struct reconcile_scan) {
-					.type = RECONCILE_SCAN_inum,
-					.inum = inode_u.bi_inum }));
-		/*
-		 * Data written before this subvolume branched off is keyed at
-		 * an ancestor snapshot, and takes its options from the inode
-		 * version there: the new options have to be pushed up to reach
-		 * it. iter.snapshot, not inode_u.bi_snapshot - peek() can find
-		 * the key at an ancestor, but we write here.
-		 */
-		try(bch2_inode_opt_propagate_start(trans, inode_u.bi_inum,
-						   iter.snapshot, propagate));
-	}
+	/*
+	 * iter.snapshot, not inode_u.bi_snapshot: peek() can find the key at an
+	 * ancestor, but we write here
+	 */
+	try(bch2_inode_opt_change_trans(trans, &old_r, &inode_u, iter.snapshot, opt_change));
 
 	try(bch2_inode_write(trans, &iter, &inode_u));
 	try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
@@ -196,12 +182,11 @@ int __must_check bch2_write_inode(struct bch_fs *c,
 				  void *p, unsigned fields)
 {
 	CLASS(btree_trans, trans)(c);
-	bool reconcile_changed = false;
 	/* On the stack: it has to outlive the commit that inserts it */
-	struct bkey_i_logged_op_inode_opt_propagate propagate;
+	struct inode_opt_change opt_change;
 
 	int ret = lockrestart_do(trans, bch2_write_inode_trans(trans, inode, set, p, fields,
-							       &reconcile_changed, &propagate));
+							       &opt_change));
 
 	bch2_fs_fatal_err_on(bch2_err_matches(ret, ENOENT), c,
 			     "%s: inode %llu:%llu not found when updating",
@@ -209,12 +194,8 @@ int __must_check bch2_write_inode(struct bch_fs *c,
 			     inode_inum(inode).subvol,
 			     inode_inum(inode).inum);
 
-	if (!ret) {
-		if (propagate.k.type == KEY_TYPE_logged_op_inode_opt_propagate)
-			ret = bch2_inode_opt_propagate_finish(trans, &propagate);
-		if (reconcile_changed)
-			bch2_reconcile_wakeup(c, RECONCILE_KICK_inode_opts);
-	}
+	if (!ret)
+		ret = bch2_inode_opt_change_finish(trans, &opt_change);
 
 	return ret < 0 ? ret : 0;
 }
@@ -1177,26 +1158,31 @@ int __bch2_unlink(struct inode *vdir, struct dentry *dentry,
 	int ret;
 
 	bch2_lock_inodes(INODE_UPDATE_LOCK, dir, inode);
-	CLASS(btree_trans, trans)(c);
+	{
+		CLASS(btree_trans, trans)(c);
 
-	ret = commit_do(trans, NULL, NULL,
-			BCH_TRANS_COMMIT_no_enospc,
-		bch2_unlink_trans(trans,
-				  inode_inum(dir),	&dir_u,
-				  inode_inum(inode),	&inode_u, &dentry->d_name,
-				  deleting_snapshot));
-	if (unlikely(ret))
-		goto err;
-
-	bch2_inode_update_after_write(trans, dir, &dir_u,
-				      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
-	bch2_inode_update_after_write(trans, inode, &inode_u,
-				      ATTR_CTIME);
-
-	if (IS_CASEFOLDED(vdir))
-		d_invalidate(dentry);
-err:
+		ret = commit_do(trans, NULL, NULL,
+				BCH_TRANS_COMMIT_no_enospc,
+			bch2_unlink_trans(trans,
+					  inode_inum(dir),	&dir_u,
+					  inode_inum(inode),	&inode_u, &dentry->d_name,
+					  deleting_snapshot));
+		if (likely(!ret)) {
+			bch2_inode_update_after_write(trans, dir, &dir_u,
+						      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
+			bch2_inode_update_after_write(trans, inode, &inode_u,
+						      ATTR_CTIME);
+		}
+	}
 	bch2_unlock_inodes(INODE_UPDATE_LOCK, dir, inode);
+
+	/*
+	 * d_invalidate() waits for other threads killing child dentries, and
+	 * evicting a deleted child takes btree locks: call it with none of ours
+	 * held, as vfs_rmdir() does shrink_dcache_parent()
+	 */
+	if (!ret && IS_CASEFOLDED(vdir))
+		d_invalidate(dentry);
 
 	return ret;
 }
@@ -1258,6 +1244,8 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 	struct bch_inode_info *dst_inode = to_bch_ei(dst_dentry->d_inode);
 	struct bch_inode_unpacked dst_dir_u, src_dir_u;
 	struct bch_inode_unpacked src_inode_u, dst_inode_u, *whiteout_inode_u;
+	/* On the stack: they have to outlive the commit that inserts them */
+	struct inode_opt_change src_opt_change, dst_opt_change;
 	enum bch_rename_mode mode = flags & RENAME_EXCHANGE
 		? BCH_RENAME_EXCHANGE
 		: dst_dentry->d_inode
@@ -1315,7 +1303,9 @@ retry:
 				&dst_inode_u,
 				&src_dentry->d_name,
 				&dst_dentry->d_name,
-				mode);
+				mode,
+				&src_opt_change,
+				&dst_opt_change);
 	if (unlikely(ret))
 		goto err_tx_restart;
 
@@ -1367,6 +1357,8 @@ err_tx_restart:
 		bch2_inode_update_after_write(trans, dst_inode, &dst_inode_u,
 					      ATTR_CTIME);
 
+	ret = bch2_inode_opt_change_finish(trans, &src_opt_change) ?:
+	      bch2_inode_opt_change_finish(trans, &dst_opt_change);
 err:
 	bch2_fs_quota_transfer(c, src_inode,
 			       bch_qid(&src_inode->ei_inode),
@@ -1596,9 +1588,44 @@ static const struct vm_operations_struct bch_vm_ops = {
 	.page_mkwrite   = bch2_page_mkwrite,
 };
 
+/*
+ * No new mappings of a writable file after a shutdown, so writers get an error
+ * from mmap() instead of SIGBUS from page_mkwrite. EIO, as ext4 and f2fs return
+ * from a shut-down filesystem: mmap(2) documents neither EIO nor EROFS.
+ */
+/*
+ * A write fault on a shut-down filesystem can't get a disk reservation, so
+ * page_mkwrite would SIGBUS: refuse the mapping instead, so the writer gets an
+ * error from mmap(). Only shared writable mappings fault that way - a
+ * read-only mapping of a file open for writing (xfs_io's default) never calls
+ * page_mkwrite, and must still work: generic/743 maps read-only while its
+ * error injection is taking the filesystem down. mprotect() can still make one
+ * writable later; that case SIGBUSes, as it always did.
+ */
+static int bch2_mmap_check(struct file *file, bool shared_writable)
+{
+	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
+
+	if (shared_writable &&
+	    test_bit(BCH_FS_emergency_ro, &c->flags))
+		return bch2_err_class(bch_err_throw(c, mmap_emergency_ro));
+	return 0;
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,17,0)
 static int bch2_mmap_prepare(struct vm_area_desc *desc)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7,0,0)
+	bool shared_writable = vma_flags_test_all(&desc->vma_flags,
+						  VMA_SHARED_BIT, VMA_WRITE_BIT);
+#else
+	bool shared_writable = (desc->vm_flags & (VM_SHARED|VM_WRITE)) ==
+		(VM_SHARED|VM_WRITE);
+#endif
+	int ret = bch2_mmap_check(desc->file, shared_writable);
+	if (ret)
+		return ret;
+
 	file_accessed(desc->file);
 
 	desc->vm_ops = &bch_vm_ops;
@@ -1607,6 +1634,11 @@ static int bch2_mmap_prepare(struct vm_area_desc *desc)
 #else
 static int bch2_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	int ret = bch2_mmap_check(file,
+			(vma->vm_flags & (VM_SHARED|VM_WRITE)) == (VM_SHARED|VM_WRITE));
+	if (ret)
+		return ret;
+
 	file_accessed(file);
 
 	vma->vm_ops = &bch_vm_ops;
@@ -2609,7 +2641,21 @@ static int bch2_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_bsize	= sb->s_blocksize;
 	buf->f_blocks	= usage.capacity >> shift;
 	buf->f_bfree	= usage.free >> shift;
-	buf->f_bavail	= avail_factor(usage.free) >> shift;
+
+	/*
+	 * What this inode could actually write: a reservation at its replica
+	 * count, from placeable space (whole free buckets) - applications size
+	 * fallocate() from this. Never more than capacity - used.
+	 */
+	struct bch_inode_opts opts;
+	bch2_inode_opts_get_inode(c, &to_bch_ei(d_inode(dentry))->ei_inode, &opts);
+	unsigned nr_replicas = clamp_t(unsigned, opts.data_replicas, 1, BCH_REPLICAS_MAX);
+
+	u64 placeable[BCH_REPLICAS_MAX];
+	bch2_fs_sectors_placeable(c, placeable, NULL);
+	buf->f_bavail	= div_u64(min(avail_factor(usage.free),
+				      placeable[nr_replicas - 1]),
+				  nr_replicas) >> shift;
 
 	u64 nr_inodes = 0;
 	struct disk_accounting_pos k;

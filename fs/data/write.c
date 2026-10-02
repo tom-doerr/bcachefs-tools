@@ -876,7 +876,8 @@ int bch2_sum_sector_overwrites(struct btree_trans *trans,
 			       struct bkey_i *new,
 			       bool *usage_increasing,
 			       s64 *i_sectors_delta,
-			       s64 *disk_sectors_delta)
+			       s64 *disk_sectors_delta,
+			       unsigned *new_nr_replicas)
 {
 	struct bch_fs *c = trans->c;
 	struct bkey_durability new_d = bch2_bkey_durability_safe(c, bkey_i_to_s_c(new));
@@ -884,6 +885,11 @@ int bch2_sum_sector_overwrites(struct btree_trans *trans,
 	*usage_increasing	= false;
 	*i_sectors_delta	= 0;
 	*disk_sectors_delta	= 0;
+	/*
+	 * @disk_sectors_delta is weighted by this below, so a caller topping up
+	 * a reservation to cover it needs to know the count it's charging at:
+	 */
+	*new_nr_replicas	= new_d.nr_replicas;
 
 	CLASS(btree_iter_copy, iter)(extent_iter);
 	struct bkey_s_c old;
@@ -1068,15 +1074,18 @@ int bch2_extent_update(struct btree_trans *trans,
 		flush = NULL;
 	}
 
+	unsigned new_nr_replicas = 0;
 	try(bch2_sum_sector_overwrites(trans, iter, k,
 				       &usage_increasing,
 				       &i_sectors_delta,
-				       &disk_sectors_delta));
+				       &disk_sectors_delta,
+				       &new_nr_replicas));
 
 	if (disk_res &&
 	    disk_sectors_delta > (s64) disk_res->sectors)
-		try(bch2_disk_reservation_add(c, disk_res,
+		try(__bch2_disk_reservation_add(c, disk_res,
 					disk_sectors_delta - disk_res->sectors,
+					new_nr_replicas,
 					!check_enospc || !usage_increasing
 					? BCH_DISK_RESERVATION_NOFAIL : 0));
 
@@ -1546,6 +1555,8 @@ static void bch2_write_endio(struct bio *bio)
 
 	bch2_account_io_completion(ca, BCH_MEMBER_ERROR_write,
 				   wbio->submit_time, !bio->bi_status);
+	if (!(bio->bi_opf & REQ_FUA))
+		bch2_dev_write_unflushed(ca);
 
 	if (unlikely(bio->bi_status)) {
 		guard(spinlock_irqsave)(&c->write_error_lock);
@@ -2565,10 +2576,10 @@ again:
 
 			if (bch2_err_matches(ret2, BCH_ERR_operation_blocked) &&
 			    wait_on_allocator_sync) {
-				bch2_wait_on_allocator(trans, req, ret2, &op->cl);
+				ret2 = bch2_wait_on_allocator(trans, req, ret2, &op->cl);
 				__bch2_write_index(op);
 				op->wbio.failed.nr = 0;
-				ret2 = btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
+				ret2 = ret2 ?: btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 			}
 			ret2;
 		}));

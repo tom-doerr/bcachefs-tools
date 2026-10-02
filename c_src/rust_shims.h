@@ -110,6 +110,7 @@ BCH_IOCTL_BIND(BCH_IOCTL_DEV_USAGE_V2);
 BCH_IOCTL_BIND(BCH_IOCTL_FSCK_OFFLINE);
 BCH_IOCTL_BIND(BCH_IOCTL_FSCK_ONLINE);
 BCH_IOCTL_BIND(BCH_IOCTL_QUERY_ACCOUNTING);
+BCH_IOCTL_BIND(BCH_IOCTL_QUERY_ACCOUNTING_v2);
 BCH_IOCTL_BIND(BCH_IOCTL_QUERY_COUNTERS);
 BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_LIST);
 BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_TO_PATH);
@@ -208,7 +209,7 @@ void rust_read_submit(struct bch_fs *c,
 
 /*
  * Extent construction for migrate — wraps bkey_extent_init,
- * bch2_bkey_append_ptr, bucket_gen, bch2_disk_reservation_get/put,
+ * bch2_bkey_append_ptr, bucket_gen, bch2_disk_reservation_add/put,
  * bch2_btree_insert. All static inlines or macro-generated,
  * not available through bindgen.
  */

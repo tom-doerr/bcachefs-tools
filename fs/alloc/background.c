@@ -1229,6 +1229,41 @@ static noinline int inval_bucket_key(struct btree_trans *trans, struct bkey_s_c 
 #define statechange_from(expr)		(eval_state(old_a, expr) && !eval_state(new_a, expr))
 #define statechange(expr)		(eval_state(old_a, expr) != eval_state(new_a, expr))
 
+/*
+ * stripe_refcount counts the bucket_to_stripe entries for this bucket. If it
+ * drops to zero while a stripe still points here, nothing stops the bucket
+ * going empty, being discarded and reused under the stripe - the stripe's
+ * pointers then go stale, which fsck doesn't otherwise catch until the stripe
+ * is read (GH #960). Name the transaction that let it happen.
+ */
+static noinline int alloc_check_no_stripe_refs(struct btree_trans *trans,
+					       struct bkey_s_c old, struct bkey_s_c new)
+{
+	struct bch_fs *c = trans->c;
+	u64 b = bucket_to_u64(new.k->p);
+	struct bpos end = POS(b, U64_MAX);
+
+	CLASS(btree_iter, iter)(trans, BTREE_ID_bucket_to_stripe, POS(b, 0), 0);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(&iter, &end));
+	int ret = 0;
+
+	if (k.k) {
+		CLASS(printbuf, buf)();
+		prt_printf(&buf, "bucket stripe_refcount went to 0 in %s, but stripe %llu still references it\n",
+			   trans->fn, k.k->p.offset);
+		prt_str(&buf, "old: ");
+		bch2_bkey_val_to_text(&buf, c, old);
+		prt_str(&buf, "\nnew: ");
+		bch2_bkey_val_to_text(&buf, c, new);
+		prt_newline(&buf);
+		bch2_prt_task_backtrace(&buf, current, 1, GFP_KERNEL);
+
+		log_fsck_err(trans, alloc_key_stripe_refcount_wrong, "%s", buf.buf);
+	}
+fsck_err:
+	return ret;
+}
+
 int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 {
 	struct bch_fs *c = trans->c;
@@ -1299,6 +1334,10 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 		 * bucket), so don't WARN during fsck.
 		 */
 		bool in_fsck = test_bit(BCH_FS_in_fsck, &c->flags);
+
+		if (!in_fsck &&
+		    unlikely(old_a->stripe_refcount && !new_a->stripe_refcount))
+			try(alloc_check_no_stripe_refs(trans, op.old, op.new.s_c));
 
 		if (statechange_to(a->data_type == BCH_DATA_free)) {
 			/*
@@ -1434,6 +1473,26 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 
 		if (statechange_to(a->data_type == BCH_DATA_free))
 			bch2_alloc_wake_dev(ca);
+
+		if (statechange(a->data_type == BCH_DATA_free)) {
+			/*
+			 * nr_open_buckets counts open buckets that are still
+			 * free: a written one is already gone from
+			 * buckets[free], and __dev_buckets_free() would
+			 * subtract it twice.
+			 */
+			guard(spinlock)(&c->allocator.freelist_lock);
+			struct open_bucket *ob =
+				bch2_bucket_is_open(c, op.new.k->p.inode, op.new.k->p.offset);
+			if (ob) {
+				bool uncount = statechange_from(a->data_type == BCH_DATA_free);
+
+				if (ob->free_uncounted != uncount) {
+					ca->nr_open_buckets += uncount ? -1 : 1;
+					ob->free_uncounted = uncount;
+				}
+			}
+		}
 
 		if (statechange_to(!data_type_is_empty(a->data_type))) {
 			/*
@@ -1586,6 +1645,32 @@ unsigned long bch2_fs_ra_pages(struct bch_fs *c)
 	return ra_pages ?: VM_READAHEAD_PAGES;
 }
 
+/*
+ * c->capacity.reserved is the sum of these, and the per-device free space walk
+ * subtracts each, so reservations and capacity run out together. gc_reserve is
+ * shared out by capacity, not bucket count: bucket sizes can differ.
+ */
+static u64 dev_reserved_sectors(struct bch_dev *ca, u64 gc_reserve, u64 capacity)
+{
+	u64 dev_sectors = dev_capacity_sectors(ca);
+
+	/*
+	 * Enough to refill every reserve from scratch, twice over: copygc
+	 * spends its whole reserve in one go, then runs again against what
+	 * that freed.
+	 */
+	u64 alloc_reserve = ca->nr_btree_reserve * 2 +
+			    (ca->mi.nbuckets >> 6) +	/* copygc */
+			    3;				/* btree, copygc, rebalance write points */
+	alloc_reserve *= (u64) ca->mi.bucket_size * 2;
+
+	u64 gc_share = capacity
+		? mul_u64_u64_div_u64(gc_reserve, dev_sectors, capacity)
+		: 0;
+
+	return min(max(alloc_reserve, gc_share), dev_sectors);
+}
+
 void bch2_recalc_capacity(struct bch_fs *c)
 {
 	u64 capacity = 0, reserved_sectors = 0, gc_reserve;
@@ -1594,64 +1679,49 @@ void bch2_recalc_capacity(struct bch_fs *c)
 	lockdep_assert_held(&c->state_lock);
 
 	guard(rcu)();
+
+	/* the total first: gc_reserve_bytes has to be shared out against it */
+	for_each_member_device_rcu(c, ca, NULL)
+		if (dev_has_capacity(ca))
+			capacity += dev_capacity_sectors(ca);
+
+	gc_reserve = c->opts.gc_reserve_bytes
+		? c->opts.gc_reserve_bytes >> 9
+		: div64_u64(capacity * c->opts.gc_reserve_percent, 100);
+	gc_reserve = min(gc_reserve, capacity);
+
+	bool all_devs_rw = true;
+
 	for_each_member_device_rcu(c, ca, NULL) {
 		if (!bch2_dev_is_rw(ca))
+			all_devs_rw = false;
+
+		if (!dev_has_capacity(ca)) {
+			ca->reserved_sectors = 0;
 			continue;
+		}
 
-		if (!ca->mi.durability)
-			continue;
-
-		u64 dev_reserve = 0;
-
-		/*
-		 * We need to reserve buckets (from the number
-		 * of currently available buckets) against
-		 * foreground writes so that mainly copygc can
-		 * make forward progress.
-		 *
-		 * We need enough to refill the various reserves
-		 * from scratch - copygc will use its entire
-		 * reserve all at once, then run against when
-		 * its reserve is refilled (from the formerly
-		 * available buckets).
-		 *
-		 * This reserve is just used when considering if
-		 * allocations for foreground writes must wait -
-		 * not -ENOSPC calculations.
-		 */
-
-		dev_reserve += ca->nr_btree_reserve * 2;
-		dev_reserve += ca->mi.nbuckets >> 6; /* copygc reserve */
-
-		dev_reserve += 1;	/* btree write point */
-		dev_reserve += 1;	/* copygc write point */
-		dev_reserve += 1;	/* rebalance write point */
-
-		dev_reserve *= ca->mi.bucket_size;
-
-		capacity += bucket_to_sector(ca, ca->mi.nbuckets -
-					     ca->mi.first_bucket);
-
-		reserved_sectors += dev_reserve * 2;
+		ca->reserved_sectors = dev_reserved_sectors(ca, gc_reserve, capacity);
+		reserved_sectors += ca->reserved_sectors;
 
 		bucket_size_max = max_t(unsigned, bucket_size_max,
 					ca->mi.bucket_size);
 	}
 
+	/*
+	 * Cached: every reservation that comes up short asks, and only this
+	 * changes it.
+	 */
+	mod_bit(BCH_FS_all_devs_rw, &c->flags, all_devs_rw);
+
 	bch2_set_ra_pages(c, bch2_fs_ra_pages(c));
-
-	gc_reserve = c->opts.gc_reserve_bytes
-		? c->opts.gc_reserve_bytes >> 9
-		: div64_u64(capacity * c->opts.gc_reserve_percent, 100);
-
-	reserved_sectors = max(gc_reserve, reserved_sectors);
-
-	reserved_sectors = min(reserved_sectors, capacity);
 
 	c->capacity.reserved = reserved_sectors;
 	c->capacity.capacity = capacity - reserved_sectors;
 
 	c->capacity.bucket_size_max = bucket_size_max;
+
+	bch2_disk_reservation_caches_invalidate(c);
 
 	/* Wake up case someone was waiting for buckets */
 	bch2_alloc_wake_all(c);
@@ -1759,8 +1829,12 @@ void bch2_fs_capacity_exit(struct bch_fs *c)
 {
 	percpu_free_rwsem(&c->capacity.mark_lock.lock);
 	if (c->capacity.pcpu) {
-		u64 v = percpu_u64_get(&c->capacity.pcpu->online_reserved);
-		WARN(v, "online_reserved not 0 at shutdown: %lli", v);
+		for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++) {
+			u64 v = percpu_u64_get(&c->capacity.pcpu->online_reserved[i]);
+
+			WARN(v, "online_reserved not 0 at shutdown: %llu at %u replicas",
+			     v, i + 1);
+		}
 	}
 
 	free_percpu(c->capacity.pcpu);

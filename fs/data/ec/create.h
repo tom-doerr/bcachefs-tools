@@ -55,11 +55,6 @@ struct ec_stripe_new_bucket {
 	u64			dev_bucket;
 };
 
-struct ec_stripe_handle {
-	struct hlist_node	hash;
-	u64			idx;
-};
-
 struct ec_stripe_new {
 	struct bch_fs		*c;
 	struct moving_context	*ctxt;
@@ -96,6 +91,7 @@ struct ec_stripe_new {
 	bool			allocated:1;
 	bool			mem_allocated:1;
 	bool			old_stripe_read:1;
+	bool			old_stripe_read_all:1;
 
 	unsigned long		blocks_gotten[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
 	unsigned long		blocks_allocated[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
@@ -204,7 +200,7 @@ void bch2_ec_stripe_head_put(struct bch_fs *, struct ec_stripe_head *);
 
 struct alloc_request;
 struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *,
-			struct alloc_request *, unsigned);
+			struct alloc_request *, unsigned, struct open_bucket **);
 
 void bch2_do_stripe_deletes(struct bch_fs *);
 void bch2_ec_stripe_create_start(struct bch_fs *, struct ec_stripe_new *);
@@ -253,9 +249,8 @@ void bch2_new_stripes_to_text(struct printbuf *, struct bch_fs *);
 struct moving_context;
 int bch2_stripe_repair(struct moving_context *, struct btree_iter *, struct bkey_s_c_stripe);
 
-struct wb_maybe_flush;
-int bch2_ec_record_lost_block(struct btree_trans *, struct bkey_s_c_stripe, unsigned,
-			      enum bch_sb_error_id, struct wb_maybe_flush *);
+void bch2_ec_record_lost_blocks(struct btree_trans *, struct bkey_s_c_stripe, u32,
+				enum bch_sb_error_id, bool);
 
 void bch2_logged_op_stripe_update_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 

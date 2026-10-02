@@ -46,10 +46,9 @@ static int bch2_set_nr_journal_buckets_iter(struct bch_dev *ca, unsigned nr,
 			 req->data_type = BCH_DATA_journal,
 			 PTR_ERR_OR_ZERO(ob[nr_got] = bch2_bucket_alloc_trans(trans, req)));
 
-			if (bch2_err_matches(ret2, BCH_ERR_operation_blocked)) {
-				bch2_wait_on_allocator(trans, req, ret2, cl);
-				ret2 = btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
-			}
+			if (bch2_err_matches(ret2, BCH_ERR_operation_blocked))
+				ret2 = bch2_wait_on_allocator(trans, req, ret2, cl) ?:
+					btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 
 			ret2;
 		}));
@@ -162,10 +161,15 @@ static int bch2_set_nr_journal_buckets_loop(struct bch_fs *c, struct bch_dev *ca
 		 * XXX: that's not right, disk reservations only ensure a
 		 * filesystem-wide allocation will succeed, this is a device
 		 * specific allocation - we can hang here:
+		 *
+		 * A device outside the capacity (durability 0) takes nothing
+		 * anyone reserved, so there's nothing to reserve against - and
+		 * when initializing a new filesystem, the devices after it
+		 * don't have their free space counted yet.
 		 */
 		CLASS(disk_reservation, res)(c);
-		if (!new_fs)
-			try(bch2_disk_reservation_get(c, &res.r,
+		if (!new_fs && dev_has_capacity(ca))
+			try(bch2_disk_reservation_add(c, &res.r,
 						bucket_to_sector(ca, nr - ja->nr), 1, 0));
 
 		ret = bch2_set_nr_journal_buckets_iter(ca, nr, new_fs, watermark, &cl);
