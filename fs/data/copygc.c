@@ -136,7 +136,20 @@ static int bch2_bucket_is_movable(struct btree_trans *trans,
 	b->sectors	= bch2_bucket_sectors_dirty(*a);
 	u64 lru_idx	= alloc_lru_idx_fragmentation(*a, ca);
 
-	if (!lru_idx || lru_idx > time) {
+	/*
+	 * A bucket from the fragmentation lru must still be at least as
+	 * fragmented as its lru entry said. A bucket reached through its
+	 * stripe (U64_MAX) is moved to empty the stripe, however full it is:
+	 * a full bucket has no fragmentation lru position (0), and a sparse
+	 * stripe's remaining blocks are typically full buckets.
+	 */
+	bool movable = time == U64_MAX
+		? a->data_type < BCH_DATA_NR &&
+		  data_type_movable(a->data_type) &&
+		  b->sectors
+		: lru_idx && lru_idx <= time;
+
+	if (!movable) {
 		bch_err_throw(c, bucket_not_moveable_lru_race);
 		return 0;
 	}
