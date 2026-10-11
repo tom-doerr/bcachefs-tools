@@ -1764,14 +1764,41 @@ static int new_stripe_alloc_buckets(struct btree_trans *trans,
 
 /*
  * What reuse and repair need to know of a stripe's blocks, as masks by block
- * index: which data blocks hold live data, and which blocks - data or parity -
- * are on a device that's lost its durability (missing, evacuating; see
- * bch2_stripe_block_dev_bad()).
+ * index: which data blocks hold live data, which blocks - data or parity - are
+ * on a device that's lost its durability (missing, evacuating; see
+ * bch2_stripe_block_dev_bad()), and which of the rest are on a device we can't
+ * write to (ro, spare).
+ *
+ * A block in @nowrite isn't bad - its data counts, nothing needs repairing -
+ * but a new stripe can't keep it in place: stripe creation takes a WRITE ref
+ * on every member device (stripe_get_iorefs()), and a device that isn't rw
+ * never gives one. Carried anyway, the create fails, every time the stripe
+ * comes up for reuse. So it moves, like a bad block.
  */
 struct stripe_blocks {
 	u32	live;
 	u32	bad;
+	u32	nowrite;
 };
+
+static bool stripe_block_dev_writable(struct bch_fs *c, unsigned dev)
+{
+	guard(rcu)();
+	struct bch_dev *ca = bch2_dev_rcu_noerror(c, dev);
+	return ca && bch2_dev_is_rw(ca);
+}
+
+/* Live data blocks a new stripe keeps where they are: */
+static inline u32 stripe_blocks_carry(struct stripe_blocks b)
+{
+	return b.live & ~(b.bad | b.nowrite);
+}
+
+/* Live data blocks a new stripe gets new buckets for: */
+static inline u32 stripe_blocks_move(struct stripe_blocks b)
+{
+	return b.live & (b.bad | b.nowrite);
+}
 
 static struct stripe_blocks stripe_blocks_get(struct bch_fs *c, const struct bch_stripe *s)
 {
@@ -1783,6 +1810,8 @@ static struct stripe_blocks stripe_blocks_get(struct bch_fs *c, const struct bch
 			b.live |= BIT(i);
 		if (bch2_stripe_block_dev_bad(c, s->ptrs[i].dev))
 			b.bad |= BIT(i);
+		else if (!stripe_block_dev_writable(c, s->ptrs[i].dev))
+			b.nowrite |= BIT(i);
 	}
 
 	return b;
@@ -1799,7 +1828,7 @@ static bool may_reuse_stripe(struct bch_fs *c,
 	struct stripe_blocks b = stripe_blocks_get(c, old);
 	struct bch_devs_mask devs_may_alloc = new->devs;
 
-	unsigned long carried = b.live & ~b.bad;
+	unsigned long carried = stripe_blocks_carry(b);
 	unsigned i;
 	for_each_set_bit(i, &carried, BCH_BKEY_PTRS_MAX)
 		__clear_bit(old->ptrs[i].dev, devs_may_alloc.d);
@@ -2074,7 +2103,7 @@ static int stripe_reuse(struct btree_trans *trans, struct ec_stripe_new *s)
 		return ret ?: bch_err_throw(c, stripe_alloc_blocked);
 
 	struct stripe_blocks b = stripe_blocks_get(c, &s->old_stripe.key.v);
-	init_new_stripe_from_old(c, s, b.live & ~b.bad, b.live & b.bad, false);
+	init_new_stripe_from_old(c, s, stripe_blocks_carry(b), stripe_blocks_move(b), false);
 	return 0;
 }
 
@@ -2645,8 +2674,9 @@ err:
  * bch2_disk_label_ec_devs()).
  *
  * A repair carries the stripe's good data blocks forward where they are
- * (init_new_stripe_from_old()); only the blocks on bad devices, and all the
- * parity, get new buckets. So a device holding a carried block counts whatever
+ * (init_new_stripe_from_old()); only the blocks on bad devices or on devices
+ * we can't write to (stripe_blocks_move()), and all the parity, get new
+ * buckets. So a device holding a carried block counts whatever
  * its free space; any other device counts only if it can take a new block -
  * free buckets at the repair's watermark now, or copygc will make some (the
  * same test as the data update path, and the allocator's bail-out).
@@ -2659,7 +2689,7 @@ static void stripe_repair_usable_devs(struct bch_fs *c, const struct bch_stripe 
 				      struct stripe_blocks b, struct bch_devs_mask *devs)
 {
 	struct bch_devs_mask carried = {};
-	unsigned long carried_blocks = b.live & ~b.bad;
+	unsigned long carried_blocks = stripe_blocks_carry(b);
 	unsigned i;
 
 	for_each_set_bit(i, &carried_blocks, BCH_BKEY_PTRS_MAX)
@@ -2736,10 +2766,10 @@ static int stripe_repair_narrow(struct moving_context *ctxt,
 	unsigned blocks_used[BCH_BKEY_PTRS_MAX], nr = 0;
 
 	/*
-	 * Blocks on bad devices first: that's the data that has to move, and
-	 * the stripe narrows to the good blocks:
+	 * Blocks that have to move first - on bad devices, or on devices we
+	 * can't write to - and the stripe narrows to the blocks it carries:
 	 */
-	unsigned long moving = b.live & b.bad, carried = b.live & ~b.bad;
+	unsigned long moving = stripe_blocks_move(b), carried = stripe_blocks_carry(b);
 	unsigned i;
 
 	for_each_set_bit(i, &moving, BCH_BKEY_PTRS_MAX)
@@ -3126,7 +3156,7 @@ static int stripe_repair_unrebuildable(struct moving_context *ctxt,
 
 	/* clean blocks on devices that have lost their durability still move: */
 	return stripe_repair_rebuild(ctxt, s, h, buf, devs,
-				     b.live & ~b.bad, b.live & b.bad);
+				     stripe_blocks_carry(b), stripe_blocks_move(b));
 }
 
 /*
@@ -3162,7 +3192,7 @@ static int stripe_repair_opened(struct moving_context *ctxt, struct bkey_s_c_str
 	}
 
 	return stripe_repair_rebuild(ctxt, s, h, buf, devs,
-				     b.live & ~b.bad, b.live & b.bad);
+				     stripe_blocks_carry(b), stripe_blocks_move(b));
 }
 
 static int __stripe_repair(struct moving_context *ctxt, struct btree_iter *iter,
