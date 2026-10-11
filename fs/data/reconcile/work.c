@@ -1556,6 +1556,19 @@ static int do_reconcile_scan_bp(struct btree_trans *trans,
 	return update_reconcile_opts_scan(trans, NULL, &opts, &iter, bp.v->level, k, s);
 }
 
+/*
+ * A device being removed loses its data to the removal's own drop, and the
+ * backpointers a device scan read up front go stale under it - each costing a
+ * write buffer flush to find out (one per key: the re-read after the flush
+ * drops it before a second look).
+ */
+static bool reconcile_scan_dev_leaving(struct bch_fs *c, unsigned dev)
+{
+	guard(rcu)();
+	struct bch_dev *ca = bch2_dev_rcu_noerror(c, dev);
+	return !ca || READ_ONCE(ca->removing);
+}
+
 static int do_reconcile_scan_bps(struct moving_context *ctxt,
 				 struct reconcile_scan s,
 				 struct wb_maybe_flush *last_flushed)
@@ -1573,7 +1586,8 @@ static int do_reconcile_scan_bps(struct moving_context *ctxt,
 		ctxt->stats->pos = BBPOS(BTREE_ID_backpointers, iter.pos);
 
 		CLASS(disk_reservation, res)(c);
-		(kthread_should_stop() || !bch2_reconcile_enabled(c))
+		(kthread_should_stop() || !bch2_reconcile_enabled(c) ||
+		 reconcile_scan_dev_leaving(c, s.dev))
 		? bch_err_throw(c, reconcile_scan_stop) :
 		do_reconcile_scan_bp(trans, s, bp, last_flushed) ?:
 		bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc);
@@ -1772,7 +1786,16 @@ static int do_reconcile_scan(struct moving_context *ctxt,
 	} else if (s.type == RECONCILE_SCAN_metadata) {
 		try(do_reconcile_scan_fs(ctxt, s, snapshot_io_opts, true));
 	} else if (s.type == RECONCILE_SCAN_device) {
-		try(do_reconcile_scan_bps(ctxt, s, last_flushed));
+		/*
+		 * Removed: nothing left to scan, just clear the cookie. Being
+		 * removed: leave it - removal deletes it once the device is
+		 * gone, and if the removal fails it's scanned then:
+		 */
+		if (bch2_dev_exists(c, s.dev)) {
+			if (reconcile_scan_dev_leaving(c, s.dev))
+				return 0;
+			try(do_reconcile_scan_bps(ctxt, s, last_flushed));
+		}
 	} else if (s.type == RECONCILE_SCAN_stripes) {
 		try(do_reconcile_scan_stripes(ctxt));
 	} else if (s.type == RECONCILE_SCAN_inum) {
