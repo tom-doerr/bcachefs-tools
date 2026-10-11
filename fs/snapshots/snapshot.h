@@ -33,6 +33,14 @@ int bch2_check_snapshot_needs_deletion(struct btree_trans *, struct bkey_s_c, u3
 	.min_val_size	= 24,					\
 })
 
+/*
+ * The raw state field. A key that predates it reads 0, which matches no state:
+ * == SNAPSHOT_STATE_deleted is false for a deleted legacy node, and
+ * != SNAPSHOT_STATE_live true for a live one.
+ *
+ * Use bch2_snapshot_state_compat() to decide what to do with a node; this is for
+ * validation and the migration, which care what's in the field.
+ */
 static inline enum bch_snapshot_state bch2_snapshot_state(const struct bch_snapshot *s)
 {
 	return le32_to_cpu(s->state);
@@ -49,6 +57,10 @@ static inline enum bch_snapshot_state bch2_snapshot_state_from_flags(const struc
 	return SNAPSHOT_STATE_live;
 }
 
+/*
+ * The node's state, on any key: zero isn't a valid state, so a zero field means
+ * the key predates it, and the old flag bits are authoritative.
+ */
 static inline enum bch_snapshot_state bch2_snapshot_state_compat(const struct bch_snapshot *s)
 {
 	return s->state
@@ -111,6 +123,7 @@ static inline const struct snapshot_t *snapshot_t(struct bch_fs *c, u32 id)
 }
 
 struct snapshot_t *bch2_snapshot_t_mut(struct bch_fs *, u32);
+int bch2_snapshot_table_make_room(struct bch_fs *, u32);
 
 static inline u32 bch2_snapshot_tree(struct bch_fs *c, u32 id)
 {
@@ -175,6 +188,8 @@ static inline u32 bch2_snapshot_nth_parent(struct bch_fs *c, u32 id, u32 n)
 }
 
 u32 bch2_snapshot_skiplist_get(struct bch_fs *, u32);
+u32 bch2_snapshot_oldest_subvol(struct bch_fs *, u32);
+u32 bch2_snapshot_table_find_edge(struct bch_fs *, const struct bch_snapshot *, u32, bool);
 
 static inline u32 bch2_snapshot_root(struct bch_fs *c, u32 id)
 {
@@ -226,6 +241,14 @@ static inline int bch2_snapshot_is_leaf(struct bch_fs *c, u32 id)
 	return !ret;
 }
 
+/*
+ * No NULL check, unlike the helpers above: @parent must be an ancestor of a node
+ * the caller already found in the table. The table is indexed by U32_MAX - id
+ * and IDs descend, so a table covering a node covers all its ancestors.
+ *
+ * Returning 0 for a missing entry would write a wrong depth during repair; an
+ * oops at least stops.
+ */
 static inline u32 bch2_snapshot_depth(struct bch_fs *c, u32 parent)
 {
 	guard(rcu)();

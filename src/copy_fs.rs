@@ -9,16 +9,17 @@
 // Converted from c_src/posix_to_bcachefs.c.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
 use bch_bindgen::data::io::{block_on, MAX_IO_SIZE};
 use bcachefs_kernel::btree;
-use bcachefs_kernel::btree::iter::{CommitFlags, CommitOpts};
+use bcachefs_kernel::btree::iter::CommitFlags;
 use bcachefs_kernel::data::io_misc;
-use bcachefs_kernel::{dirent, inode, namei, str_hash, xattr};
+use bcachefs_kernel::{acl, dirent, inode, namei, str_hash, xattr};
 use bcachefs_kernel::errcode::{ret_to_result_void as ret_to_result, BchError, bch_errcode};
 use bcachefs_kernel::fs::Fs;
 
@@ -151,13 +152,13 @@ fn unlink_and_rm(
     dir: &mut c::bch_inode_unpacked,
     child_name: &CStr,
 ) -> Result<(), BchError> {
-    let qstr = dirent::qstr(child_name.to_bytes());
+    let child_name = OsStr::from_bytes(child_name.to_bytes());
     let mut child: c::bch_inode_unpacked = Default::default();
 
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             namei::unlink_trans(
                 t,
@@ -165,7 +166,7 @@ fn unlink_and_rm(
                 dir,
                 zeroed_subvol_inum(),
                 &mut child,
-                &qstr,
+                child_name,
                 false,
             )
         },
@@ -192,9 +193,9 @@ fn create_or_update_link(
 ) -> Result<(), BchError> {
     let dir_hash = str_hash::hash_info_init(fs, dir)?;
 
-    let qstr = dirent::qstr(name.to_bytes());
+    let os_name = OsStr::from_bytes(name.to_bytes());
 
-    match dirent::lookup(fs, dir_inum, &dir_hash, &qstr) {
+    match dirent::lookup(fs, dir_inum, &dir_hash, os_name) {
         Err(e) if e.matches(bch_errcode::BCH_ERR_ENOENT_str_hash_lookup) => {
             // Fall through to create
         }
@@ -213,8 +214,8 @@ fn create_or_update_link(
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new(),
-        |t| namei::link_trans(t, dir_inum, &mut dir_u, inum, &mut inode, &qstr),
+        CommitFlags::empty(),
+        |t| namei::link_trans(t, dir_inum, &mut dir_u, inum, &mut inode, os_name),
     )
 }
 
@@ -231,8 +232,8 @@ fn create_or_update_file(
 ) -> Result<c::bch_inode_unpacked, BchError> {
     let dir_hash = str_hash::hash_info_init(fs, dir)?;
 
-    let qname = dirent::qstr(name.to_bytes());
-    let child_inum = dirent::lookup(fs, dir_inum, &dir_hash, &qname);
+    let name = OsStr::from_bytes(name.to_bytes());
+    let child_inum = dirent::lookup(fs, dir_inum, &dir_hash, name);
 
     let mut child_inode: c::bch_inode_unpacked = Default::default();
     let mut child_subvol : c::bch_subvolume = Default::default();
@@ -249,7 +250,7 @@ fn create_or_update_file(
         // bch2_fsck_write_inode has its own commit_do loop internally —
         // don't wrap it in trans_commit_do or it double-nests.
         {
-            let trans = btree::BtreeTrans::new(fs);
+            let trans = bcachefs_kernel::btree_trans!(fs);
             inode::fsck_write_inode(&trans, &mut child_inode)?;
         }
     } else {
@@ -258,7 +259,7 @@ fn create_or_update_file(
         btree::iter::trans_commit_do(
             fs,
             None,
-            CommitOpts::new(),
+            CommitFlags::empty(),
             |t| {
                 namei::create_trans(
                     t,
@@ -266,11 +267,13 @@ fn create_or_update_file(
                     dir,
                     &mut child_inode,
                     &mut child_subvol,
-                    &qname,
+                    Some(name),
                     uid,
                     gid,
                     mode as _,
                     rdev as _,
+                    None,
+                    None,
                     zeroed_subvol_inum(),
                     0,
                 )
@@ -331,6 +334,8 @@ fn copy_xattrs(
         return Ok(()); // silently skip if xattrs not supported
     }
 
+    let mut acl_flags = Vec::new();
+
     let mut pos = 0usize;
     while pos < attrs_size {
         let end = attrs_buf[pos..attrs_size].iter().position(|&b| b == 0).unwrap() + pos;
@@ -349,19 +354,39 @@ fn copy_xattrs(
             Err(_) => continue,
         };
 
-        let stripped_cstr = CString::new(stripped).unwrap();
+        // POSIX ACLs come in the xattr API's format; bcachefs stores its
+        // own. bch2_get_acl() goes by the inode's flags, not the xattrs:
+        // without them the ACLs are there and ignored.
+        let acl;
+        let value = match xattr_type {
+            XATTR_INDEX_ACL_ACCESS | XATTR_INDEX_ACL_DEFAULT => {
+                let Some(v) = acl_from_xattr(&val_buf[..val_size]) else {
+                    eprintln!("{}: {} isn't a POSIX ACL, not copied",
+                              src.to_string_lossy(), String::from_utf8_lossy(attr_name));
+                    continue;
+                };
+                acl = v;
+                acl_flags.push(if xattr_type == XATTR_INDEX_ACL_ACCESS {
+                    c::bch_inode_flags::BCH_INODE_has_access_acl
+                } else {
+                    c::bch_inode_flags::BCH_INODE_has_default_acl
+                });
+                &acl[..]
+            }
+            _ => &val_buf[..val_size],
+        };
 
         btree::iter::trans_commit_do(
             fs,
             None,
-            CommitOpts::new(),
+            CommitFlags::empty(),
             |t| {
                 xattr::set(
                     t,
                     subvol_inum(dst.bi_inum),
                     dst,
-                    &stripped_cstr,
-                    &val_buf[..val_size],
+                    OsStr::from_bytes(stripped),
+                    value,
                     xattr_type,
                     0,
                 )
@@ -369,7 +394,39 @@ fn copy_xattrs(
         )?;
     }
 
+    // Each set above reads the inode back into @dst, so a flag set before
+    // the last would be lost: set them now. Written with the rest of the
+    // inode by the caller.
+    for flag in acl_flags {
+        dst.set_flag(flag, true);
+    }
+
     Ok(())
+}
+
+/// A POSIX ACL as the xattr API gives it - <linux/posix_acl_xattr.h>: a
+/// version 2 header, then 8 byte entries - as bcachefs stores it. None if
+/// it isn't one.
+fn acl_from_xattr(value: &[u8]) -> Option<Vec<u8>> {
+    const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
+
+    let (header, entries) = value.split_at_checked(4)?;
+    if u32::from_le_bytes(header.try_into().ok()?) != POSIX_ACL_XATTR_VERSION ||
+       entries.len() % 8 != 0 {
+        return None;
+    }
+
+    let entries: Vec<acl::AclEntry> = entries.chunks_exact(8)
+        .map(|e| acl::AclEntry {
+            tag:  u16::from_le_bytes([e[0], e[1]]),
+            perm: u16::from_le_bytes([e[2], e[3]]),
+            id:   u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+        })
+        .collect();
+
+    let mut out = vec![0u8; acl::encoded_len(entries.iter().copied())?];
+    acl::encode(entries.iter().copied(), &mut out);
+    Some(out)
 }
 
 fn write_data(
@@ -1024,10 +1081,11 @@ pub fn copy_fs(
 
     rustix::process::fchdir(src_fd).map_err(rustix_err)?;
 
-    copy_times(fs, &mut root_inode, &stat);
-
+    // Xattrs first: setting each reads the inode back, over the times.
     let dot = CString::new(".").unwrap();
     copy_xattrs(fs, &mut root_inode, &dot)?;
+
+    copy_times(fs, &mut root_inode, &stat);
 
     let dup_fd = rustix::io::dup(src_fd).map_err(rustix_err)?;
     copy_dir(fs, s, &mut root_inode, dup_fd, src_path)?;

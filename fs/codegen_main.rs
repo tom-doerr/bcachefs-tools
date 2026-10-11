@@ -42,10 +42,10 @@ fn main() {
         None => userspace_clang_args(&src, &target),
     };
     let blocklist: Vec<String> = match opt(args, "--blocklist") {
-        Some(v) => v.split(':').map(blocklist_dir).collect(),
+        Some(v) => v.split(':').map(kernel_blocklist_dir).collect(),
         None => default_blocklist(&src),
     };
 
     run_bindgen(&out, &clang_args, &blocklist, &ptr_width);
-    gen_xmacros(&src, &out);
+    gen_bitmasks(&src, &out);
 }

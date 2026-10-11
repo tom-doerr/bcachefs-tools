@@ -1,5 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0
 
+/* DOC(btree-node-read)
+ *
+ * A btree node read has three outcomes:
+ *
+ *   clean     - every bset parsed and validated.
+ *   degraded  - damage was worked around in memory: a bset with a bad checksum
+ *               kept, an invalid bkey dropped, the tail of a bset truncated.
+ *               The node is usable, but the copy on disk isn't fixed until the
+ *               node is rewritten: it's flagged need_rewrite and
+ *               need_rewrite_error.
+ *   unusable  - nothing parses, or there's no replica left to try: the caller
+ *               gets btree_node_validate_err.
+ *
+ * Degraded vs. unusable depends only on the damage - FSCK_CAN_FIX, and whether
+ * another replica is worth reading - never on fix_errors. fix_errors decides
+ * whether a repair gets written, and bch2_async_btree_op() gates that on a
+ * write ref, so a read-only mount reads degraded nodes and writes nothing.
+ * Making the read itself depend on fix_errors makes a parseable node unreadable
+ * on an ordinary mount, and topology repair then livelocks on it.
+ */
+
 #include "bcachefs.h"
 
 #include "alloc/buckets.h"
@@ -1203,9 +1224,9 @@ struct btree_node_scrub {
 };
 
 static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, unsigned ptr_written,
-				   struct printbuf *err)
+				   __le64 seq, struct printbuf *err)
 {
-	unsigned written = 0;
+	unsigned written = 0, end = ptr_written ?: btree_sectors(c);
 
 	if (le64_to_cpu(data->magic) != bset_magic(c)) {
 		prt_printf(err, "bad magic: want %llx, got %llx",
@@ -1213,20 +1234,35 @@ static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, un
 		return false;
 	}
 
-	while (written < (ptr_written ?: btree_sectors(c))) {
+	if (data->keys.seq != seq) {
+		prt_printf(err, "wrong btree node: seq %llx, want %llx",
+			   le64_to_cpu(data->keys.seq), le64_to_cpu(seq));
+		return false;
+	}
+
+	while (written < end) {
 		struct btree_node_entry *bne;
 		struct bset *i;
 		bool first = !written;
+		unsigned sectors;
 
 		if (first) {
 			bne = NULL;
 			i = &data->keys;
+			sectors = vstruct_sectors(data, c->block_bits);
 		} else {
 			bne = (void *) data + (written << 9);
 			i = &bne->keys;
 
-			if (!ptr_written && i->seq != data->keys.seq)
+			if (i->seq != data->keys.seq)
 				break;
+			sectors = vstruct_sectors(bne, c->block_bits);
+		}
+
+		if (written + sectors > end) {
+			prt_printf(err, "bset past end of btree node (offset %u len %u but written %u)",
+				   written, sectors, end);
+			return false;
 		}
 
 		struct nonce nonce = btree_nonce(i, written << 9);
@@ -1240,8 +1276,6 @@ static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, un
 					return false;
 				}
 			}
-
-			written += vstruct_sectors(data, c->block_bits);
 		} else {
 			if (good_csum_type) {
 				struct bch_csum csum = csum_vstruct(c, BSET_CSUM_TYPE(i), nonce, bne);
@@ -1250,9 +1284,15 @@ static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, un
 					return false;
 				}
 			}
-
-			written += vstruct_sectors(bne, c->block_bits);
 		}
+
+		written += sectors;
+	}
+
+	if (ptr_written && written < ptr_written) {
+		prt_printf(err, "btree node data missing: expected %u sectors, found %u",
+			   ptr_written, written);
+		return false;
 	}
 
 	return true;
@@ -1269,7 +1309,7 @@ static void btree_node_scrub_work(struct work_struct *work)
 	prt_newline(&err);
 
 	bool good = !scrub->bio.bi_status &&
-		btree_node_scrub_check(c, scrub->buf, scrub->written, &err);
+		btree_node_scrub_check(c, scrub->buf, scrub->written, scrub->seq, &err);
 	btree_node_scrub_report_fn report = scrub->report;
 
 	if (report) {

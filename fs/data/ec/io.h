@@ -17,7 +17,10 @@ enum bch_stripe_buf_err {
 };
 
 struct ec_stripe_buf {
+	/* belongs to the buffer's owner, see bch2_ec_stripe_buf_move(): */
 	struct closure		io;
+
+	struct_group(contents,
 	struct bch_fs		*c;
 
 	/* might not be buffering the entire stripe: */
@@ -34,6 +37,7 @@ struct ec_stripe_buf {
 
 	struct bkey_i_stripe	key;
 	u64			pad[255];
+	);
 };
 
 static inline unsigned ec_nr_failed(struct ec_stripe_buf *buf,
@@ -72,10 +76,11 @@ static inline u32 ec_failed_mask(struct ec_stripe_buf *buf,
 
 void __bch2_ec_stripe_buf_exit(struct ec_stripe_buf *);
 void bch2_ec_stripe_buf_exit(struct ec_stripe_buf *);
+void bch2_ec_stripe_buf_move(struct ec_stripe_buf *, struct ec_stripe_buf *);
 int bch2_ec_stripe_buf_init(struct bch_fs *, struct ec_stripe_buf *, unsigned, unsigned,
 			    struct closure *);
 
-DEFINE_FREE(ec_stripe_buf_free, struct ec_stripe_buf *, bch2_ec_stripe_buf_exit(_T); kfree(_T));
+DEFINE_FREE(ec_stripe_buf_free, struct ec_stripe_buf *, if (_T) { bch2_ec_stripe_buf_exit(_T); kfree(_T); });
 
 s64 bch2_ec_scrub_block(struct bch_fs *, struct ec_stripe_buf *, unsigned);
 void bch2_ec_generate_ec(struct ec_stripe_buf *);

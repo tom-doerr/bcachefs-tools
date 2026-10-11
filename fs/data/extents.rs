@@ -1,11 +1,23 @@
-use crate::btree::bkey::{BkeyS, BkeyValSC};
+use crate::btree::bkey::{BkeyS, BkeySC, BkeyValSC};
+use crate::btree::iter::{BtreeIter, TransAttempt};
+use crate::errcode::BchError;
 use crate::c;
 use crate::fs::Fs;
 use core::marker::PhantomData;
 use core::mem::size_of;
 
-// Pull in generated extent_entry_type_u64s() from build.rs
-include!(concat!(env!("OUT_DIR"), "/extent_entry_types_gen.rs"));
+macro_rules! extent_entry_u64s {
+    ($(($name:tt, $nr:literal)),* $(,)?) => { ::paste::paste! {
+        /// Size in u64s for each known extent entry type.
+        pub fn extent_entry_type_u64s(ty: u32) -> Option<usize> {
+            Some(match ty {
+                $($nr => size_of::<c::[<bch_extent_ $name>]>() / 8,)*
+                _ => return None,
+            })
+        }
+    } };
+}
+c::BCH_EXTENT_ENTRY_TYPES!(extent_entry_u64s);
 
 trait ExtentUnionField<T> {
     unsafe fn as_union_ref(&self) -> &T;
@@ -181,7 +193,7 @@ impl<'a> Iterator for ExtentEntryIterMut<'a> {
         }
 
         let entry = unsafe { &mut *self.cur };
-        let u64s = unsafe { c::extent_entry_u64s(self.fs.raw, self.cur) as usize };
+        let u64s = entry_u64s(self.fs, entry);
         if u64s == 0 {
             return None;
         }
@@ -200,14 +212,35 @@ pub(crate) fn bkey_extent_entries_mut<'a>(
     fs: &'a Fs,
     k:  &'a mut BkeyS<'_>,
 ) -> ExtentEntryIterMut<'a> {
-    let ptrs = unsafe { c::bch2_bkey_ptrs(k.to_raw()) };
+    // Where the entries are, by the read-only view - as offsets into the
+    // value, taken mutably from its bytes below:
+    let span = {
+        let sc = k.as_sc();
+        let v = sc.v as *const c::bch_val as *const u8;
+        bkey_ptrs_raw(&sc.v()).map(|(start, end)| unsafe {
+            ((start as *const u8).offset_from(v) as usize,
+             (end   as *const u8).offset_from(v) as usize)
+        })
+    };
+    let (start, end) = span.unwrap_or((0, 0));
+    let val = k.val_bytes_mut().as_mut_ptr();
 
     ExtentEntryIterMut {
         fs,
-        cur:      ptrs.start,
-        end:      ptrs.end,
+        cur:      unsafe { val.add(start).cast() },
+        end:      unsafe { val.add(end).cast() },
         _phantom: PhantomData,
     }
+}
+
+/// @entry's size in u64s, from this filesystem's table - which can know
+/// types this code doesn't: as extent_entry_u64s().
+fn entry_u64s(fs: &Fs, entry: &c::bch_extent_entry) -> usize {
+    let ty = extent_entry_type(entry) as usize;
+    let sb = unsafe { &(*fs.raw).sb };
+    assert!(ty < sb.extent_types_known as usize,
+            "extent entry type {ty}, of {} known: a validated key has none", sb.extent_types_known);
+    sb.extent_type_u64s[ty] as usize
 }
 
 pub struct ExtentPtrIterMut<'a> {
@@ -232,6 +265,65 @@ pub fn bkey_ptrs_mut<'a>(
     k:  &'a mut BkeyS<'_>,
 ) -> ExtentPtrIterMut<'a> {
     ExtentPtrIterMut { inner: bkey_extent_entries_mut(fs, k) }
+}
+
+fn extent_entry_is_crc(entry: &c::bch_extent_entry) -> bool {
+    use c::bch_extent_entry_type::*;
+
+    let ty = extent_entry_type(entry);
+    ty == BCH_EXTENT_ENTRY_crc32 as u32 ||
+    ty == BCH_EXTENT_ENTRY_crc64 as u32 ||
+    ty == BCH_EXTENT_ENTRY_crc128 as u32
+}
+
+/// The checksum/compression entries of @k, unpacked: as bkey_for_each_crc().
+pub fn bkey_crcs<'a>(k: BkeySC<'a>) -> impl Iterator<Item = c::bch_extent_crc_unpacked> + 'a {
+    bkey_extent_entries_sc(&k.v())
+        .filter(|e| extent_entry_is_crc(e))
+        .map(move |e| unsafe {
+            c::bch2_extent_crc_unpack(k.k, e as *const _ as *const c::bch_extent_crc)
+        })
+}
+
+/// Whether @crc's data is checksummed or compressed - read back whole, so
+/// bounded by encoded_extent_max: as crc_is_encoded().
+pub fn crc_is_encoded(crc: &c::bch_extent_crc_unpacked) -> bool {
+    // By value in C; bindgen doesn't make it Copy
+    unsafe { c::crc_is_encoded(core::ptr::read(crc)) }
+}
+
+/// Whether @k is counted in its inode's i_sectors: as
+/// bkey_extent_is_allocation().
+pub fn bkey_extent_is_allocation(k: &c::bkey) -> bool {
+    use c::bch_bkey_type as t;
+
+    [t::KEY_TYPE_extent, t::KEY_TYPE_reservation, t::KEY_TYPE_reflink_p, t::KEY_TYPE_reflink_v,
+     t::KEY_TYPE_inline_data, t::KEY_TYPE_indirect_inline_data, t::KEY_TYPE_error]
+        .iter().any(|ty| ty.0 == k.type_ as u32)
+}
+
+/// Whether @k reserves space rather than holding data - a reservation, or
+/// an extent with unwritten pointers: as bkey_extent_is_reservation().
+pub fn bkey_extent_is_reservation(k: BkeySC<'_>) -> bool {
+    k.k.type_ as u32 == c::bch_bkey_type::KEY_TYPE_reservation.0 ||
+        bkey_ptrs_sc(&k.v()).any(|p| p.unwritten() != 0)
+}
+
+/// @k's durability, for reserving space to rewrite it: as
+/// bch2_bkey_durability_safe(), which tolerates bad pointers.
+pub fn durability_safe(fs: &Fs, k: BkeySC<'_>) -> c::bkey_durability {
+    unsafe { c::bch2_bkey_durability_safe(fs.raw, k.to_raw()) }
+}
+
+/// Drop @k's stale cached pointers, updating it through @iter: as
+/// bch2_bkey_drop_stale_ptrs().
+pub fn drop_stale_ptrs<'a, 't>(
+    t:    &TransAttempt<'a, 't>,
+    iter: &BtreeIter<'t>,
+    k:    BkeySC<'_>,
+) -> Result<(), BchError> {
+    let ret = unsafe { c::bch2_bkey_drop_stale_ptrs(t.raw(), iter.raw(), k.to_raw()) };
+    t.result(ret)
 }
 
 /// Mutable access to an entry's `stripe_ptr` union field.

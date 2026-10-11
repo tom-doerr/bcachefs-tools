@@ -10,6 +10,10 @@
 
 include!("codegen.rs");
 
+include!("../clang_target.rs");
+
+include!("../build-link.rs");
+
 fn watch_dir(dir: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -37,9 +41,15 @@ fn main() {
     // `kernel` cfg selects kernel vs. bcachefs-shim types in mod.rs; cargo never
     // sets it, so declare it to avoid the unexpected-cfg warning.
     println!("cargo::rustc-check-cfg=cfg(kernel)");
+    // The build whose object rust_types_gen reads - see types/lib.rs.
+    println!("cargo::rustc-check-cfg=cfg(bch_cstruct_records)");
+    // The kernel build's, as for C; types defined in Rust test it.
+    println!("cargo::rustc-check-cfg=cfg(__KERNEL__)");
     // The shared codegen logic is include!d, not a tracked source file — tell
     // cargo to rerun us when it changes.
     println!("cargo:rerun-if-changed=codegen.rs");
+    println!("cargo:rerun-if-changed=build_config.rs");
+    println!("cargo:rerun-if-changed=../clang_target.rs");
     // Rerun when any C/H file the wrapper might include changes.
     for dir in ["..", "../include"] {
         watch_dir(dir);
@@ -48,13 +58,18 @@ fn main() {
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let src = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"); // = fs/
     let target = std::env::var("TARGET").expect("TARGET");
+    let clang_target = clang_target_for_rust_target(&target);
     let ptr_width = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default();
 
-    let clang_args = userspace_clang_args(&src, &target);
+    let clang_args = userspace_clang_args(&src, clang_target);
     let blocklist = default_blocklist(&src);
 
+    let root = std::path::Path::new(&src).parent().expect("fs crate has a parent dir");
+    rerun_if_userspace_config_changed(root);
+    emit_userspace_config_cfgs(root);
+
     run_bindgen(&out, &clang_args, &blocklist, &ptr_width);
-    gen_xmacros(&src, &out);
+    gen_bitmasks(&src, &out);
 
     // Compile the static-inline wrappers bindgen just emitted and link them in,
     // with the same -I/-D set the headers were parsed with. cc-rs targets the
@@ -65,6 +80,13 @@ fn main() {
         w.flag(f);
     }
     w.compile("bcachefs_static_wrappers");
+
+    println!("cargo:rerun-if-changed=../build-link.rs");
+    link_bcachefs(
+        &root.display().to_string(),
+        &root.join("libbcachefs.a").display().to_string(),
+        false,
+    );
 
     // dh-cargo Built-Using (Debian): point the path at the package root (the
     // workspace root, == the dpkg build's $PWD) so dh-cargo-built-using sees

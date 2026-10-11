@@ -376,7 +376,7 @@ fn mount_legacy(
     // An interior NUL can't be expressed in a C string at all. Nothing has been
     // attempted at this point, so the errno is ours rather than the kernel's.
     let bad_arg = |what: &str| MountError {
-        code: BchError::from_raw(libc::EINVAL),
+        code: libc::EINVAL.into(),
         text: format!("{what} contains a NUL byte"),
     };
 
@@ -503,9 +503,20 @@ pub(crate) fn parse_mountflag_options(options: impl AsRef<str>) -> ParsedMountOp
 
 #[cfg(test)]
 mod tests {
-    use super::{is_splitbrain, parse_mountflag_options};
+    use super::{is_splitbrain, parse_mountflag_options, take_fuse_option};
     use bcachefs_kernel::c;
     use bcachefs_kernel::errcode::BchError;
+
+    #[test]
+    fn fuse_option_is_consumed_wherever_it_is() {
+        assert_eq!(take_fuse_option(""), (false, String::new()));
+        assert_eq!(take_fuse_option("ro,noatime"), (false, "ro,noatime".into()));
+        assert_eq!(take_fuse_option("fuse"), (true, String::new()));
+        assert_eq!(take_fuse_option("fuse,ro"), (true, "ro".into()));
+        assert_eq!(take_fuse_option("ro,fuse,noatime"), (true, "ro,noatime".into()));
+        // only the whole word - not an option that merely contains it:
+        assert_eq!(take_fuse_option("fusefoo=1"), (false, "fusefoo=1".into()));
+    }
 
     /// The prompt only happens if this recognises the error, and a failure to
     /// recognise it is silent - mount just refuses, exactly as it would with
@@ -513,12 +524,12 @@ mod tests {
     /// straight through `?`, and behind a context someone adds later.
     #[test]
     fn splitbrain_is_recognised_through_anyhow() {
-        let sb = || BchError::from_errcode(c::bch_errcode::BCH_ERR_device_splitbrain);
+        let sb = || BchError::from(c::bch_errcode::BCH_ERR_device_splitbrain);
 
         assert!(is_splitbrain(&anyhow::Error::from(sb())));
         assert!(is_splitbrain(&anyhow::Error::from(sb()).context("scanning for devices")));
 
-        let other = BchError::from_errcode(c::bch_errcode::BCH_ERR_device_has_been_removed);
+        let other = BchError::from(c::bch_errcode::BCH_ERR_device_has_been_removed);
         assert!(!is_splitbrain(&anyhow::Error::from(other)));
         assert!(!is_splitbrain(&anyhow::anyhow!("not a bcachefs error at all")));
     }
@@ -856,10 +867,30 @@ fn check_bcachefs_module() -> ModuleCheck {
     ModuleCheck { loaded: path.exists(), modprobe_error }
 }
 
-fn mount(cli: Cli) -> std::process::ExitCode {
-    let module = check_bcachefs_module();
+/// `fuse` among the mount options: mount through the FUSE daemon instead of
+/// the kernel, as `-t bcachefs.fuse` does, for callers that can only pass
+/// options - an fstab line, or a test suite mounting `-t bcachefs` with its
+/// own options appended. Consumed here; the filesystem never sees it.
+fn take_fuse_option(options: &str) -> (bool, String) {
+    let mut fuse = false;
+    let rest: Vec<&str> = options.split(',')
+        .filter(|o| if *o == "fuse" { fuse = true; false } else { !o.is_empty() })
+        .collect();
+    (fuse, rest.join(","))
+}
 
-    if cli.fs_type == "bcachefs.fuse" {
+fn mount(cli: Cli) -> std::process::ExitCode {
+    // TODO: centralize this on the top level CLI
+    // First: the FUSE path below reports its failures with error!(), which
+    // says nothing at all until this has run.
+    logging::setup(cli.verbose, cli.colorize);
+
+    let (via_fuse, options) = take_fuse_option(&cli.options);
+
+    // Before the module check: a FUSE mount mustn't modprobe the kernel
+    // driver, or a test run meant to exercise FUSE can quietly mount some of
+    // its filesystems through the kernel instead.
+    if cli.fs_type == "bcachefs.fuse" || via_fuse {
         if cli.fake {
             info!("fake mount (-f/--fake): skipping FUSE mount");
             return std::process::ExitCode::SUCCESS;
@@ -867,7 +898,7 @@ fn mount(cli: Cli) -> std::process::ExitCode {
         #[cfg(feature = "fuse")]
         {
             let fuse_cli = super::fusemount::Cli {
-                options: if cli.options.is_empty() { None } else { Some(cli.options.clone()) },
+                options: if options.is_empty() { None } else { Some(options) },
                 foreground: false,
                 device: cli.dev.clone(),
                 mountpoint: cli.mountpoint.as_ref()
@@ -889,8 +920,7 @@ fn mount(cli: Cli) -> std::process::ExitCode {
         }
     }
 
-    // TODO: centralize this on the top level CLI
-    logging::setup(cli.verbose, cli.colorize);
+    let module = check_bcachefs_module();
 
     match cmd_mount_inner(&cli) {
         Ok(_)   => std::process::ExitCode::SUCCESS,

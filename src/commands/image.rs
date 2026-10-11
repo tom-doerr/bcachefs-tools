@@ -4,7 +4,6 @@
 // primary device, then migrates metadata to the primary and drops the temp device.
 
 use std::ffi::{CString, c_char, c_void};
-use std::fmt::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process;
@@ -15,7 +14,7 @@ use bcachefs_kernel::accounting::{compression_type, data_type, DiskAccountingKin
 use bcachefs_kernel::btree::bkey::bkey_type;
 use bcachefs_kernel::btree_id;
 use bcachefs_kernel::opts::{prt_compression_type, prt_data_type};
-use bcachefs_kernel::btree::iter::{BtreeIter, BtreeTrans, lockrestart_do};
+use bcachefs_kernel::btree::iter::{BtreeIter, lockrestart_do};
 use bch_bindgen::c;
 use crate::copy_fs::{CopyFsState, copy_fs};
 use bch_bindgen::data::moving::MovingContext;
@@ -177,7 +176,7 @@ fn move_btree(fs: &Fs, move_alloc: bool, target_dev: u32) -> Result<(), anyhow::
 
 /// Look up the last alloc key to find how many buckets are used.
 fn get_nbuckets_used(fs: &Fs) -> Result<u64, anyhow::Error> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut iter = BtreeIter::new(
         &trans,
         btree_id::alloc,
@@ -187,10 +186,9 @@ fn get_nbuckets_used(fs: &Fs) -> Result<u64, anyhow::Error> {
 
     // Extract type and offset inside the closure to avoid lifetime escape.
     let result: Result<(u8, u64), _> = lockrestart_do(&trans, |t| {
-        let (t, k) = t.result_value(iter.peek_prev())?;
-        match k {
-            Some(k) => t.done((k.k.type_, k.k.p.offset)),
-            None => Err(bcachefs_kernel::errcode::BchError::from_raw(libc::ENOENT).into()),
+        match iter.peek_prev(t)? {
+            Some(k) => Ok((k.k.type_, k.k.p.offset)),
+            None => Err(bcachefs_kernel::errcode::BchError::from(libc::ENOENT)),
         }
     });
 
@@ -206,9 +204,9 @@ fn get_nbuckets_used(fs: &Fs) -> Result<u64, anyhow::Error> {
 
 /// Print sector count formatted as human-readable bytes.
 fn prt_sectors(out: &mut Printbuf, v: u64) {
-    write!(out, "\t").ok();
+    write!(out, "\t");
     out.human_readable_u64(v << 9);
-    write!(out, "\r\n").ok();
+    write!(out, "\r\n");
 }
 
 /// Print usage for a specific data type on a device.
@@ -225,7 +223,7 @@ fn print_data_type_usage(
     }
     if d.fragmented != 0 {
         prt_data_type(out, data_type);
-        write!(out, " fragmented").ok();
+        write!(out, " fragmented");
         prt_sectors(out, d.fragmented);
     }
 }
@@ -280,12 +278,12 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
     .encode();
 
     let v = fs.accounting_mem_read(acc_pos.as_bpos(), 1);
-    write!(&mut buf, "user").ok();
+    write!(&mut buf, "user");
     prt_sectors(&mut buf, v[0]);
 
     let user_idx = data_type::user.0 as usize;
     if usage.d[user_idx].fragmented != 0 {
-        write!(&mut buf, "user fragmented").ok();
+        write!(&mut buf, "user fragmented");
         prt_sectors(&mut buf, usage.d[user_idx].fragmented);
     }
 
@@ -307,7 +305,7 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
         }
 
         if !compression_header {
-            write!(&mut buf, "compression type\tcompressed\runcompressed\rratio\r\n").ok();
+            write!(&mut buf, "compression type\tcompressed\runcompressed\rratio\r\n");
             buf.indent_add(2);
         }
         compression_header = true;
@@ -316,10 +314,10 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
         let sectors_compressed = v[2];
 
         prt_compression_type(&mut buf, c::bch_compression_type(i));
-        write!(&mut buf, "\t").ok();
+        write!(&mut buf, "\t");
 
         buf.human_readable_u64(sectors_compressed << 9);
-        write!(&mut buf, "\r").ok();
+        write!(&mut buf, "\r");
 
         if i == u32::from(compression_type::incompressible) {
             buf.newline();
@@ -328,9 +326,9 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
 
         buf.human_readable_u64(sectors_uncompressed << 9);
         if sectors_uncompressed > 0 {
-            write!(&mut buf, "\r{}%\r\n", sectors_compressed * 100 / sectors_uncompressed).ok();
+            write!(&mut buf, "\r{}%\r\n", sectors_compressed * 100 / sectors_uncompressed);
         } else {
-            write!(&mut buf, "\r\n").ok();
+            write!(&mut buf, "\r\n");
         }
     }
 
@@ -339,7 +337,7 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
         buf.indent_sub(2);
     }
 
-    write!(&mut buf, "image size").ok();
+    write!(&mut buf, "image size");
     prt_sectors(&mut buf, bucket_to_sector(ca, nbuckets));
 
     buf.tabstop_align();

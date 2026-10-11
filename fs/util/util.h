@@ -4,6 +4,9 @@
 
 #include <linux/bio.h>
 #include <linux/blkdev.h>
+#ifdef __KERNEL__
+#include <linux/capability.h>
+#endif
 #include <linux/errno.h>
 #include <linux/freezer.h>
 #include <linux/kernel.h>
@@ -446,21 +449,19 @@ do {									\
 u64 bch2_get_random_u64_below(u64);
 
 /*
- * Rust-facing wrappers: local_clock() is a static inline and cond_resched() is a
- * macro, so neither binds through bindgen. Wrapping them as bch2_* static
- * inlines (allowlisted, so the codegen's wrap_static_fns emits callable
- * wrappers) lets fs/ Rust call them uniformly across the kernel and userspace
- * builds, with the macro expanded at C-compile time.
+ * For Rust, what it can't call itself - static inlines and macros, in the
+ * kernel or in userspace: out of line in util.c.
  */
-static inline u64 bch2_local_clock(void)
-{
-	return local_clock();
-}
-
-static inline void bch2_cond_resched(void)
-{
-	cond_resched();
-}
+u64 bch2_local_clock(void);
+void bch2_cond_resched(void);
+u64 bch2_get_random_u64(void);
+void bch2_ktime_get_coarse_real_ts64(struct timespec64 *);
+bool bch2_queue_work(struct workqueue_struct *, struct work_struct *);
+bool bch2_capable(int);
+#ifdef __KERNEL__
+unsigned bch2_cpumask_local_spread(unsigned);
+unsigned bch2_nr_cpu_ids(void);
+#endif
 
 /*
  * All-ones mask of width @bits, defined for the full range 0..64 — unlike
@@ -959,5 +960,12 @@ static inline void bch2_atomic_max(atomic_t *v, int new)
 	while (new > old && !atomic_try_cmpxchg(v, &old, new))
 		;
 }
+
+/*
+ * For Rust: the kernel's Rust allocator API has no __GFP_NOFAIL. Out of line,
+ * as util/locking.h's shims are, for the same reason.
+ */
+void *rust_kzalloc_nofail(size_t size);
+void rust_kfree(const void *p);
 
 #endif /* _BCACHEFS_UTIL_H */

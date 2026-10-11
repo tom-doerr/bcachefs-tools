@@ -13,6 +13,8 @@
 /// and `kernel`'s real one otherwise.
 pub use bcachefs_shim_macros::pin_data;
 
+pub mod alloc;
+
 pub mod c {
     #![allow(
         non_camel_case_types,
@@ -23,6 +25,10 @@ pub mod c {
         unnecessary_transmutes
     )]
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+    // The kernel's name: userspace's crc32c() is bch_crc32c(), so as not to
+    // clash with libblkid's in a static build (include/linux/crc32c.h).
+    pub use bch_crc32c as crc32c;
 }
 
 pub mod print {
@@ -48,4 +54,5 @@ macro_rules! pr_info {
     };
 }
 
+pub mod sync;
 pub mod workqueue;

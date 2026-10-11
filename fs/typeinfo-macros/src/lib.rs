@@ -35,6 +35,8 @@ fn derives_type_info(name: &str) -> bool {
     name.starts_with("bch_") || matches!(name, "bpos" | "bkey" | "bversion")
 }
 
+/// `#[derive(TypeInfo)]`: implements `crate::typeinfo::TypeInfo` for a
+/// bindgen-generated struct, union or enum - see the crate docs.
 #[proc_macro_derive(TypeInfo)]
 pub fn derive_type_info(input: TokenStream) -> TokenStream {
     let toks: Vec<TokenTree> = input.into_iter().collect();
@@ -293,8 +295,9 @@ fn classify(ty: &[TokenTree]) -> String {
         "usize" | "c_ulong" => ("", "Native", false),
         "isize" | "c_long" => ("", "Native", true),
         other => {
-            // Nested struct/union/enum we also derive on?
-            if derives_type_info(other) {
+            // Nested struct/union/enum we also derive on? Not a generic -
+            // a container of one, DArray<bch_foo>: that's opaque.
+            if derives_type_info(other) && !full.contains('<') {
                 return format!(
                     "crate::typeinfo::FieldKind::Struct(\
                          <{full} as crate::typeinfo::TypeInfo>::INFO)"

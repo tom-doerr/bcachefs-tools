@@ -1,14 +1,15 @@
 use core::ffi::CStr;
-use core::fmt;
+use core::fmt::{self, Write as _};
 use core::ops::{Deref, DerefMut};
 
 use crate::c;
-#[cfg(feature = "std")]
 use crate::c::bpos as Bpos;
+use crate::util::os_str::{OsStr, OsStrExt};
 
 /// Rust wrapper around `c::printbuf` providing `fmt::Write` via
 /// `bch2_prt_bytes_indented`, which processes `\t`, `\r`, `\n` for
 /// tabstop and indent handling.
+#[repr(transparent)]
 pub struct Printbuf(c::printbuf);
 
 /// RAII guard for printbuf indentation — calls `indent_sub` on drop.
@@ -38,6 +39,15 @@ impl Printbuf {
         Printbuf(c::printbuf::new())
     }
 
+    /// A C caller's printbuf, to write to - for a to_text C calls. Borrowed:
+    /// it's the caller's to free.
+    ///
+    /// # Safety
+    /// @raw is a valid printbuf nothing else touches for 'a.
+    pub unsafe fn borrow_raw<'a>(raw: *mut c::printbuf) -> &'a mut Printbuf {
+        unsafe { &mut *(raw as *mut Printbuf) }
+    }
+
     pub fn as_str(&self) -> &str {
         if self.0.buf.is_null() {
             ""
@@ -46,6 +56,21 @@ impl Printbuf {
                 .to_str()
                 .unwrap_or("")
         }
+    }
+
+    /// What's been written, as bytes - which needn't be UTF-8, after
+    /// write_bytes().
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.0.buf.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.0.buf as *const u8, self.0.pos as usize) }
+        }
+    }
+
+    /// What's been written, as a name: for building one.
+    pub fn as_os_str(&self) -> &OsStr {
+        OsStr::from_bytes(self.as_bytes())
     }
 
     /// Add a tabstop at `spaces` columns from the previous tabstop.
@@ -135,16 +160,23 @@ impl Printbuf {
         self.0.set_human_readable_units(v);
     }
 
+    /// Whether this message is not to be printed: C's printbuf.suppress, for
+    /// a message that's printed only if what it reports turns out to need
+    /// it - scheduling a recovery pass, for one, clears it.
+    pub fn is_suppressed(&self) -> bool {
+        self.0.suppress()
+    }
+
+    pub fn set_suppressed(&mut self, v: bool) {
+        self.0.set_suppress(v);
+    }
+
     /// Print a human-readable representation of a u64 value.
     pub fn human_readable_u64(&mut self, v: u64) {
         unsafe { c::bch2_prt_human_readable_u64(&mut self.0, v) };
     }
 
     /// Print a bcachefs metadata version number.
-    pub fn version(&mut self, v: u32) {
-        unsafe { c::bch2_version_to_text(&mut self.0, c::bcachefs_metadata_version(v)) };
-    }
-
     /// Print superblock contents.
     ///
     /// # Safety
@@ -165,6 +197,24 @@ impl Printbuf {
     /// Access the underlying `c::printbuf` for calling C prt_* functions.
     pub fn as_raw(&mut self) -> &mut c::printbuf {
         &mut self.0
+    }
+
+    /// What write!() and writeln!() call: as fmt::Write's, but infallible -
+    /// writing to a printbuf can't fail (allocation failure is recorded in
+    /// the printbuf, as C's prt_printf() does), so there's no Result to
+    /// discard. Inherent methods take precedence over trait methods, so this
+    /// is the one write!() finds.
+    pub fn write_fmt(&mut self, args: fmt::Arguments<'_>) {
+        let _ = fmt::Write::write_fmt(self, args);
+    }
+
+    /// Write @bytes as they are - a name, which needn't be UTF-8, and whose
+    /// newlines and tabs aren't indent or tabstops: as prt_bytes().
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        unsafe {
+            c::rust_prt_bytes(&mut self.0, bytes.as_ptr() as *const core::ffi::c_void,
+                              bytes.len() as core::ffi::c_uint);
+        }
     }
 }
 
@@ -206,17 +256,23 @@ impl Drop for c::printbuf {
     }
 }
 
-#[cfg(feature = "std")]
 impl fmt::Display for Bpos {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         printbuf_to_formatter(f, |buf| unsafe { c::bch2_bpos_to_text(buf, *self) })
     }
 }
 
-#[cfg(feature = "std")]
+/// Display through a C *_to_text(): render into a printbuf made for this call,
+/// then write it out. The printbuf only exists while something is actually
+/// formatting. Its indentation and tabstops start from scratch, but `\n`,
+/// `\t` and `\r` it leaves raw are interpreted by the destination, when that's
+/// a Printbuf (see its fmt::Write).
+///
+/// Invalid UTF-8 comes out as U+FFFD, as to_string_lossy() would, without
+/// allocating - so this works in-kernel too.
 pub fn printbuf_to_formatter<F>(f: &mut fmt::Formatter<'_>, func: F) -> fmt::Result
 where
-    F: Fn(*mut c::printbuf),
+    F: FnOnce(*mut c::printbuf),
 {
     let mut buf = c::printbuf::new();
 
@@ -226,6 +282,12 @@ where
         return Ok(());
     }
 
-    let s = unsafe { CStr::from_ptr(buf.buf) };
-    f.write_str(&s.to_string_lossy())
+    let bytes = unsafe { CStr::from_ptr(buf.buf) }.to_bytes();
+    for chunk in bytes.utf8_chunks() {
+        f.write_str(chunk.valid())?;
+        if !chunk.invalid().is_empty() {
+            f.write_char(char::REPLACEMENT_CHARACTER)?;
+        }
+    }
+    Ok(())
 }

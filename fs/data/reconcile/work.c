@@ -811,6 +811,28 @@ typedef struct {
 } stripe_retry;
 DEFINE_DARRAY(stripe_retry);
 
+/*
+ * Park a stripe whose repair can't succeed until something changes - see
+ * bch_fs_reconcile.stripes_pending. We hold btree locks here, so no blocking
+ * allocation: if one fails the stripe just isn't parked, and the next pass
+ * tries it again as it would have anyway.
+ */
+static void reconcile_stripe_park(struct bch_fs *c, u64 idx)
+{
+	cuckoo_u64_add(&c->reconcile.stripes_pending, idx, GFP_NOWAIT|__GFP_NOWARN);
+}
+
+/*
+ * Something changed that might let a parked stripe's repair succeed: data
+ * moved, copygc freed buckets, or the devices changed (the pending scan).
+ * The set is small and a parked stripe that still can't be repaired just
+ * parks again, so retry them all.
+ */
+static void reconcile_stripes_unpark(struct bch_fs *c)
+{
+	cuckoo_u64_clear(&c->reconcile.stripes_pending);
+}
+
 static int do_reconcile_stripe(struct moving_context *ctxt,
 			       struct btree_iter *iter,
 			       struct bkey_s_c k,
@@ -825,6 +847,9 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 
 	struct bkey_s_c_stripe s = bkey_s_c_to_stripe(k);
 	if (!s.v->needs_reconcile) /* write buffer race */
+		return 0;
+
+	if (cuckoo_u64_test(&c->reconcile.stripes_pending, k.k->p.offset))
 		return 0;
 
 	struct bkey_buf stack_k __cleanup(bch2_bkey_buf_exit);
@@ -847,9 +872,11 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 					    .io_seq	= ctxt->io_seq,
 			}));
 		} else {
+			/* The evacuation we waited for didn't empty the block: */
 			CLASS(bch_log_msg_ratelimited, msg)(c);
 			prt_printf(&msg.m, "error retrying stripe: %s\n", bch2_err_str(ret));
 			bch2_bkey_val_to_text(&msg.m, c, s.s_c);
+			reconcile_stripe_park(c, k.k->p.offset);
 		}
 		ret = 0;
 	} else if (ret &&
@@ -858,9 +885,9 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 		/*
 		 * One stripe we can't repair right now - out of space, say -
 		 * must not end the reconcile thread, and with it all
-		 * background data movement until the next start. Skip it, as
-		 * do_reconcile_extent() skips an extent it can't move: the
-		 * stripe keeps needs_reconcile, so a later pass retries it.
+		 * background data movement until the next start. Park it: the
+		 * stripe keeps needs_reconcile, so a later pass retries it once
+		 * something has changed.
 		 *
 		 * An interrupted wait for the move budget is not a failed
 		 * repair: it goes up, and the phase resumes at this stripe.
@@ -869,6 +896,7 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 		prt_printf(&msg.m, "error repairing stripe, leaving it for a later pass: %s\n",
 			   bch2_err_str(ret));
 		bch2_bkey_val_to_text(&msg.m, c, s.s_c);
+		reconcile_stripe_park(c, k.k->p.offset);
 		ret = 0;
 	}
 
@@ -1815,7 +1843,9 @@ static int do_reconcile_scan(struct moving_context *ctxt,
 					    r->scan_start.pos, r->scan_end.pos));
 	}
 
-	try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
+	/* do_reconcile() clears the pending cookie after the pending phases. */
+	if (s.type != RECONCILE_SCAN_pending)
+		try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
 
 	*sectors_scanned += atomic64_read(&r->scan_stats.sectors_seen);
 	/*
@@ -2208,10 +2238,14 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase,
 		nr_started++;
 	}
 
-	/* The threads freeze in place, so our wait for them must be freezable too: */
+	/*
+	 * The threads freeze in place, so our wait for them must be freezable
+	 * too. TASK_IDLE: we sleep here for the whole pass, which on a large
+	 * rotational device can be hours - that's not a hung task:
+	 */
 	for (unsigned i = 0; i < nr_started; i++)
 		wait_for_completion_state(&thrs.data[i].done,
-					  TASK_UNINTERRUPTIBLE|TASK_FREEZABLE);
+					  TASK_IDLE|TASK_FREEZABLE);
 
 	darray_for_each(thrs, i)
 		c->reconcile.deferred += i->deferred;
@@ -2313,8 +2347,11 @@ static int do_reconcile_scan_key(struct reconcile_pass *p, struct bkey_s_c k)
 	struct btree_trans *trans = p->ctxt->trans;
 	struct bch_fs *c = trans->c;
 
-	if (reconcile_scan_decode(c, k.k->p.offset).type == RECONCILE_SCAN_pending)
+	if (reconcile_scan_decode(c, k.k->p.offset).type == RECONCILE_SCAN_pending) {
 		bkey_reassemble(&p->pending_cookie->k_i, k);
+		/* What retries pending extents - device add, resize, state, label: */
+		reconcile_stripes_unpark(c);
+	}
 
 	int ret = do_reconcile_scan(p->ctxt, p->snapshot_io_opts, k.k->p,
 				    le64_to_cpu(bkey_s_c_to_cookie(k).v->cookie),
@@ -2441,8 +2478,14 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 			/*
 			 * Bounded: a copygc run can take hours on a fragmented
 			 * pool, and the entry is deferred either way.
+			 * Freezable: copygc freezes in place, so a wait that
+			 * isn't would stall the freezer. Not D-state: a copygc
+			 * run can outlast the hung task timeout. Upstream waits
+			 * TASK_IDLE|TASK_FREEZABLE; a kthread gets no signals,
+			 * so the interruptible freezable wait is the same and
+			 * has a timeout variant.
 			 */
-			wait_event_timeout(c->copygc.running_wq,
+			wait_event_freezable_timeout(c->copygc.running_wq,
 				   c->copygc.run_count != *p->copygc_run_count ||
 				   kthread_should_stop() ||
 				   test_bit(BCH_FS_going_ro, &c->flags),
@@ -2710,6 +2753,12 @@ static int do_reconcile(struct moving_context *ctxt)
 		pass.yielded = false;
 		pass.phys_yielded = false;
 
+		/* copygc may have freed the buckets a parked stripe needed: */
+		if (r->stripes_pending_copygc_run_count != c->copygc.run_count) {
+			r->stripes_pending_copygc_run_count = c->copygc.run_count;
+			reconcile_stripes_unpark(c);
+		}
+
 		for (r->phase = 0; r->phase < ARRAY_SIZE(reconcile_phases); r->phase++) {
 			reconcile_phase_start(c);
 
@@ -2769,9 +2818,19 @@ static int do_reconcile(struct moving_context *ctxt)
 			break;
 	}
 out:
-	if (!ret && !bkey_deleted(&pending_cookie.k))
+	if (!ret &&
+	    r->phase == ARRAY_SIZE(reconcile_phases) &&
+	    !bkey_deleted(&pending_cookie.k))
 		try(bch2_clear_reconcile_needs_scan(trans,
 				pending_cookie.k.p, pending_cookie.v.cookie));
+
+	/*
+	 * Data that moved this pass - converted to EC, say - may have freed
+	 * the space a parked stripe needs. Parked stripes were skipped, so this
+	 * is never their own retries feeding each other:
+	 */
+	if (atomic64_read(&r->work_stats.sectors_moved))
+		reconcile_stripes_unpark(c);
 
 	bch2_move_stats_exit(&r->work_stats, c);
 
@@ -2831,6 +2890,24 @@ __cold void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c
 	printbuf_tabstop_push(out, 12);
 
 	struct bch_fs_reconcile *r = &c->reconcile;
+
+	/*
+	 * Marking work needs incompatible features: without them every scan
+	 * completes, finds nothing to do, and the only other sign is a notice
+	 * once per boot (#1052, #946):
+	 */
+	bool data_ok	= bch2_incompat_feature_allowed(c, bcachefs_metadata_version_sb_field_extent_type_u64s);
+	bool meta_ok	= bch2_incompat_feature_allowed(c, bcachefs_metadata_version_reconcile);
+	if (!data_ok || !meta_ok) {
+		prt_printf(out, "Reconcile disabled%s: needs incompatible feature ",
+			   data_ok ? " for metadata" : "");
+		bch2_version_to_text(out, data_ok
+				     ? bcachefs_metadata_version_reconcile
+				     : bcachefs_metadata_version_sb_field_extent_type_u64s);
+		prt_str(out, ", allowed up to ");
+		bch2_version_to_text(out, c->sb.version_incompat_allowed);
+		prt_str(out, "\n  set version_upgrade=incompatible to enable\n\n");
+	}
 
 	if (!r->running) {
 		prt_printf(out, "waiting:\n");
@@ -3151,6 +3228,7 @@ void bch2_fs_reconcile_exit(struct bch_fs *c)
 
 	kvfree(r->phys_laps);
 	r->phys_laps = NULL;
+	cuckoo_u64_exit(&r->stripes_pending);
 
 #ifdef CONFIG_POWER_SUPPLY
 	power_supply_unreg_notifier(&r->power_notifier);
@@ -3175,6 +3253,9 @@ int bch2_fs_reconcile_init(struct bch_fs *c)
 	mutex_init(&r->scans_in_flight_lock);
 	try(rhashtable_init(&r->scans_in_flight, &reconcile_scan_in_flight_params));
 	r->scans_in_flight_init_done = true;
+
+	if (cuckoo_u64_init(&r->stripes_pending, 4, GFP_KERNEL))
+		return bch_err_throw(c, ENOMEM_reconcile_stripes_pending);
 
 #ifdef CONFIG_POWER_SUPPLY
 	r->power_notifier.notifier_call = bch2_reconcile_power_notifier;

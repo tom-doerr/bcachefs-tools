@@ -18,17 +18,26 @@
 
 use std::process::Command;
 
+include!("build_config.rs");
+
 const HEADERS: &[&str] = &[
     "bcachefs.h", "opts.h",
-    "btree/cache.h", "btree/interior.h", "btree/iter.h", "btree/read.h",
+    "btree/cache.h", "btree/interior.h", "btree/iter.h", "btree/read.h", "btree/write_buffer.h",
     "alloc/accounting.h", "alloc/background.h", "alloc/buckets.h", "alloc/disk_groups.h",
     "data/checksum.h", "data/ec/trigger.h", "data/extents.h", "data/io_misc.h", "data/move.h", "data/read.h", "data/update.h", "data/write.h",
     "debug/debug.h",
-    "init/dev.h", "init/error.h", "init/fs.h", "init/passes.h",
-    "fs/check.h", "fs/dirent.h", "fs/inode.h", "fs/inode_opts.h", "fs/namei.h", "fs/xattr.h",
+    "init/damage.h", "init/dev.h", "init/error.h", "init/fs.h", "init/passes.h", "init/recovery.h",
+    "fs/acl.h", "fs/check.h", "fs/dirent.h", "fs/inode.h", "fs/inode_opts.h", "fs/namei.h", "fs/xattr.h",
+    "data/reconcile/work.h", "vfs/rust.h",
     "journal/init.h", "journal/read.h", "journal/reclaim.h", "journal/seq_blacklist.h", "journal/validate.h",
     "sb/io.h", "sb/members.h",
+    "util/varint.h",
 ];
+
+/// The kernel API headers for the CRCs the string hash uses: bound from the
+/// kernel's own in the kernel build (KERNEL_UNBLOCKLISTED). In userspace they
+/// stay blocklisted, and bcachefs-shim binds them.
+const CRC_HEADERS: &[&str] = &["linux/crc32c.h", "linux/crc64.h"];
 
 // Translated 1:1 from the bindgen builder calls in build.rs.
 const ALLOWLIST_FUNCTION: &[&str] = &[
@@ -37,7 +46,11 @@ const ALLOWLIST_FUNCTION: &[&str] = &[
     // convention as bch_bindgen's allowlist.
     ".*bch2_.*", "rust_.*", "block_bytes", "match_string", "printbuf.*", "_bch2_err_matches",
     "bpos_.*", "bkey_init", "bkey_.*_init", "bkey_i_to_s", "bkey_i_to_s_c",
-    "btree_iter_path", "extent_entry_u64s", "enumerated_ref_put",
+    "btree_iter_path", "extent_entry_u64s", "enumerated_ref_tryget", "enumerated_ref_put",
+    "journal_cur_seq",
+    "prt_bytes",
+    "bkey_extent_is_allocation", "bkey_extent_is_reservation", "crc_is_encoded",
+    "crc32c", "crc64_be", "SipHash_.*",
     // crypto helpers for the dump sanitize path (static inlines, not
     // bch2_-prefixed): nonce constructors + bset_encrypt, driven from Rust
     // over the already-wrapped bch2_checksum / bch2_encrypt.
@@ -46,18 +59,41 @@ const ALLOWLIST_FUNCTION: &[&str] = &[
     // damage command unpacks BCHFS_IOC_GET_DAMAGE entries through them.
     "BCH_SB_ERROR_ENTRY_V2_.*",
 ];
-const BLOCKLIST_FUNCTION: &[&str] = &["bch2_prt_vprintf", ".*bch2_snapshot_id_state"];
+const BLOCKLIST_FUNCTION: &[&str] = &[
+    "bch2_prt_vprintf",
+    // A static inline in fs/vendor/closure.h that .*bch2_.* catches: the
+    // closures are bcachefs-shim's, which wraps it too - two
+    // bch2_closure_debug_create__extern don't link.
+    "bch2_closure_debug_create",
+];
 const BLOCKLIST_TYPE: &[&str] = &["bch_ioctl_data_event", "bch_replicas_padded__bindgen_ty_.*"];
 const BLOCKLIST_ITEM: &[&str] = &["bch2_bkey_ops"];
-const ALLOWLIST_VAR: &[&str] = &["BCH_.*", "BTREE_MAX_DEPTH", "KEY_SPEC_.*", "bch.*", "__bch2.*", "__BTREE_ITER.*", "BTREE_ITER.*"];
+const ALLOWLIST_VAR: &[&str] = &["BCH_.*", "BTREE_MAX_DEPTH", "BTREE_TRANS_MEM_MAX", "KEY_FORMAT_CURRENT", "KEY_SPEC_.*", "bch.*", "__bch2.*", "__BTREE_ITER.*", "BTREE_ITER.*",
+    // bcachefs's own dirent type, alongside the kernel's DT_*:
+    "DT_SUBVOL",
+    // errnos, for bch2_err_matches() against a bare errno, or returning one
+    // as C does (darray_push()'s -ENOMEM); add as needed:
+    "ENOENT", "ENOMEM", "EINVAL", "ENAMETOOLONG", "ERANGE", "ENODATA", "E2BIG", "EACCES",
+    "ECHILD", "EROFS", "EXDEV", "ENOTDIR", "EIO", "ENOTEMPTY",
+    "BCACHEFS_ROOT_SUBVOL", "BCACHEFS_ROOT_INO",
+    "BLOCKDEV_INODE_MAX", "INODEv3_FIELDS_START_INITIAL",
+    "KEY_TYPE_XATTR_INDEX_.*"];
 const ALLOWLIST_TYPE: &[&str] = &["bch_.*", "bkey_i_.*", "bkey_s_c_.*", "bkey_s_.*", "btree_flags", "disk_accounting_type", "fsck_err_opts", "nonce", "sb_names",
+    // the logged_ops btree's reserved inode numbers - inode alloc cursors
+    // live at one:
+    "logged_ops_inums",
+    // xattr lookups take it through a void *, so nothing else pulls it in:
+    "xattr_search_key",
     // genradix: kernel::bindings doesn't bind it, so we emit it ourselves from a
     // build-time copy of the kernel header (see run_bindgen + fs/Makefile).
     "genradix.*", "__genradix.*"];
 const BITFIELD_ENUM: &[&str] = &[
+    "bch_fsck_flags",
     "btree_iter_update_trigger_flags",
     "bch_reservation_flags",
+    "bch_run_recovery_pass_flags",
     "bch_trans_commit_flags",
+    "bch_validate_flags",
     "bch_write_flags",
 ];
 const RUSTIFIED_ENUM: &[&str] = &["fsck_err_opts", "bch_key_types"];
@@ -93,6 +129,8 @@ const NO_PARTIALEQ: &[&str] = &["bkey", "bpos"];
 const DERIVE_READD: &[&str] = &[
     "bpos", "bbpos",
     "subvol_inum", "bch_opts",
+    "bch_inode_unpacked", "u96",
+    "bch_hash_desc",
     "bch_ioctl_snapshot_node",
     "bch_ioctl_snapshot_node_v2",
 ];
@@ -123,6 +161,7 @@ pub fn run_bindgen(out: &str, clang_args: &[String], blocklist_dirs: &[String], 
         body.push_str("#include \"generic-radix-tree.h\"\n");
     }
     body.push_str(&HEADERS.iter().map(|h| format!("#include \"{h}\"\n")).collect::<String>());
+    body.push_str(&CRC_HEADERS.iter().map(|h| format!("#include <{h}>\n")).collect::<String>());
     std::fs::write(&wrapper, body).expect("write wrapper header");
 
     let mut a: Vec<String> = vec![wrapper.clone()];
@@ -190,24 +229,34 @@ pub fn run_bindgen(out: &str, clang_args: &[String], blocklist_dirs: &[String], 
     // bindgen bakes the wrapper's path into extern.c's `#include`; strip it to
     // the bare name so the C compile finds it right next to extern.c (same dir)
     // — no -I, no build-location-specific absolute path.
+    //
+    // And bindgen's wrapper serializer (codegen/serialize.rs) writes "const "
+    // for a const ResolvedTypeRef and again for the const struct it resolves
+    // to: "const const struct bkey_ops *" in the kernel build, which gcc warns
+    // about (-Wduplicate-decl-specifier).
     let extern_c = format!("{out}/extern.c");
     let fixed = std::fs::read_to_string(&extern_c).expect("read extern.c")
-        .replace(&format!("\"{wrapper}\""), "\"codegen-wrapper.h\"");
+        .replace(&format!("\"{wrapper}\""), "\"codegen-wrapper.h\"")
+        .replace("const const ", "const ");
     std::fs::write(&extern_c, fixed).expect("write extern.c");
 }
 
 /// Clang args for the userspace (tools) build: target + liburcu includes + the
-/// bcachefs -I/-D set. The kernel build supplies its own (Kbuild computes them).
+/// bcachefs -I set + the build configuration, as the Makefile's C compiles
+/// have it (build_config.rs). The kernel build supplies its own (Kbuild
+/// computes them).
 pub fn userspace_clang_args(src: &str, target: &str) -> Vec<String> {
     let root = parent(src);
     let include_dir = format!("{root}/include");
     let mut a = vec![format!("--target={target}")];
     a.extend(pkg_config_includes("liburcu"));
-    for d in [&root, &src.to_string(), &format!("{root}/c_src"), &include_dir] {
+    // build/: generated headers (rust_types_gen.h), as for the C compiles
+    for d in [&root, &src.to_string(), &format!("{root}/c_src"), &include_dir,
+              &format!("{root}/build")] {
         a.push(format!("-I{d}"));
     }
-    for f in ["-DZSTD_STATIC_LINKING_ONLY", "-DNO_BCACHEFS_FS", "-D_GNU_SOURCE",
-              "-DRUST_BINDGEN", "-fkeep-inline-functions"] {
+    a.extend(userspace_config_args(std::path::Path::new(&root)));
+    for f in ["-DRUST_BINDGEN", "-fkeep-inline-functions"] {
         a.push(f.to_string());
     }
     a
@@ -260,455 +309,68 @@ fn regex_escape(s: &str) -> String {
 /// `__u32` from the shim are the same type. Verified by generating on Arch and
 /// NixOS: identical type surfaces.
 pub fn default_blocklist(src: &str) -> Vec<String> {
-    vec![blocklist_dir(&format!("{}/include", parent(src)))]
+    vec![blocklist_dir(&format!("{}/include", parent(src)), &["uapi/"])]
 }
 
-/// A `--blocklist-file` regex for everything under `dir` — except its `uapi/`
-/// subtree, which must stay visible for the reason above.
+/// What the kernel build binds from the kernel's own header trees, which
+/// otherwise stay blocklisted: `uapi/`, and the CRCs the string hash uses,
+/// which `kernel::bindings` doesn't have. Userspace takes the CRCs from
+/// bcachefs-shim.
+const KERNEL_UNBLOCKLISTED: &[&str] = &["uapi/", "linux/crc32.h", "linux/crc64.h"];
+
+/// The kernel build's `--blocklist-file` regex for header tree `dir`.
+pub fn kernel_blocklist_dir(dir: &str) -> String {
+    blocklist_dir(dir, KERNEL_UNBLOCKLISTED)
+}
+
+/// A `--blocklist-file` regex for everything under `dir` — except what's under
+/// it in `unblocklisted`. That's always its `uapi/` subtree, which must stay
+/// visible for the reason above.
 ///
 /// The kernel build can't simply drop its blocklist the way userspace did: the
 /// trees it names hold the kernel's own structs — `inode`, `super_block`, `bio`
 /// — and `kernel::bindings` already binds those, so a second copy would be a
-/// different type and nothing would link. But the only part of them bcachefs
-/// reaches is `uapi/`, and there it's scalar typedefs, which are transparent.
-/// So the tree stays blocklisted and the uapi half is carved out.
-///
-/// bindgen matches these with the `regex` crate, which has no lookahead, so
-/// "under `dir` but not under `dir/uapi/`" is spelled as an alternation over the
-/// prefixes of `uapi/` that can't be completed.
-fn blocklist_dir(dir: &str) -> String {
-    format!(r"{}/(?:[^u]|u(?:[^a]|a(?:[^p]|p(?:[^i]|i[^/])))).*", regex_escape(dir))
+/// different type and nothing would link. But what bcachefs reaches of them is
+/// `uapi/`, where it's scalar typedefs, which are transparent - and the few
+/// functions in KERNEL_UNBLOCKLISTED. So the tree stays blocklisted and those
+/// are carved out.
+fn blocklist_dir(dir: &str, unblocklisted: &[&str]) -> String {
+    format!("{}/{}", regex_escape(dir), not_prefixed(unblocklisted))
 }
 
-/// Generate the x-macro-derived *_gen.rs files from the *_format.h headers.
-pub fn gen_xmacros(src: &str, out: &str) {
-    let format_h = std::fs::read_to_string(format!("{src}/bcachefs_format.h"))
-        .expect("reading bcachefs_format.h");
+/// A regex for any string that doesn't start with one of @prefixes. bindgen
+/// matches with the `regex` crate, which has no lookahead, so it's spelled out
+/// a character at a time: a character no prefix continues with matches,
+/// whatever follows; one that some do continues down those - unless it
+/// completes one.
+fn not_prefixed(prefixes: &[&str]) -> String {
+    let mut next: Vec<char> = prefixes.iter().filter_map(|p| p.chars().next()).collect();
+    next.sort();
+    next.dedup();
 
-    let errcode_h = std::fs::read_to_string(format!("{src}/errcode.h"))
-        .expect("reading errcode.h");
-    let errcodes = parse_xmacro(&errcode_h, "BCH_ERRCODES");
-    assert!(!errcodes.is_empty(), "failed to parse BCH_ERRCODES()");
-    std::fs::write(format!("{out}/errcodes_gen.rs"), generate_errcodes(&errcodes))
-        .expect("write errcodes_gen.rs");
+    // '-' last in the class, where it's literal rather than a range
+    let class: String = next.iter().filter(|&&c| c != '-').map(|c| regex_escape(&c.to_string()))
+        .chain(next.contains(&'-').then(|| "-".to_string()))
+        .collect();
+    let mut alts = vec![format!("[^{class}].*")];
+    for c in next {
+        let rest: Vec<&str> = prefixes.iter().filter_map(|p| p.strip_prefix(c)).collect();
+        if rest.iter().any(|r| r.is_empty()) {
+            continue;
+        }
+        alts.push(format!("{}{}", regex_escape(&c.to_string()), not_prefixed(&rest)));
+    }
+    format!("(?:{})", alts.join("|"))
+}
 
-    let bkey_types = parse_xmacro(&format_h, "BCH_BKEY_TYPES");
-    assert!(!bkey_types.is_empty(), "failed to parse BCH_BKEY_TYPES()");
-    std::fs::write(format!("{out}/bkey_types_gen.rs"), generate_bkey_types(&bkey_types))
-        .expect("write bkey_types_gen.rs");
-
+/// The BITMASK() bit ranges, scanned out of the headers, and their accessors:
+/// typeinfo_gen.rs. The x-macro lists, Rust reads itself (c_xmacro_from_c!).
+pub fn gen_bitmasks(src: &str, out: &str) {
     let bitmasks = parse_bitmasks(src);
     assert!(!bitmasks.is_empty(), "failed to parse any BITMASK() declarations");
     std::fs::write(format!("{out}/typeinfo_gen.rs"),
-                   generate_bkey_typeinfo(&bkey_types)
-                       + &generate_bitmask_table(&bitmasks)
-                       + &generate_bitmask_accessors(&bitmasks, out))
+                   generate_bitmask_table(&bitmasks) + &generate_bitmask_accessors(&bitmasks, out))
         .expect("write typeinfo_gen.rs");
-
-    let sb_fields = parse_xmacro(&format_h, "BCH_SB_FIELDS");
-    assert!(!sb_fields.is_empty(), "failed to parse BCH_SB_FIELDS()");
-    std::fs::write(format!("{out}/sb_field_types_gen.rs"), generate_sb_field_impls(&sb_fields))
-        .expect("write sb_field_types_gen.rs");
-
-    let members_h = std::fs::read_to_string(format!("{src}/sb/members_format.h"))
-        .expect("reading members_format.h");
-    let member_states = parse_xmacro(&members_h, "BCH_MEMBER_STATES");
-    assert!(!member_states.is_empty(), "failed to parse BCH_MEMBER_STATES()");
-    std::fs::write(format!("{out}/member_states_gen.rs"),
-                   generate_str_table("MEMBER_STATE_NAMES", &member_states))
-        .expect("write member_states_gen.rs");
-
-    let snapshots_h = std::fs::read_to_string(format!("{src}/snapshots/format.h"))
-        .expect("reading snapshots/format.h");
-    let snapshot_states = parse_xmacro(&snapshots_h, "BCH_SNAPSHOT_STATES");
-    assert!(!snapshot_states.is_empty(), "failed to parse BCH_SNAPSHOT_STATES()");
-    let subvolume_states = parse_xmacro(&snapshots_h, "BCH_SUBVOLUME_STATES");
-    assert!(!subvolume_states.is_empty(), "failed to parse BCH_SUBVOLUME_STATES()");
-    std::fs::write(format!("{out}/snapshot_states_gen.rs"),
-                   "// Auto-generated — do not edit\n\n".to_string() +
-                   &generate_value_table("SNAPSHOT_STATE_VALUES", &snapshot_states) +
-                   &generate_value_table("SUBVOLUME_STATE_VALUES", &subvolume_states))
-        .expect("write snapshot_states_gen.rs");
-
-    let counters_h = std::fs::read_to_string(format!("{src}/sb/counters_format.h"))
-        .expect("reading counters_format.h");
-    let counters = parse_xmacro(&counters_h, "BCH_PERSISTENT_COUNTERS");
-    assert!(!counters.is_empty(), "failed to parse BCH_PERSISTENT_COUNTERS()");
-    std::fs::write(format!("{out}/counters_gen.rs"), generate_counter_table(&counters))
-        .expect("write counters_gen.rs");
-
-    let extents_h = std::fs::read_to_string(format!("{src}/data/extents_format.h"))
-        .expect("reading extents_format.h");
-    let extent_entry_types = parse_xmacro(&extents_h, "BCH_EXTENT_ENTRY_TYPES");
-    assert!(!extent_entry_types.is_empty(), "failed to parse BCH_EXTENT_ENTRY_TYPES()");
-    std::fs::write(format!("{out}/extent_entry_types_gen.rs"),
-                   generate_extent_entry_u64s(&extent_entry_types))
-        .expect("write extent_entry_types_gen.rs");
-
-    let accounting_h = std::fs::read_to_string(format!("{src}/alloc/accounting_format.h"))
-        .expect("reading accounting_format.h");
-    let disk_accounting_types = parse_xmacro(&accounting_h, "BCH_DISK_ACCOUNTING_TYPES");
-    assert!(!disk_accounting_types.is_empty(), "failed to parse BCH_DISK_ACCOUNTING_TYPES()");
-
-    let reconcile_h = std::fs::read_to_string(format!("{src}/data/reconcile/format.h"))
-        .expect("reading reconcile/format.h");
-    let reconcile_accounting_types = parse_xmacro(&reconcile_h, "BCH_RECONCILE_ACCOUNTING");
-    assert!(!reconcile_accounting_types.is_empty(), "failed to parse BCH_RECONCILE_ACCOUNTING()");
-
-    let data_types = parse_xmacro(&accounting_h, "BCH_DATA_TYPES");
-    assert!(!data_types.is_empty(), "failed to parse BCH_DATA_TYPES()");
-
-    let metadata_versions = parse_xmacro(&format_h, "BCH_METADATA_VERSIONS");
-    assert!(!metadata_versions.is_empty(), "failed to parse BCH_METADATA_VERSIONS()");
-
-    let compression_types = parse_xmacro(&format_h, "BCH_COMPRESSION_TYPES");
-    assert!(!compression_types.is_empty(), "failed to parse BCH_COMPRESSION_TYPES()");
-
-    let jset_entry_types = parse_xmacro(&format_h, "BCH_JSET_ENTRY_TYPES");
-    assert!(!jset_entry_types.is_empty(), "failed to parse BCH_JSET_ENTRY_TYPES()");
-
-    let btree_ids = parse_xmacro(&format_h, "BCH_BTREE_IDS");
-    assert!(!btree_ids.is_empty(), "failed to parse BCH_BTREE_IDS()");
-
-    let sb_compats = parse_xmacro(&format_h, "BCH_SB_COMPAT");
-    assert!(!sb_compats.is_empty(), "failed to parse BCH_SB_COMPAT()");
-
-    let opts_h = std::fs::read_to_string(format!("{src}/opts.h"))
-        .expect("reading opts.h");
-    let opts = parse_xmacro(&opts_h, "BCH_OPTS");
-    assert!(!opts.is_empty(), "failed to parse BCH_OPTS()");
-
-    std::fs::write(
-        format!("{out}/newtype_enum_aliases_gen.rs"),
-        [
-            generate_newtype_enum_aliases(
-                "bcachefs_metadata_version",
-                "bcachefs_metadata_version",
-                &metadata_versions,
-                "max",
-                "bcachefs_metadata_version_max",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_opt_id",
-                "Opt",
-                &opts,
-                "nr",
-                "bch2_opts_nr",
-            ),
-            generate_newtype_enum_aliases(
-                "btree_id",
-                "BTREE_ID",
-                &btree_ids,
-                "nr",
-                "BTREE_ID_NR",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_bkey_type",
-                "KEY_TYPE",
-                &bkey_types,
-                "nr",
-                "KEY_TYPE_MAX",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_data_type",
-                "BCH_DATA",
-                &data_types,
-                "nr",
-                "BCH_DATA_NR",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_compression_type",
-                "BCH_COMPRESSION_TYPE",
-                &compression_types,
-                "nr",
-                "BCH_COMPRESSION_TYPE_NR",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_jset_entry_type",
-                "BCH_JSET_ENTRY",
-                &jset_entry_types,
-                "nr",
-                "BCH_JSET_ENTRY_NR",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_sb_compat",
-                "BCH_COMPAT",
-                &sb_compats,
-                "nr",
-                "BCH_COMPAT_NR",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_sb_field_type",
-                "BCH_SB_FIELD",
-                &sb_fields,
-                "nr",
-                "BCH_SB_FIELD_NR",
-            ),
-            generate_newtype_enum_aliases(
-                "disk_accounting_type",
-                "BCH_DISK_ACCOUNTING",
-                &disk_accounting_types,
-                "nr",
-                "BCH_DISK_ACCOUNTING_TYPE_NR",
-            ),
-            generate_newtype_enum_aliases(
-                "bch_reconcile_accounting_type",
-                "BCH_RECONCILE_ACCOUNTING",
-                &reconcile_accounting_types,
-                "nr",
-                "BCH_RECONCILE_ACCOUNTING_NR",
-            ),
-        ].join("\n"),
-    )
-    .expect("write newtype_enum_aliases_gen.rs");
-
-    std::fs::write(
-        format!("{out}/btree_ids_gen.rs"),
-        generate_btree_ids_known(&btree_ids),
-    )
-    .expect("write btree_ids_gen.rs");
-}
-
-// ---------------------------------------------------------------------------
-// x-macro parsing + generators — verbatim from build.rs.
-
-/// Parse an x-macro from a C header: find `#define {macro}(...)` and extract all
-/// `x(...)` invocations, each as a vec of trimmed argument strings.
-fn parse_xmacro(header: &str, macro_name: &str) -> Vec<Vec<String>> {
-    let define_prefix = format!("#define {}", macro_name);
-    let mut in_macro = false;
-    let mut macro_text = String::new();
-
-    for line in header.lines() {
-        let trimmed = line.trim();
-        if !in_macro {
-            if trimmed.starts_with(&define_prefix) {
-                in_macro = true;
-                if let Some(pos) = trimmed.find(&define_prefix) {
-                    let after = &trimmed[pos + define_prefix.len()..];
-                    let after = if let Some(i) = after.find(')') { &after[i + 1..] } else { after };
-                    macro_text.push_str(after.trim_end_matches('\\').trim());
-                    macro_text.push(' ');
-                }
-                if !trimmed.ends_with('\\') { break; }
-            }
-        } else {
-            macro_text.push_str(trimmed.trim_end_matches('\\').trim());
-            macro_text.push(' ');
-            if !trimmed.ends_with('\\') { break; }
-        }
-    }
-
-    let mut entries = Vec::new();
-    let bytes = macro_text.as_bytes();
-    let mut pos = 0;
-    while pos < bytes.len() {
-        let Some(start) = macro_text[pos..].find("x(") else { break };
-        let open = pos + start + 2;
-        let mut depth = 1usize;
-        let mut i = open;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] { b'(' => depth += 1, b')' => depth -= 1, _ => {} }
-            if depth > 0 { i += 1; }
-        }
-        if depth == 0 {
-            entries.push(split_xmacro_args(&macro_text[open..i]));
-            pos = i + 1;
-        } else { break; }
-    }
-    entries
-}
-
-fn split_xmacro_args(s: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut depth = 0;
-    let mut current = String::new();
-    for ch in s.chars() {
-        match ch {
-            '(' => { depth += 1; current.push(ch); }
-            ')' => { depth -= 1; current.push(ch); }
-            ',' if depth == 0 => { args.push(current.trim().to_string()); current.clear(); }
-            _ => current.push(ch),
-        }
-    }
-    let tail = current.trim().to_string();
-    if !tail.is_empty() { args.push(tail); }
-    args
-}
-
-fn rust_ident(name: &str) -> String {
-    let mut out: String = name
-        .chars()
-        .map(|c| if c == '_' || c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-
-    if !out
-        .chars()
-        .next()
-        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
-    {
-        out.insert(0, '_');
-    }
-
-    out
-}
-
-fn generate_sb_field_impls(entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    out.push_str("// Auto-generated from BCH_SB_FIELDS() — do not edit\n\n");
-    out.push_str("/// Marker trait connecting an sb field struct to its field type enum.\n");
-    out.push_str("///\n");
-    out.push_str("/// # Safety\n");
-    out.push_str("/// Implementors must ensure FIELD_TYPE matches the struct type,\n");
-    out.push_str("/// and that `field` is the first member (offset 0).\n");
-    out.push_str("pub unsafe trait SbField: Sized {\n");
-    out.push_str("    const FIELD_TYPE: c::bch_sb_field_type;\n");
-    out.push_str("}\n\n");
-    for e in entries {
-        let name = &e[0];
-        let ident = rust_ident(name);
-        out.push_str(&format!(
-            "unsafe impl SbField for c::bch_sb_field_{name} {{\n\
-             \x20   const FIELD_TYPE: c::bch_sb_field_type = c::bch_sb_field_type::{ident};\n\
-             }}\n\n"
-        ));
-    }
-    out
-}
-
-fn generate_str_table(name: &str, entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    out.push_str("// Auto-generated — do not edit\n\n");
-    out.push_str(&format!("pub const {name}: &[&str] = &[\n"));
-    for e in entries { out.push_str(&format!("    \"{}\",\n", e[0])); }
-    out.push_str("];\n");
-    out
-}
-
-/// Name <-> value table for an x-macro enum with explicit values: x(name, val)
-fn generate_value_table(name: &str, entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("pub const {name}: &[(&str, u64)] = &[\n"));
-    for e in entries { out.push_str(&format!("    (\"{}\", {}),\n", e[0], e[1])); }
-    out.push_str("];\n");
-    out
-}
-
-fn generate_counter_table(entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    out.push_str("// Auto-generated from BCH_PERSISTENT_COUNTERS() — do not edit\n\n");
-    out.push_str("pub struct CounterInfo {\n");
-    out.push_str("    pub name: &'static str,\n");
-    out.push_str("    pub stable_id: u16,\n");
-    out.push_str("    pub is_sectors: bool,\n");
-    out.push_str("}\n\n");
-    out.push_str("pub const COUNTERS: &[CounterInfo] = &[\n");
-    for e in entries {
-        let name = &e[0];
-        let stable_id = &e[1];
-        let is_sectors = e[2].contains("TYPE_SECTORS");
-        out.push_str(&format!(
-            "    CounterInfo {{ name: \"{name}\", stable_id: {stable_id}, is_sectors: {is_sectors} }},\n"
-        ));
-    }
-    out.push_str("];\n");
-    out
-}
-
-fn generate_extent_entry_u64s(entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    out.push_str("// Auto-generated from BCH_EXTENT_ENTRY_TYPES() — do not edit\n\n");
-    out.push_str("/// Size in u64s for each known extent entry type.\n");
-    out.push_str("pub fn extent_entry_type_u64s(ty: u32) -> Option<usize> {\n");
-    out.push_str("    use core::mem::size_of;\n");
-    out.push_str("    Some(match ty {\n");
-    for e in entries {
-        out.push_str(&format!("        {} => size_of::<c::bch_extent_{}>() / 8,\n", e[1], e[0]));
-    }
-    out.push_str("        _ => return None,\n");
-    out.push_str("    })\n");
-    out.push_str("}\n");
-    out
-}
-
-fn generate_errcodes(entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    out.push_str("// Auto-generated from BCH_ERRCODES() — do not edit\n\n");
-
-    for e in entries {
-        if e.len() < 2 {
-            continue;
-        }
-
-        let name = rust_ident(&e[1]);
-        out.push_str(&format!(
-            "#[allow(non_upper_case_globals)]\n\
-             pub const {name}: bch_errcode = bch_errcode::BCH_ERR_{name};\n"
-        ));
-    }
-
-    out
-}
-
-fn generate_newtype_enum_aliases(
-    ty: &str,
-    prefix: &str,
-    entries: &[Vec<String>],
-    nr_alias: &str,
-    nr_const: &str,
-) -> String {
-    let mut out = String::new();
-
-    out.push_str("// Auto-generated from x-macros - do not edit\n\n");
-    out.push_str(&format!("impl c::{ty} {{\n"));
-    for e in entries {
-        let name = &e[0];
-        let alias = rust_ident(name);
-        out.push_str(&format!(
-            "    #[allow(non_upper_case_globals)]\n    pub const {alias}: Self = Self::{prefix}_{name};\n"
-        ));
-    }
-    out.push_str(&format!(
-        "    #[allow(non_upper_case_globals)]\n    pub const {nr_alias}: Self = Self::{nr_const};\n"
-    ));
-    out.push_str("}\n");
-
-    out
-}
-
-fn generate_bkey_typeinfo(entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-
-    out.push_str("// Auto-generated from BCH_BKEY_TYPES() — do not edit\n\n");
-    out.push_str(
-        "/// A bkey type together with its val struct's type info.\n\
-         pub struct BkeyTypeInfo {\n\
-         \x20   pub name: &'static str,\n\
-         \x20   pub type_: u32,\n\
-         \x20   pub info: &'static StructInfo,\n\
-         }\n\n",
-    );
-
-    out.push_str("pub static BKEY_TYPE_INFO: &[BkeyTypeInfo] = &[\n");
-    for e in entries {
-        out.push_str(&format!(
-            "    BkeyTypeInfo {{ name: \"{0}\", type_: {1}, \
-                 info: <crate::c::bch_{0} as TypeInfo>::INFO }},\n",
-            e[0], e[1]
-        ));
-    }
-    out.push_str("];\n\n");
-
-    out.push_str(
-        "pub fn bkey_val_info(type_: u32) -> Option<&'static StructInfo> {\n\
-         \x20   BKEY_TYPE_INFO.iter().find(|t| t.type_ == type_).map(|t| t.info)\n\
-         }\n\n\
-         pub fn bkey_type_info_by_name(name: &str) -> Option<&'static BkeyTypeInfo> {\n\
-         \x20   BKEY_TYPE_INFO.iter().find(|t| t.name == name)\n\
-         }\n",
-    );
-
-    out
 }
 
 // ── BITMASK / LE*_BITMASK bit-range fields ──────────────────────────────────
@@ -940,147 +602,6 @@ fn generate_bitmask_accessors(bms: &[Bitmask], out_dir: &str) -> String {
         }
         out.push_str("}\n");
     }
-    out
-}
-
-fn generate_btree_ids_known(entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-
-    out.push_str("// Auto-generated from BCH_BTREE_IDS() - do not edit\n\n");
-    out.push_str("pub const BTREE_IDS_KNOWN: &[c::btree_id] = &[\n");
-    for e in entries {
-        let name = rust_ident(&e[0]);
-        out.push_str(&format!("    c::btree_id::{name},\n"));
-    }
-    out.push_str("];\n");
-
-    let mut mask: u64 = 0;
-    for e in entries {
-        let nr: u32 = e[1].trim().parse().expect("BCH_BTREE_IDS: numeric id");
-        if e[2].contains("BTREE_IS_snapshots") {
-            mask |= 1 << nr;
-        }
-    }
-    out.push_str(&format!(
-        "\n/// Btrees whose keys are snapshotted; mirrors the C btree_has_snapshots_mask\n\
-         /// (a static const bindgen can't see).\n\
-         pub const BTREE_HAS_SNAPSHOTS_MASK: u64 = {mask:#x};\n"
-    ));
-
-    out
-}
-
-fn generate_bkey_types(entries: &[Vec<String>]) -> String {
-    let mut out = String::new();
-    out.push_str("// Auto-generated from BCH_BKEY_TYPES() — do not edit\n\n");
-
-    for e in entries {
-        let name = &e[0];
-        let type_name = format!("Bkey{}", snake_to_pascal(name));
-        out.push_str(&format!("pub type {type_name} = Bkey<c::bkey_i_{name}>;\n"));
-    }
-    out.push('\n');
-
-    for e in entries {
-        let name = &e[0];
-        out.push_str(&format!(
-            "impl c::bkey_i_{name} {{\n\
-             \x20   pub fn k(&self) -> &c::bkey {{ unsafe {{ self.__bindgen_anon_1.k.as_ref() }} }}\n\
-             \x20   pub fn k_mut(&mut self) -> &mut c::bkey {{ unsafe {{ self.__bindgen_anon_1.k.as_mut() }} }}\n\
-             \x20   pub fn k_i(&self) -> &c::bkey_i {{ unsafe {{ self.__bindgen_anon_1.k_i.as_ref() }} }}\n\
-             \x20   pub fn k_i_mut(&mut self) -> &mut c::bkey_i {{ unsafe {{ self.__bindgen_anon_1.k_i.as_mut() }} }}\n\
-             }}\n\n"
-        ));
-    }
-
-    out.push_str("pub trait BkeyInit: Default {\n");
-    out.push_str("    fn init(&mut self);\n");
-    out.push_str("    fn k(&self) -> &c::bkey;\n");
-    out.push_str("    fn k_mut(&mut self) -> &mut c::bkey;\n");
-    out.push_str("    fn k_i(&self) -> &c::bkey_i;\n");
-    out.push_str("    fn k_i_mut(&mut self) -> &mut c::bkey_i;\n");
-    out.push_str("}\n\n");
-
-    for e in entries {
-        let name = &e[0];
-        out.push_str(&format!(
-            "impl BkeyInit for c::bkey_i_{name} {{\n\
-             \x20   fn init(&mut self) {{ unsafe {{ c::bkey_{name}_init(self.k_i_mut()) }}; }}\n\
-             \x20   fn k(&self) -> &c::bkey {{ c::bkey_i_{name}::k(self) }}\n\
-             \x20   fn k_mut(&mut self) -> &mut c::bkey {{ c::bkey_i_{name}::k_mut(self) }}\n\
-             \x20   fn k_i(&self) -> &c::bkey_i {{ c::bkey_i_{name}::k_i(self) }}\n\
-             \x20   fn k_i_mut(&mut self) -> &mut c::bkey_i {{ c::bkey_i_{name}::k_i_mut(self) }}\n\
-             }}\n\n"
-        ));
-    }
-
-    out.push_str("/// Typed dispatch for inline bkeys (`bkey_i`).\n");
-    out.push_str("pub enum BkeyValI<'a> {\n");
-    for e in entries { out.push_str(&format!("    {}(&'a c::bkey_i_{}),\n", e[0], e[0])); }
-    out.push_str("    unknown(&'a c::bkey_i),\n}\n\n");
-    out.push_str("impl<'a> BkeyValI<'a> {\n");
-    out.push_str("    #[allow(clippy::missing_transmute_annotations)]\n");
-    out.push_str("    pub fn from_bkey_i(k: &'a c::bkey_i) -> Self {\n");
-    out.push_str("        match k.k.type_ as u32 {\n");
-    for e in entries { out.push_str(&format!("            {} => BkeyValI::{}(unsafe {{ core::mem::transmute(k) }}),\n", e[1], e[0])); }
-    out.push_str("            _ => BkeyValI::unknown(k),\n        }\n    }\n}\n\n");
-
-    out.push_str("/// Typed dispatch for mutable inline bkeys (`bkey_i`).\n");
-    out.push_str("pub enum BkeyValIMut<'a> {\n");
-    for e in entries { out.push_str(&format!("    {}(&'a mut c::bkey_i_{}),\n", e[0], e[0])); }
-    out.push_str("    unknown(&'a mut c::bkey_i),\n}\n\n");
-    out.push_str("impl<'a> BkeyValIMut<'a> {\n");
-    out.push_str("    #[allow(clippy::missing_transmute_annotations)]\n");
-    out.push_str("    pub fn from_bkey_i(k: &'a mut c::bkey_i) -> Self {\n");
-    out.push_str("        let type_ = k.k.type_;\n");
-    out.push_str("        match type_ as u32 {\n");
-    for e in entries { out.push_str(&format!("            {} => BkeyValIMut::{}(unsafe {{ core::mem::transmute(k) }}),\n", e[1], e[0])); }
-    out.push_str("            _ => BkeyValIMut::unknown(k),\n        }\n    }\n}\n\n");
-
-    out.push_str("/// Typed dispatch for split-const bkey references.\n");
-    out.push_str("pub enum BkeyValSC<'a> {\n");
-    for e in entries { out.push_str(&format!("    {}(&'a c::bkey, &'a c::bch_{}),\n", e[0], e[0])); }
-    out.push_str("    unknown(&'a c::bkey, u8),\n}\n\n");
-    out.push_str("impl<'a> BkeyValSC<'a> {\n");
-    out.push_str("    #[allow(clippy::missing_transmute_annotations)]\n");
-    out.push_str("    pub fn from_bkey_i(k: &'a c::bkey_i) -> Self {\n");
-    out.push_str("        match k.k.type_ as u32 {\n");
-    for e in entries { out.push_str(&format!("            {} => BkeyValSC::{}(&k.k, unsafe {{ core::mem::transmute(&k.v) }}),\n", e[1], e[0])); }
-    out.push_str("            _ => BkeyValSC::unknown(&k.k, k.k.type_),\n        }\n    }\n\n");
-    out.push_str("    /// Construct from raw key and value references.\n");
-    out.push_str("    ///\n    /// # Safety\n");
-    out.push_str("    /// `val` must point to valid data for the bkey type indicated by `k.type_`.\n");
-    out.push_str("    #[allow(clippy::missing_transmute_annotations)]\n");
-    out.push_str("    pub unsafe fn from_raw(k: &'a c::bkey, val: &'a c::bch_val) -> Self {\n");
-    out.push_str("        match k.type_ as u32 {\n");
-    for e in entries { out.push_str(&format!("            {} => BkeyValSC::{}(k, unsafe {{ core::mem::transmute(val) }}),\n", e[1], e[0])); }
-    out.push_str("            _ => BkeyValSC::unknown(k, k.type_),\n        }\n    }\n}\n\n");
-
-    out.push_str("/// Typed dispatch for split-mutable bkey references.\n");
-    out.push_str("pub enum BkeyValS<'a> {\n");
-    for e in entries { out.push_str(&format!("    {}(&'a mut c::bkey, &'a mut c::bch_{}),\n", e[0], e[0])); }
-    out.push_str("    unknown(&'a mut c::bkey, u8),\n}\n\n");
-    out.push_str("impl<'a> BkeyValS<'a> {\n");
-    out.push_str("    #[allow(clippy::missing_transmute_annotations)]\n");
-    out.push_str("    pub fn from_bkey_i(k: &'a mut c::bkey_i) -> Self {\n");
-    out.push_str("        let type_ = k.k.type_;\n");
-    out.push_str("        match type_ as u32 {\n");
-    for e in entries { out.push_str(&format!("            {} => BkeyValS::{}(&mut k.k, unsafe {{ core::mem::transmute(&mut k.v) }}),\n", e[1], e[0])); }
-    out.push_str("            _ => BkeyValS::unknown(&mut k.k, type_),\n        }\n    }\n}\n");
-    out
-}
-
-fn snake_to_pascal(s: &str) -> String {
-    let mut out = String::new();
-
-    for word in s.split('_') {
-        let mut chars = word.chars();
-        if let Some(c) = chars.next() {
-            out.extend(c.to_uppercase());
-            out.push_str(chars.as_str());
-        }
-    }
-
     out
 }
 
