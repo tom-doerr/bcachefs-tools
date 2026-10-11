@@ -317,6 +317,15 @@ int bch2_set_fs_needs_reconcile(struct bch_fs *c)
 				true);
 }
 
+/* Device removal: a removed device's scan cookie must not outlive it */
+int bch2_delete_reconcile_needs_scan(struct bch_fs *c, struct reconcile_scan s)
+{
+	CLASS(btree_trans, trans)(c);
+	return commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+			 bch2_btree_delete(trans, BTREE_ID_reconcile_scan,
+					   POS(0, reconcile_scan_encode(s)), 0));
+}
+
 int bch2_reconcile_scan_cookie_is_set(struct btree_trans *trans, u64 inum)
 {
 	CLASS(btree_iter, iter)(trans, BTREE_ID_reconcile_scan, POS(0, inum), 0);

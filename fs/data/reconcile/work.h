@@ -66,6 +66,7 @@ int bch2_set_reconcile_needs_scan(struct bch_fs *, struct reconcile_scan, bool);
 int bch2_set_reconcile_needs_scan_pre(struct bch_fs *, struct reconcile_scan, struct opt_change_scope *);
 int bch2_set_reconcile_needs_scan_post(struct bch_fs *, struct reconcile_scan);
 int bch2_set_fs_needs_reconcile(struct bch_fs *);
+int bch2_delete_reconcile_needs_scan(struct bch_fs *, struct reconcile_scan);
 
 int bch2_reconcile_scan_cookie_is_set(struct btree_trans *, u64);
 

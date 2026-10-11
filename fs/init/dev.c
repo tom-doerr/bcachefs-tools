@@ -1127,6 +1127,15 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags,
 	bch2_dev_free(ca);
 
 	/*
+	 * Going evacuating queued a scan of this device, and nothing else
+	 * clears its cookie now. Before the slot is freed, so a device added
+	 * in its place keeps its own:
+	 */
+	int ret = bch2_delete_reconcile_needs_scan(c,
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = dev_idx });
+	bch_err_msg(c, ret, "deleting the reconcile scan cookie of removed device %u", dev_idx);
+
+	/*
 	 * Free this device's slot in the bch_member array - all pointers to
 	 * this device must be gone:
 	 */
