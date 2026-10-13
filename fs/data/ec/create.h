@@ -23,7 +23,8 @@ enum ec_stripe_ref {
 
 /*
  * open:	the sector allocator can still hand blocks out of this stripe;
- *		it's the stripe head's h->s.
+ *		it's the stripe head's: its current stripe (h->s), one of its
+ *		spares, or being allocated by a writer of the head.
  * filling:	every block has been handed to a writer, but the writers haven't
  *		finished - buckets are still checked out, and the stripe can
  *		only be completed by the writers that already hold them.
@@ -141,6 +142,33 @@ static inline unsigned ec_stripe_new_nr_parity(const struct ec_stripe_new *s)
 #define for_each_data_parity_block(_i, _nr_data, _nr_parity)		\
 	for (unsigned _i = 0; _i < (_nr_data) + (_nr_parity); _i++)
 
+/*
+ * A stripe head is where the writers of one (disk label, algorithm,
+ * redundancy, watermark) get their stripe blocks: one at a time, out of the
+ * current stripe @s. @lock covers all of it, and is held for the bookkeeping,
+ * handing out blocks and the current stripe's buffers - never across btree IO.
+ *
+ * Allocating a stripe (its index, an old stripe to reuse, its buckets) does
+ * btree lookups, so it's done without @lock held, by whichever writer needs a
+ * stripe and finds none; the others wait for it, without the lock. The
+ * ec_stripe_head_allocs module parameter (default 1) lets several writers
+ * allocate at once - a writer that finds no current stripe starts one of its
+ * own rather than waiting - and stripes allocated while another is current
+ * wait in @spares.
+ *
+ * A stripe being allocated is the allocating writer's alone: it's in none of
+ * the head's slots, only counted in @nr_allocating. An allocation that's
+ * interrupted (a transaction restart, no buckets yet) is left in @spares,
+ * unallocated, for the next writer to pick up where it stopped.
+ *
+ * @stopping: bch2_ec_stripe_head_stop() is waiting out the allocations in
+ * flight; none may start until it's done.
+ *
+ * @alloc_seq is bumped, and @alloc_wait woken, when an allocation finishes or
+ * a stop is done: that's what writers with nothing to do but wait watch.
+ */
+#define EC_STRIPE_HEAD_SPARES_MAX	8
+
 struct ec_stripe_head {
 	struct list_head	list;
 	struct mutex		lock;
@@ -165,6 +193,13 @@ struct ec_stripe_head {
 	struct ec_dev_stripe_state *dev_stripe;
 
 	struct ec_stripe_new	*s;
+
+	struct ec_stripe_new	*spares[EC_STRIPE_HEAD_SPARES_MAX];
+	unsigned		nr_spares;
+	unsigned		nr_allocating;
+	unsigned		stopping;
+	u32			alloc_seq;
+	wait_queue_head_t	alloc_wait;
 };
 
 void *bch2_writepoint_ec_buf(struct bch_fs *, struct write_point *);
@@ -192,8 +227,8 @@ int bch2_widen_cache_init(widen_cache *);
 int bch2_widen_cache_lookup(widen_cache *, struct bch_fs *,
 			    u8 disk_label, u16 sectors, unsigned *nr_devs);
 
-void bch2_ec_stripe_new_cancel(struct bch_fs *, struct ec_stripe_head *,
-			       struct ec_stripe_new *, int);
+void bch2_ec_stripe_head_stop(struct bch_fs *, struct ec_stripe_head *, struct bch_dev *,
+			      bool (*)(struct bch_fs *, struct ec_stripe_new *, struct bch_dev *));
 void bch2_ec_bucket_cancel(struct bch_fs *, struct open_bucket *, int);
 
 int bch2_ec_stripe_new_alloc(struct bch_fs *, struct ec_stripe_head *);

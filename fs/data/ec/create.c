@@ -72,6 +72,8 @@
 
 #include "journal/journal.h"
 
+#include <linux/moduleparam.h>
+
 /*
  * dev stripe state
  *
@@ -2329,13 +2331,20 @@ __cold void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
 
 	scoped_guard(mutex, &c->ec.stripe_head_lock)
 		list_for_each_entry(h, &c->ec.stripe_head_list, list) {
-			prt_printf(out, "disk label %u algo %u redundancy %u %s nr created %llu:\n",
+			guard(mutex)(&h->lock);
+
+			prt_printf(out, "disk label %u algo %u redundancy %u %s nr created %llu"
+				   " allocating %u spares %u:\n",
 			       h->disk_label, h->algo, h->redundancy,
 			       bch2_watermarks[h->watermark],
-			       h->nr_created);
+			       h->nr_created, h->nr_allocating, h->nr_spares);
 
 			if (h->s)
 				bch2_new_stripe_to_text(out, c, h->s);
+			for (unsigned i = 0; i < h->nr_spares; i++) {
+				prt_printf(out, "spare:\n");
+				bch2_new_stripe_to_text(out, c, h->spares[i]);
+			}
 		}
 
 	prt_printf(out, "in flight:\n");
@@ -2413,28 +2422,122 @@ static void ec_stripe_new_set_pending(struct bch_fs *c, struct ec_stripe_new *s)
 	ec_stripe_new_put(c, s, STRIPE_REF_io);
 }
 
-void bch2_ec_stripe_new_cancel(struct bch_fs *c, struct ec_stripe_head *h,
-			       struct ec_stripe_new *s, int err)
+/* @s is no longer any head's: abandon it, releasing what it holds. */
+static void ec_stripe_new_cancel(struct bch_fs *c, struct ec_stripe_new *s, int err)
 {
 	s->err = err;
-	ec_stripe_head_detach(h, s);
 	ec_stripe_new_set_pending(c, s);
+}
+
+static void ec_stripe_head_spare_add(struct ec_stripe_head *h, struct ec_stripe_new *s)
+{
+	lockdep_assert_held(&h->lock);
+	BUG_ON(h->nr_spares >= ARRAY_SIZE(h->spares));
+
+	h->spares[h->nr_spares++] = s;
+}
+
+/* The oldest spare that is (or isn't) allocated, taken out of @h's spares: */
+static struct ec_stripe_new *ec_stripe_head_spare_take(struct ec_stripe_head *h, bool allocated)
+{
+	lockdep_assert_held(&h->lock);
+
+	for (unsigned i = 0; i < h->nr_spares; i++) {
+		struct ec_stripe_new *s = h->spares[i];
+
+		if (s->allocated == allocated) {
+			array_remove_item(h->spares, h->nr_spares, i);
+			return s;
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * An unallocated stripe allocates from the devices its head had when it was
+ * created: once one of those has left the head, it has to go.
+ */
+static bool ec_stripe_new_devs_left(struct ec_stripe_head *h, struct ec_stripe_new *s)
+{
+	return !s->allocated &&
+		!bitmap_subset(s->devs.d, h->devs.d, BCH_SB_MEMBERS_MAX);
 }
 
 static void ec_stripe_head_devs_update(struct bch_fs *c, struct ec_stripe_head *h)
 {
-	struct bch_devs_mask old_devs = h->devs;
-
 	h->blocksize		= bch2_disk_label_ec_devs(c, h->disk_label, &h->devs, 0);
 	h->nr_active_devs	= dev_mask_nr(&h->devs);
 	h->insufficient_devs	= !ec_devs_sufficient(c, &h->devs, h->disk_label,
 						      h->redundancy, NULL);
 
-	struct bch_devs_mask devs_leaving;
-	bitmap_andnot(devs_leaving.d, old_devs.d, h->devs.d, BCH_SB_MEMBERS_MAX);
+	/*
+	 * Allocations in flight check for themselves when they're done
+	 * (ec_stripe_head_alloc()):
+	 */
+	for (unsigned i = 0; i < h->nr_spares;) {
+		struct ec_stripe_new *s = h->spares[i];
 
-	if (h->s && !h->s->allocated && dev_mask_nr(&devs_leaving))
-		bch2_ec_stripe_new_cancel(c, h, h->s, -EINTR);
+		if (ec_stripe_new_devs_left(h, s)) {
+			array_remove_item(h->spares, h->nr_spares, i);
+			ec_stripe_new_cancel(c, s, -EINTR);
+		} else {
+			i++;
+		}
+	}
+}
+
+/*
+ * Cancel the stripes @h hasn't handed over to stripe creation yet that
+ * @should_cancel picks (for @ca: bch2_ec_stop_dev(), going read-only).
+ *
+ * Allocations in flight are waited out first: one may just have got a bucket
+ * on @ca. None may start meanwhile (@stopping), or with writers coming in all
+ * the time we could wait forever; any that start after can't touch @ca - it's
+ * out of the allocator's rw devices before we're called - and none start once
+ * going_ro is set.
+ *
+ * Caller holds c->ec.stripe_head_lock.
+ */
+void bch2_ec_stripe_head_stop(struct bch_fs *c, struct ec_stripe_head *h, struct bch_dev *ca,
+			      bool (*should_cancel)(struct bch_fs *, struct ec_stripe_new *,
+						    struct bch_dev *))
+{
+	lockdep_assert_held(&c->ec.stripe_head_lock);
+
+	mutex_lock(&h->lock);
+	h->stopping++;
+
+	while (h->nr_allocating) {
+		u32 seq = h->alloc_seq;
+
+		mutex_unlock(&h->lock);
+		wait_event(h->alloc_wait, READ_ONCE(h->alloc_seq) != seq);
+		mutex_lock(&h->lock);
+	}
+
+	if (h->s && should_cancel(c, h->s, ca)) {
+		struct ec_stripe_new *s = h->s;
+
+		ec_stripe_head_detach(h, s);
+		ec_stripe_new_cancel(c, s, -BCH_ERR_erofs_no_writes);
+	}
+
+	for (unsigned i = 0; i < h->nr_spares;) {
+		struct ec_stripe_new *s = h->spares[i];
+
+		if (should_cancel(c, s, ca)) {
+			array_remove_item(h->spares, h->nr_spares, i);
+			ec_stripe_new_cancel(c, s, -BCH_ERR_erofs_no_writes);
+		} else {
+			i++;
+		}
+	}
+
+	h->stopping--;
+	h->alloc_seq++;
+	mutex_unlock(&h->lock);
+	wake_up_all(&h->alloc_wait);
 }
 
 static struct ec_stripe_head *
@@ -2448,6 +2551,7 @@ ec_new_stripe_head_alloc(struct bch_fs *c, unsigned disk_label,
 
 	mutex_init(&h->lock);
 	BUG_ON(!mutex_trylock(&h->lock));
+	init_waitqueue_head(&h->alloc_wait);
 
 	h->disk_label	= disk_label;
 	h->algo		= algo;
@@ -2456,6 +2560,26 @@ ec_new_stripe_head_alloc(struct bch_fs *c, unsigned disk_label,
 
 	list_add(&h->list, &c->ec.stripe_head_list);
 	return h;
+}
+
+/*
+ * Catch @h up with changes to the allocator's rw devices, and say if it can't
+ * make stripes with the ones it has now. Under @h's lock - again each time it
+ * has been dropped: the check is what ec_stripe_new_alloc_for_head() relies on.
+ */
+static int ec_stripe_head_devs_check(struct bch_fs *c, struct ec_stripe_head *h)
+{
+	lockdep_assert_held(&h->lock);
+
+	unsigned long rw_devs_change_count = READ_ONCE(c->allocator.rw_devs_change_count);
+	if (h->rw_devs_change_count != rw_devs_change_count) {
+		ec_stripe_head_devs_update(c, h);
+		h->rw_devs_change_count = rw_devs_change_count;
+	}
+
+	return h->insufficient_devs
+		? bch_err_throw(c, ec_alloc_failed_insufficient_devs)
+		: 0;
 }
 
 /*
@@ -2474,6 +2598,182 @@ static void ec_stripe_head_unlock(struct bch_fs *c, struct ec_stripe_head *h)
 {
 	__bch2_time_stats_update(&c->times[BCH_TIME_ec_stripe_head_hold], h->lock_time, local_clock());
 	mutex_unlock(&h->lock);
+}
+
+/*
+ * Take @h's lock back after working without it. Unlike bch2_trans_mutex_lock()
+ * the lock is held on return even when relocking the transaction fails: the
+ * caller has @h's bookkeeping to put right before it can return the restart.
+ */
+static int ec_stripe_head_relock(struct btree_trans *trans, struct ec_stripe_head *h)
+{
+	u64 wait_start = local_clock();
+	int ret = mutex_trylock(&h->lock)
+		? 0
+		: drop_locks_do(trans, (mutex_lock(&h->lock), 0));
+
+	ec_stripe_head_locked(trans->c, h, wait_start);
+	return ret;
+}
+
+/*
+ * More than one measured worse than one (VM, 5+2 stripes, cold node cache): the
+ * extra allocators queue on the dev stripe state lock in bucket allocation, and
+ * write latency's tail grows. For experiments.
+ */
+static unsigned bch2_ec_stripe_head_allocs = 1;
+module_param_named(ec_stripe_head_allocs, bch2_ec_stripe_head_allocs, uint, 0644);
+MODULE_PARM_DESC(ec_stripe_head_allocs,
+		 "stripes a stripe head may have allocated or being allocated besides its current one (1-"
+		 __stringify(EC_STRIPE_HEAD_SPARES_MAX) ", default 1)");
+
+/* Room for another stripe that isn't @h's current one? */
+static bool ec_stripe_head_may_alloc(struct ec_stripe_head *h)
+{
+	unsigned max = clamp(READ_ONCE(bch2_ec_stripe_head_allocs), 1U, EC_STRIPE_HEAD_SPARES_MAX);
+
+	return h->nr_allocating + h->nr_spares < max;
+}
+
+/*
+ * Nothing to do but wait for another writer's allocation to finish (or a stop):
+ * with @h unlocked, and the transaction's btree locks dropped.
+ */
+static int ec_stripe_head_wait_alloc(struct btree_trans *trans, struct ec_stripe_head *h)
+{
+	struct bch_fs *c = trans->c;
+	u32 seq = h->alloc_seq;
+	u64 start = local_clock();
+
+	ec_stripe_head_unlock(c, h);
+
+	int ret = drop_locks_do(trans, ({
+		wait_event(h->alloc_wait, READ_ONCE(h->alloc_seq) != seq);
+		0;
+	}));
+
+	bch2_time_stats_update(&c->times[BCH_TIME_ec_stripe_head_alloc_wait], start);
+
+	return ec_stripe_head_relock(trans, h) ?: ret;
+}
+
+/*
+ * Allocate @s - its index, an old stripe to reuse, its buckets - with @h
+ * unlocked, then make it @h's current stripe or a spare. Meanwhile @s is ours
+ * alone: it's in none of @h's slots, only counted in nr_allocating, and
+ * nothing that cancels a head's stripes can see it.
+ *
+ * Called and returns with @h locked.
+ */
+static int ec_stripe_head_alloc(struct btree_trans *trans, struct ec_stripe_head *h,
+				struct alloc_request *req, struct ec_stripe_new *s)
+{
+	struct bch_fs *c = trans->c;
+
+	h->nr_allocating++;
+	ec_stripe_head_unlock(c, h);
+
+	bool waiting = false;
+	u64 start = local_clock();
+	int ret = stripe_alloc_or_reuse(trans, req, h->dev_stripe, s, &waiting);
+	bch2_time_stats_update(&c->times[BCH_TIME_ec_stripe_alloc], start);
+
+	if (waiting &&
+	    !bch2_err_matches(ret, BCH_ERR_operation_blocked))
+		bch2_alloc_waiters_unpark(c);
+
+	int ret2 = ec_stripe_head_relock(trans, h);
+
+	h->nr_allocating--;
+	h->alloc_seq++;
+	wake_up_all(&h->alloc_wait);
+
+	/*
+	 * A restart from relocking must win over an allocation error: the
+	 * transaction is restarted, and an error that isn't a restart would
+	 * have the caller carry on in it.
+	 */
+	ret = ret2 ?: ret;
+
+	/* bch2_ec_stripe_head_stop() may have been and gone, see there: */
+	if (test_bit(BCH_FS_going_ro, &c->flags)) {
+		ec_stripe_new_cancel(c, s, -BCH_ERR_erofs_no_writes);
+		return ret ?: bch_err_throw(c, erofs_no_writes);
+	}
+
+	if (ec_stripe_new_devs_left(h, s)) {
+		ec_stripe_new_cancel(c, s, -EINTR);
+		return ret;
+	}
+
+	if (!s->allocated) {
+		/* Picked up where it stopped by the next writer to need a stripe: */
+		ec_stripe_head_spare_add(h, s);
+		return ret;
+	}
+
+	event_inc_trace(c, stripe_alloc, buf, ({
+		prt_printf(&buf, "\nnew: ");
+		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&s->new_stripe.key.k_i));
+		if (s->have_old_stripe) {
+			prt_printf(&buf, "\nold: ");
+			bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&s->old_stripe.key.k_i));
+		}
+	}));
+
+	if (!h->s)
+		h->s = s;
+	else
+		ec_stripe_head_spare_add(h, s);
+	return ret;
+}
+
+/*
+ * Give @h a current stripe, allocated, to hand blocks out of: a spare that's
+ * ready, else one we allocate - one interrupted earlier, or a new one - else
+ * wait for another writer's allocation.
+ *
+ * Called and returns with @h locked, but may drop it in between: anything read
+ * from @h before doesn't hold after.
+ */
+static int ec_stripe_head_get_current(struct btree_trans *trans, struct ec_stripe_head *h,
+				      struct alloc_request *req)
+{
+	struct bch_fs *c = trans->c;
+
+	if (!h->dev_stripe) {
+		struct ec_dev_stripe_state *d = ec_dev_stripe_state_get(trans, h->disk_label);
+		try(PTR_ERR_OR_ZERO(d));
+		h->dev_stripe = d;
+	}
+
+	while (!h->s) {
+		/* @h's lock may have been dropped since the last check: */
+		try(ec_stripe_head_devs_check(c, h));
+
+		struct ec_stripe_new *s = ec_stripe_head_spare_take(h, true);
+		if (s) {
+			h->s = s;
+			break;
+		}
+
+		if (test_bit(BCH_FS_going_ro, &c->flags))
+			return bch_err_throw(c, erofs_no_writes);
+
+		if (!h->stopping) {
+			s = ec_stripe_head_spare_take(h, false);
+			if (!s && ec_stripe_head_may_alloc(h))
+				s = errptr_try(ec_stripe_new_alloc_for_head(c, h, req->ec_max_data_blocks));
+			if (s) {
+				try(ec_stripe_head_alloc(trans, h, req, s));
+				continue;
+			}
+		}
+
+		try(ec_stripe_head_wait_alloc(trans, h));
+	}
+
+	return 0;
 }
 
 void bch2_ec_stripe_head_put(struct bch_fs *c, struct ec_stripe_head *h)
@@ -2547,15 +2847,10 @@ found:
 locked:
 	ec_stripe_head_locked(c, h, wait_start);
 
-	unsigned long rw_devs_change_count = READ_ONCE(c->allocator.rw_devs_change_count);
-	if (h->rw_devs_change_count != rw_devs_change_count) {
-		ec_stripe_head_devs_update(c, h);
-		h->rw_devs_change_count = rw_devs_change_count;
-	}
-
-	if (h->insufficient_devs) {
+	ret = ec_stripe_head_devs_check(c, h);
+	if (ret) {
 		ec_stripe_head_unlock(c, h);
-		return ERR_PTR(bch_err_throw(c, ec_alloc_failed_insufficient_devs));
+		return ERR_PTR(ret);
 	}
 
 	return h;
@@ -2619,48 +2914,11 @@ struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *trans,
 	if (IS_ERR(h))
 		return h;
 
-	if (!h->s) {
-		struct ec_stripe_new *new =
-			ec_stripe_new_alloc_for_head(c, h, req->ec_max_data_blocks);
-		if (IS_ERR(new)) {
-			ret = PTR_ERR(new);
-			goto err;
-		}
-
-		h->s = new;
-	}
+	ret = ec_stripe_head_get_current(trans, h, req);
+	if (ret)
+		goto err;
 
 	struct ec_stripe_new *s = h->s;
-	if (!s->allocated) {
-		if (!h->dev_stripe) {
-			struct ec_dev_stripe_state *d = ec_dev_stripe_state_get(trans, h->disk_label);
-			ret = PTR_ERR_OR_ZERO(d);
-			if (ret)
-				goto err;
-			h->dev_stripe = d;
-		}
-
-		bool waiting = false;
-		u64 alloc_start = local_clock();
-		ret = stripe_alloc_or_reuse(trans, req, h->dev_stripe, s, &waiting);
-		bch2_time_stats_update(&c->times[BCH_TIME_ec_stripe_alloc], alloc_start);
-		if (waiting &&
-		    !bch2_err_matches(ret, BCH_ERR_operation_blocked))
-			bch2_alloc_waiters_unpark(c);
-
-		if (ret)
-			goto err;
-
-		event_inc_trace(c, stripe_alloc, buf, ({
-			prt_printf(&buf, "\nnew: ");
-			bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&s->new_stripe.key.k_i));
-			if (s->have_old_stripe) {
-				prt_printf(&buf, "\nold: ");
-				bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&s->old_stripe.key.k_i));
-			}
-		}));
-	}
-
 	if (!s->mem_allocated) {
 		ret = bch2_ec_stripe_buf_init(c, &s->new_stripe, 0,
 					      le16_to_cpu(s->new_stripe.key.v.sectors),

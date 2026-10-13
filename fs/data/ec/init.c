@@ -282,11 +282,8 @@ static void __bch2_ec_stop(struct bch_fs *c, struct bch_dev *ca)
 	struct ec_stripe_head *h;
 
 	guard(mutex)(&c->ec.stripe_head_lock);
-	list_for_each_entry(h, &c->ec.stripe_head_list, list) {
-		guard(mutex)(&h->lock);
-		if (h->s && should_cancel_stripe(c, h->s, ca))
-			bch2_ec_stripe_new_cancel(c, h, h->s, -BCH_ERR_erofs_no_writes);
-	}
+	list_for_each_entry(h, &c->ec.stripe_head_list, list)
+		bch2_ec_stripe_head_stop(c, h, ca, should_cancel_stripe);
 }
 
 void bch2_ec_stop_dev(struct bch_fs *c, struct bch_dev *ca)
@@ -363,13 +360,17 @@ void bch2_fs_ec_exit(struct bch_fs *c)
 		if (!h)
 			break;
 
-		if (h->s) {
-			for (unsigned i = 0;
-			     i < h->s->new_stripe.key.v.nr_blocks;
-			     i++)
-				BUG_ON(h->s->blocks[i]);
+		BUG_ON(h->nr_allocating);
 
-			kfree(h->s);
+		/* bch2_fs_ec_stop() cancelled every stripe that has buckets: */
+		for (int j = -1; j < (int) h->nr_spares; j++) {
+			struct ec_stripe_new *s = j < 0 ? h->s : h->spares[j];
+			if (!s)
+				continue;
+
+			for (unsigned i = 0; i < s->new_stripe.key.v.nr_blocks; i++)
+				BUG_ON(s->blocks[i]);
+			kfree(s);
 		}
 		kfree(h);
 	}
