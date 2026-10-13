@@ -154,6 +154,8 @@ struct ec_stripe_head {
 	unsigned long		rw_devs_change_count;
 
 	u64			nr_created;
+	/* when the current holder of @lock took it, for ec_stripe_head_hold */
+	u64			lock_time;
 
 	struct bch_devs_mask	devs;
 	unsigned		nr_active_devs;

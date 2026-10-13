@@ -2454,6 +2454,24 @@ ec_new_stripe_head_alloc(struct bch_fs *c, unsigned disk_label,
 	return h;
 }
 
+/*
+ * A writer has the head: account how long it waited for it (from @wait_start),
+ * and start the clock on how long it holds it.
+ */
+static void ec_stripe_head_locked(struct bch_fs *c, struct ec_stripe_head *h, u64 wait_start)
+{
+	u64 now = local_clock();
+
+	__bch2_time_stats_update(&c->times[BCH_TIME_ec_stripe_head_wait], wait_start, now);
+	h->lock_time = now;
+}
+
+static void ec_stripe_head_unlock(struct bch_fs *c, struct ec_stripe_head *h)
+{
+	__bch2_time_stats_update(&c->times[BCH_TIME_ec_stripe_head_hold], h->lock_time, local_clock());
+	mutex_unlock(&h->lock);
+}
+
 void bch2_ec_stripe_head_put(struct bch_fs *c, struct ec_stripe_head *h)
 {
 	if (h->s && ec_stripe_new_full(h->s)) {
@@ -2463,7 +2481,7 @@ void bch2_ec_stripe_head_put(struct bch_fs *c, struct ec_stripe_head *h)
 		ec_stripe_new_set_pending(c, s);
 	}
 
-	mutex_unlock(&h->lock);
+	ec_stripe_head_unlock(c, h);
 }
 
 static struct ec_stripe_head *
@@ -2475,6 +2493,7 @@ __bch2_ec_stripe_head_get(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	struct ec_stripe_head *h;
+	u64 wait_start = local_clock();
 
 	if (!redundancy)
 		return ERR_PTR(bch_err_throw(c, ec_alloc_failed_no_redundancy));
@@ -2509,6 +2528,8 @@ __bch2_ec_stripe_head_get(struct btree_trans *trans,
 
 	unsigned long rw_devs_change_count;
 found:
+	ec_stripe_head_locked(c, h, wait_start);
+
 	rw_devs_change_count = READ_ONCE(c->allocator.rw_devs_change_count);
 	if (h->rw_devs_change_count != rw_devs_change_count) {
 		ec_stripe_head_devs_update(c, h);
@@ -2516,7 +2537,7 @@ found:
 	}
 
 	if (h->insufficient_devs) {
-		mutex_unlock(&h->lock);
+		ec_stripe_head_unlock(c, h);
 		h = ERR_PTR(bch_err_throw(c, ec_alloc_failed_insufficient_devs));
 	}
 err:
@@ -2608,7 +2629,9 @@ struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *trans,
 		}
 
 		bool waiting = false;
+		u64 alloc_start = local_clock();
 		ret = stripe_alloc_or_reuse(trans, req, h->dev_stripe, s, &waiting);
+		bch2_time_stats_update(&c->times[BCH_TIME_ec_stripe_alloc], alloc_start);
 		if (waiting &&
 		    !bch2_err_matches(ret, BCH_ERR_operation_blocked))
 			bch2_alloc_waiters_unpark(c);

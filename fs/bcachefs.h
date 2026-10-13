@@ -463,7 +463,16 @@ BCH_DEBUG_PARAMS_ALL()
 	  "Nocow lock contention")					\
 	x(blocked_discard_journal_flush,				\
 	  "Blocked: discard worker waiting for journal flush "		\
-	  "to advance rewind_seq and release buckets")
+	  "to advance rewind_seq and release buckets")			\
+	x(ec_stripe_head_wait,						\
+	  "Erasure coding: a writer waiting for its stripe head "	\
+	  "(bch2_ec_stripe_head_get() until the head is locked)")	\
+	x(ec_stripe_head_hold,						\
+	  "Erasure coding: stripe head lock held by a writer; "	\
+	  "every other writer of that head waits behind it")		\
+	x(ec_stripe_alloc,						\
+	  "Erasure coding: allocating a stripe - its index, an "	\
+	  "old stripe to reuse, its buckets (stripe_alloc_or_reuse())")
 
 enum bch_time_stats {
 #define x(name, ...) BCH_TIME_##name,
