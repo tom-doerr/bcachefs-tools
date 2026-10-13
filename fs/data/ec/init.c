@@ -206,9 +206,14 @@ static int bch2_invalidate_stripe_to_dev_from_alloc(struct btree_trans *trans,
 					     had_open, recorded);
 }
 
-int bch2_dev_remove_stripes(struct bch_fs *c, unsigned dev_idx,
+static void __bch2_ec_stop(struct bch_fs *, struct bch_dev *,
+			   bool (*)(struct bch_fs *, struct ec_stripe_new *, struct bch_dev *));
+static bool stripe_reuses_dev(struct bch_fs *, struct ec_stripe_new *, struct bch_dev *);
+
+int bch2_dev_remove_stripes(struct bch_fs *c, struct bch_dev *ca,
 			    unsigned flags, struct printbuf *err)
 {
+	unsigned dev_idx = ca->dev_idx;
 	CLASS(btree_trans, trans)(c);
 	u64 recorded = 0;
 	int ret = 0;
@@ -234,7 +239,16 @@ int bch2_dev_remove_stripes(struct bch_fs *c, unsigned dev_idx,
 		if (ret || !had_open)
 			goto out;
 
-		bch2_trans_unlock(trans);
+		/* the stop can wait out other writers' allocations, btree IO and all: */
+		bch2_trans_unlock_long(trans);
+		/*
+		 * Stripe heads keep the old stripes they're reusing open until
+		 * the new stripe is full, which on an idle head is never - and
+		 * a spare isn't even being filled: let go of those on @ca.
+		 * Reuse doesn't pick stripes on a removing device, so they don't
+		 * come back.
+		 */
+		__bch2_ec_stop(c, ca, stripe_reuses_dev);
 		bch2_fs_ec_flush_outstanding(c);
 	}
 
@@ -277,23 +291,39 @@ static bool should_cancel_stripe(struct bch_fs *c, struct ec_stripe_new *s, stru
 	return false;
 }
 
-static void __bch2_ec_stop(struct bch_fs *c, struct bch_dev *ca)
+/* Reusing an old stripe with a block on @ca, which it holds open: */
+static bool stripe_reuses_dev(struct bch_fs *c, struct ec_stripe_new *s, struct bch_dev *ca)
+{
+	if (!s->have_old_stripe)
+		return false;
+
+	struct bch_stripe *v = &s->old_stripe.key.v;
+
+	for (unsigned i = 0; i < v->nr_blocks; i++)
+		if (v->ptrs[i].dev == ca->dev_idx)
+			return true;
+	return false;
+}
+
+static void __bch2_ec_stop(struct bch_fs *c, struct bch_dev *ca,
+			   bool (*should_cancel)(struct bch_fs *, struct ec_stripe_new *,
+						 struct bch_dev *))
 {
 	struct ec_stripe_head *h;
 
 	guard(mutex)(&c->ec.stripe_head_lock);
 	list_for_each_entry(h, &c->ec.stripe_head_list, list)
-		bch2_ec_stripe_head_stop(c, h, ca, should_cancel_stripe);
+		bch2_ec_stripe_head_stop(c, h, ca, should_cancel);
 }
 
 void bch2_ec_stop_dev(struct bch_fs *c, struct bch_dev *ca)
 {
-	__bch2_ec_stop(c, ca);
+	__bch2_ec_stop(c, ca, should_cancel_stripe);
 }
 
 void bch2_fs_ec_stop(struct bch_fs *c)
 {
-	__bch2_ec_stop(c, NULL);
+	__bch2_ec_stop(c, NULL, should_cancel_stripe);
 }
 
 static bool bch2_fs_ec_flush_done(struct bch_fs *c)

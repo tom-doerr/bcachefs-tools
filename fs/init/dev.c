@@ -1006,7 +1006,7 @@ static int __bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca,
 	ret = fast_device_removal
 		? bch2_dev_data_drop_by_backpointers(c, ca, flags, err)
 		: (bch2_dev_data_drop(c, ca->dev_idx, flags, err) ?:
-		   bch2_dev_remove_stripes(c, ca->dev_idx, flags, err));
+		   bch2_dev_remove_stripes(c, ca, flags, err));
 	if (ret)
 		goto err;
 

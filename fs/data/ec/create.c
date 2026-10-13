@@ -1823,12 +1823,32 @@ static struct stripe_blocks stripe_blocks_get(struct bch_fs *c, const struct bch
 	return b;
 }
 
+/*
+ * A stripe with a block on a device being removed is the removal's to deal
+ * with: reusing it would hold it open, and bch2_dev_remove_stripes() can't
+ * finish while it's open. Unlike stripe_has_removing_dev(), for keys that may
+ * have invalidated pointers.
+ */
+static bool stripe_on_removing_dev(struct bch_fs *c, const struct bch_stripe *v)
+{
+	guard(rcu)();
+	for (unsigned i = 0; i < v->nr_blocks; i++) {
+		struct bch_dev *ca = bch2_dev_rcu_noerror(c, v->ptrs[i].dev);
+		if (ca && READ_ONCE(ca->removing))
+			return true;
+	}
+	return false;
+}
+
 static bool may_reuse_stripe(struct bch_fs *c,
 			     struct ec_stripe_new *new, const struct bch_stripe *old)
 {
 	if (old->disk_label		!= new->new_stripe.key.v.disk_label ||
 	    old->algorithm		!= new->new_stripe.key.v.algorithm ||
 	    old->nr_redundant		!= new->new_stripe.key.v.nr_redundant)
+		return false;
+
+	if (stripe_on_removing_dev(c, old))
 		return false;
 
 	struct stripe_blocks b = stripe_blocks_get(c, old);
