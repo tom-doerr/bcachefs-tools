@@ -2101,6 +2101,15 @@ static int stripe_reuse(struct btree_trans *trans, struct ec_stripe_new *s)
 			lru_pos(BCH_LRU_STRIPE_FRAGMENTATION, 2, 0),
 			lru_pos(BCH_LRU_STRIPE_FRAGMENTATION, 2, LRU_TIME_MAX),
 			0, lru_k, ret) {
+		/*
+		 * Open - another writer's reuse, a create, a repair - so not
+		 * ours to take: skip it without a lookup. The front of the LRU
+		 * is where every allocation looks, so with several in flight
+		 * these come first.
+		 */
+		if (bch2_stripe_is_open(c, lru_k.k->p.offset))
+			continue;
+
 		ret = get_old_stripe(trans, s, lru_k.k->p.offset);
 		if (ret)
 			break;
