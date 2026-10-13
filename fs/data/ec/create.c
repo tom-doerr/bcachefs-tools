@@ -2503,34 +2503,47 @@ __bch2_ec_stripe_head_get(struct btree_trans *trans,
 		return ERR_PTR(ret);
 
 	if (test_bit(BCH_FS_going_ro, &c->flags)) {
-		h = ERR_PTR(bch_err_throw(c, erofs_no_writes));
-		goto err;
+		mutex_unlock(&c->ec.stripe_head_lock);
+		return ERR_PTR(bch_err_throw(c, erofs_no_writes));
 	}
 
 	list_for_each_entry(h, &c->ec.stripe_head_list, list)
 		if (h->disk_label	== disk_label &&
 		    h->algo		== algo &&
 		    h->redundancy	== redundancy &&
-		    h->watermark	== watermark) {
-			ret = bch2_trans_mutex_lock(trans, &h->lock);
-			if (ret) {
-				h = ERR_PTR(ret);
-				goto err;
-			}
+		    h->watermark	== watermark)
 			goto found;
-		}
 
 	h = ec_new_stripe_head_alloc(c, disk_label, algo, redundancy, watermark);
-	if (!h) {
-		h = ERR_PTR(bch_err_throw(c, ENOMEM_stripe_head_alloc));
-		goto err;
-	}
-
-	unsigned long rw_devs_change_count;
+	mutex_unlock(&c->ec.stripe_head_lock);
+	if (!h)
+		return ERR_PTR(bch_err_throw(c, ENOMEM_stripe_head_alloc));
+	goto locked;
 found:
+	/*
+	 * Not under the list lock: a writer waiting for one head would hold up
+	 * every other head's writers behind it. Heads are only freed by
+	 * bch2_fs_ec_exit(), so @h outlives the list lock.
+	 */
+	mutex_unlock(&c->ec.stripe_head_lock);
+
+	ret = bch2_trans_mutex_lock(trans, &h->lock);
+	if (ret)
+		return ERR_PTR(ret);
+
+	/*
+	 * bch2_fs_ec_stop() may have been through this head while we waited:
+	 * it sets going_ro before it starts, so anything we started now would
+	 * be missed.
+	 */
+	if (test_bit(BCH_FS_going_ro, &c->flags)) {
+		mutex_unlock(&h->lock);
+		return ERR_PTR(bch_err_throw(c, erofs_no_writes));
+	}
+locked:
 	ec_stripe_head_locked(c, h, wait_start);
 
-	rw_devs_change_count = READ_ONCE(c->allocator.rw_devs_change_count);
+	unsigned long rw_devs_change_count = READ_ONCE(c->allocator.rw_devs_change_count);
 	if (h->rw_devs_change_count != rw_devs_change_count) {
 		ec_stripe_head_devs_update(c, h);
 		h->rw_devs_change_count = rw_devs_change_count;
@@ -2538,10 +2551,9 @@ found:
 
 	if (h->insufficient_devs) {
 		ec_stripe_head_unlock(c, h);
-		h = ERR_PTR(bch_err_throw(c, ec_alloc_failed_insufficient_devs));
+		return ERR_PTR(bch_err_throw(c, ec_alloc_failed_insufficient_devs));
 	}
-err:
-	mutex_unlock(&c->ec.stripe_head_lock);
+
 	return h;
 }
 
