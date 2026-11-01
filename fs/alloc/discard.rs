@@ -239,6 +239,13 @@ fn dev_bucket_nouse(fs: &Fs, bucket: c::bpos) -> bool {
     fs.dev_rcu(bucket.inode as u32, &rcu).is_none_or(|ca| ca.bucket_nouse(bucket.offset))
 }
 
+/// Whether @bucket's device is rw - one that isn't keeps its need_discard
+/// buckets till it is.
+fn dev_bucket_rw(fs: &Fs, bucket: c::bpos) -> bool {
+    let rcu = read_lock();
+    fs.dev_rcu(bucket.inode as u32, &rcu).is_some_and(dev_is_rw)
+}
+
 /// Discards on, for @ca: the mount option, if it was given, or the device's
 /// own.
 fn discard_opt_enabled(fs: &Fs, ca: &c::bch_dev) -> bool {
@@ -401,6 +408,14 @@ impl<'a> Worker<'a> {
         let fs = t.fs();
 
         if unlikely(dev_bucket_nouse(fs, bucket)) {
+            return Ok(());
+        }
+        // A device that isn't rw keeps its need_discard buckets, with old
+        // journal seqs, at the front of need_discard: checked before the alloc
+        // key lookup, or every pass looks each one up before it gets to a rw
+        // device's. dev_get_ioref() below catches a device gone ro since.
+        if unlikely(!dev_bucket_rw(fs, bucket)) {
+            self.s.write(|s| s.not_rw += bucket_size);
             return Ok(());
         }
         if let Err(n) = fs.discards.check(bucket, self.fastpath) {
